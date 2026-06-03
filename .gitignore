@@ -1,21 +1,7 @@
-# local files
-*.log
-*.tmp
-*.bak
 *.tar.gz
-*.tgz
 *.zip
-
-# secrets
+*.log
 .env
-.env.*
 config.env
-!config/config.env.example
-
-# editor
-.vscode/
-.idea/
-.DS_Store
-
-# shellcheck/cache
-.cache/
+rw-backup-full.env
+backup/

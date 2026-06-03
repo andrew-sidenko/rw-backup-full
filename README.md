@@ -1,202 +1,101 @@
 # rw-backup-full
 
-`rw-backup-full` — надстройка над `distillium/remnawave-backup-restore` для проектов, где на одном сервере может быть:
+`rw-backup-full` — надстройка над оригинальным `distillium/remnawave-backup-restore` для серверов Remnawave/VPN, где кроме панели есть самописные Docker Telegram-боты в `/home`.
 
-- Remnawave panel;
-- только custom Telegram/VPN bot без панели;
-- Caddy;
-- Remnawave subscription-page;
-- несколько Docker Compose проектов в `/home`.
+## Что делает
 
-Скрипт не зависит от имени папки `/home/VPNNEW`, `/home/OneOkBotNew` или другого имени. Custom bot проекты находятся автоматически через Docker Compose labels.
+- Не заменяет оригинальный `rw-backup`, а использует его для backup/restore Remnawave panel.
+- Хранит настройки `rw-backup-full` отдельно в `/opt/rw-backup-restore/rw-backup-full.env`.
+- Читает Telegram/S3 параметры из оригинального `/opt/rw-backup-restore/config.env`.
+- Автоматически находит custom Docker-ботов в `/home` через Docker Compose labels.
+- Делает backup custom bot: `pg_dumpall` PostgreSQL + `dump.rdb` Redis + архив папки проекта без live DB-каталогов.
+- Поддерживает restore custom bot.
+- Поддерживает отправку custom backup в Telegram/S3/both/local.
+- Имеет отдельную глубину хранения custom backup локально и в S3.
+- Имеет пункт меню установки systemd timer.
 
-## Что умеет
+## Конфиги
 
-- Запускать оригинальный `rw-backup` для Remnawave panel.
-- Делать backup custom Docker bot проектов из `/home`.
-- Делать restore custom Docker bot проектов.
-- Отправлять custom backup в Telegram, S3, оба направления или оставлять локально.
-- Чистить локальные `custom_bot_*.tar.gz` по глубине хранения.
-- Чистить S3 `custom_bot_*.tar.gz` по глубине хранения.
-- Сохранять дополнительные конфиги `/opt/remnawave/caddy` и `/opt/remnawave/subscription`, если они есть.
+### Оригинальный конфиг
 
-## Логика custom bot backup
+```text
+/opt/rw-backup-restore/config.env
+```
 
-Для каждого найденного проекта в `/home`:
+Используется оригинальным `rw-backup`. `rw-backup-full` читает оттуда только параметры доставки:
 
-1. Находит Docker Compose project через labels.
-2. Определяет рабочую директорию проекта.
-3. Находит PostgreSQL контейнер.
-4. Находит Redis/Valkey контейнер.
-5. Делает `pg_dumpall` из PostgreSQL контейнера.
-6. Делает `redis-cli SAVE` и забирает `dump.rdb`.
-7. Архивирует папку проекта.
-8. Исключает из архива live-каталоги:
-   - `volumes/pgdata`
-   - `volumes/redis`
-9. Кладёт всё в итоговый архив `custom_bot_<project>_<timestamp>.tar.gz`.
-10. Отправляет архив в Telegram или S3 согласно `config.env`.
+```env
+UPLOAD_METHOD="s3"
+BOT_TOKEN=""
+CHAT_ID=""
+MESSAGE_THREAD_ID=""
+S3_BUCKET=""
+S3_ACCESS_KEY=""
+S3_SECRET_KEY=""
+S3_REGION="us-east-1"
+S3_ENDPOINT=""
+S3_PREFIX="rw-backup"
+```
 
-## Условия для custom bot backup
+### Конфиг full
 
-На сервере должны быть:
+```text
+/opt/rw-backup-restore/rw-backup-full.env
+```
 
-- Docker;
-- Docker Compose plugin;
-- `tar`;
-- `gzip`;
-- `curl` для Telegram upload;
-- `awscli` для S3 upload;
-- Docker Compose проект в `/home/...`;
-- PostgreSQL контейнер в этом compose-проекте;
-- Redis или Valkey контейнер в этом compose-проекте.
+Тут хранятся только параметры надстройки:
 
-Проект должен быть запущен через `docker compose up -d`, а не через одиночный `docker run`, потому что auto-detect использует Docker Compose labels:
+```env
+FULL_UPLOAD_METHOD="inherit"
+FULL_BACKUP_DIR="/opt/rw-backup-restore/backup"
+FULL_LOCAL_RETENTION_DAYS="3"
+FULL_S3_RETENTION_DAYS="10"
+FULL_TIMER_MODE="custom-backup"
+FULL_TIMER_INTERVAL_HOURS="3"
+FULL_AUTO_INSTALL_RW_BACKUP="true"
+FULL_REQUIRE_ORIGINAL_RW_BACKUP="true"
+FULL_INCLUDE_EXTRA_CONFIGS="true"
+FULL_SYSTEMD_UNIT_NAME="rw-backup-full"
+```
 
-- `com.docker.compose.project`
-- `com.docker.compose.project.working_dir`
-- `com.docker.compose.service`
+`FULL_UPLOAD_METHOD=inherit` означает: взять `UPLOAD_METHOD` из оригинального `config.env`.
 
 ## Установка
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y curl tar gzip
+sudo apt-get install -y curl tar gzip docker.io docker-compose-plugin
 ```
 
-Для S3:
-
 ```bash
-sudo apt-get install -y awscli
-```
-
-Установка проекта:
-
-```bash
-git clone https://github.com/YOUR-ORG/rw-backup-full.git
+git clone https://github.com/YOUR-USER/rw-backup-full.git
 cd rw-backup-full
 sudo ./install.sh
 ```
 
 Установщик:
 
-- создаёт `/opt/rw-backup-restore/backup`;
-- копирует `scripts/rw-backup-full.sh` в `/opt/rw-backup-restore/rw-backup-full.sh`;
-- создаёт symlink `/usr/local/bin/rw-backup-full`;
-- не перезаписывает существующий `/opt/rw-backup-restore/config.env`;
-- если `config.env` уже есть, добавляет в конец блок настроек `rw-backup-full`.
+1. Кладёт `rw-backup-full.sh` в `/opt/rw-backup-restore/rw-backup-full.sh`.
+2. Создаёт symlink `/usr/local/bin/rw-backup-full`.
+3. Не перезаписывает существующий `/opt/rw-backup-restore/config.env`.
+4. Создаёт `/opt/rw-backup-restore/rw-backup-full.env`, если его нет.
+5. Если оригинальный `rw-backup` отсутствует — скачивает `/opt/rw-backup-restore/backup-restore.sh` и создаёт `/usr/local/bin/rw-backup`.
 
-## Настройка config.env
-
-Файл:
-
-```bash
-sudo nano /opt/rw-backup-restore/config.env
-```
-
-Минимальный вариант для Telegram:
-
-```env
-UPLOAD_METHOD="telegram"
-
-BOT_TOKEN="123456:xxxxxxxxxxxxxxxx"
-CHAT_ID="-1001234567890"
-MESSAGE_THREAD_ID="123"
-
-RETAIN_BACKUPS_DAYS=3
-S3_RETENTION_DAYS=10
-```
-
-Минимальный вариант для S3:
-
-```env
-UPLOAD_METHOD="s3"
-
-S3_BUCKET="bucket-name"
-S3_ACCESS_KEY="access-key"
-S3_SECRET_KEY="secret-key"
-S3_REGION="us-east-1"
-S3_ENDPOINT="https://s3.example.com"
-S3_PREFIX="rw-backup"
-
-RETAIN_BACKUPS_DAYS=3
-S3_RETENTION_DAYS=10
-S3_RETAIN_DAYS=10
-```
-
-Оставлять только локально:
-
-```env
-UPLOAD_METHOD="local"
-RETAIN_BACKUPS_DAYS=3
-```
-
-Отправлять и в Telegram, и в S3:
-
-```env
-UPLOAD_METHOD="both"
-```
-
-## Команды
-
-Показать настройки:
+## Проверка
 
 ```bash
 sudo rw-backup-full config
-```
-
-Показать найденные custom bot проекты:
-
-```bash
 sudo rw-backup-full list
 ```
 
-Backup только custom bots:
+Для найденного бота вывод будет примерно таким:
 
-```bash
-sudo rw-backup-full custom-backup
-```
-
-Backup Remnawave panel через оригинальный `rw-backup`:
-
-```bash
-sudo rw-backup-full panel-backup
-```
-
-Backup всего:
-
-```bash
-sudo rw-backup-full backup-all
-```
-
-Restore custom bot из меню:
-
-```bash
-sudo rw-backup-full custom-restore
-```
-
-Restore custom bot из конкретного архива:
-
-```bash
-sudo rw-backup-full custom-restore-file /opt/rw-backup-restore/backup/custom_bot_project_20260603_120000.tar.gz
-```
-
-Restore без подтверждения:
-
-```bash
-sudo rw-backup-full custom-restore-file /opt/rw-backup-restore/backup/custom_bot_project_20260603_120000.tar.gz --yes
-```
-
-Запуск S3 cleanup вручную:
-
-```bash
-sudo rw-backup-full s3-cleanup
-```
-
-Запуск local cleanup вручную:
-
-```bash
-sudo rw-backup-full local-cleanup
+```text
+oneokbotnew
+  dir:      /home/OneOkBotNew
+  postgres: vpn_postgres / service=postgres
+  redis:    vpn_redis / service=redis
+  apps:     vpn_api vpn_bot vpn_user_cabinet
 ```
 
 ## Меню
@@ -214,67 +113,131 @@ sudo rw-backup-full
 4. Restore custom bot из custom_bot архива
 5. Backup ALL: panel + custom bot
 6. Показать найденные custom bot проекты
-7. Показать настройки
-8. Открыть оригинальное меню rw-backup
-0. Выход
+7. Настроить full retention / режим / интервал
+8. Установить/обновить systemd timer
+9. Установить/обновить оригинальный rw-backup
+10. Показать настройки
+11. Открыть оригинальное меню rw-backup
 ```
 
-## Cron каждые 3 часа
-
-Сервер с панелью и ботом:
+## Backup только ботов
 
 ```bash
-sudo crontab -e
+sudo rw-backup-full custom-backup
 ```
 
-```cron
-0 */3 * * * /usr/local/bin/rw-backup-full backup-all >> /var/log/rw-backup-full.log 2>&1
-```
-
-Сервер только с ботом, без панели:
-
-```cron
-0 */3 * * * /usr/local/bin/rw-backup-full custom-backup >> /var/log/rw-backup-full.log 2>&1
-```
-
-## systemd timer
-
-Сервер с панелью и ботом:
+## Backup panel + bots
 
 ```bash
-sudo cp systemd/rw-backup-full.service /etc/systemd/system/rw-backup-full.service
-sudo cp systemd/rw-backup-full.timer /etc/systemd/system/rw-backup-full.timer
-sudo systemctl daemon-reload
-sudo systemctl enable --now rw-backup-full.timer
+sudo rw-backup-full backup-all
 ```
 
-Сервер только с ботом:
+Если панели на сервере нет, panel backup будет пропущен, а custom backup ботов выполнится.
+
+## Restore custom bot
 
 ```bash
-sudo cp systemd/rw-backup-full-custom.service /etc/systemd/system/rw-backup-full-custom.service
-sudo cp systemd/rw-backup-full-custom.timer /etc/systemd/system/rw-backup-full-custom.timer
-sudo systemctl daemon-reload
-sudo systemctl enable --now rw-backup-full-custom.timer
+sudo rw-backup-full custom-restore
+```
+
+Или из конкретного файла:
+
+```bash
+sudo rw-backup-full custom-restore-file /opt/rw-backup-restore/backup/custom_bot_oneokbotnew_20260603_120000.tar.gz
+```
+
+Без подтверждения:
+
+```bash
+sudo rw-backup-full custom-restore-file /opt/rw-backup-restore/backup/custom_bot_oneokbotnew_20260603_120000.tar.gz --yes
+```
+
+## Systemd timer раз в 3 часа
+
+Через меню:
+
+```bash
+sudo rw-backup-full
+# пункт 8
+```
+
+Или напрямую:
+
+```bash
+sudo rw-backup-full install-timer
 ```
 
 Проверка:
 
 ```bash
-systemctl list-timers | grep rw-backup-full
-journalctl -u rw-backup-full.service -n 100 --no-pager
-journalctl -u rw-backup-full-custom.service -n 100 --no-pager
+systemctl list-timers | grep rw-backup
+sudo journalctl -u rw-backup-full.service -n 100 --no-pager
 ```
 
-## Что будет внутри custom backup архива
+Настройки таймера хранятся в `rw-backup-full.env`:
 
-Пример:
+```env
+FULL_TIMER_MODE="custom-backup"
+FULL_TIMER_INTERVAL_HOURS="3"
+```
+
+Для сервера только с ботами используйте:
+
+```env
+FULL_TIMER_MODE="custom-backup"
+```
+
+Для сервера с панелью и ботом:
+
+```env
+FULL_TIMER_MODE="backup-all"
+```
+
+## Retention
+
+Настройка через меню:
+
+```bash
+sudo rw-backup-full configure
+```
+
+Или вручную:
+
+```env
+FULL_LOCAL_RETENTION_DAYS="3"
+FULL_S3_RETENTION_DAYS="10"
+```
+
+S3 cleanup удаляет только:
 
 ```text
-custom_bot_vpnnew_20260603_120000.tar.gz
-custom_bot_oneokbotnew_20260603_120000.tar.gz
+custom_bot_*.tar.gz
 ```
 
-Состав:
+и не трогает оригинальные:
+
+```text
+remnawave_backup_*.tar.gz
+```
+
+## Диагностика структуры сервера
+
+```bash
+sudo scripts/collect-bot-structure.sh
+```
+
+Отчёт будет создан в `/root/bot-structure-report-<host>-<date>.txt`.
+
+## Условия для custom bot backup
+
+- Бот запущен через `docker compose`.
+- Рабочая папка проекта находится в `/home/...`.
+- В compose-проекте есть PostgreSQL контейнер или сервис `postgres`.
+- В compose-проекте есть Redis контейнер или сервис `redis`.
+- Для Telegram установлен `curl`.
+- Для S3 установлен `awscli`.
+
+## Что внутри custom backup
 
 ```text
 PROFILE.env
@@ -295,125 +258,11 @@ BACKUP_NOTES.txt
 SHA256SUMS
 ```
 
-## Restore custom bot
-
-Restore делает безопасно:
-
-1. Распаковывает custom backup.
-2. Читает `PROFILE.env`.
-3. Останавливает текущий compose-проект, если он есть.
-4. Старую папку проекта не удаляет, а переименовывает:
+`project_dir.tar.gz` исключает live-каталоги:
 
 ```text
-/home/<project>.before_restore_YYYYMMDD_HHMMSS
+volumes/pgdata
+volumes/redis
 ```
 
-5. Восстанавливает папку проекта из `project_dir.tar.gz`.
-6. Кладёт `redis_dump.rdb` в `volumes/redis/dump.rdb` до запуска Redis.
-7. Поднимает PostgreSQL service.
-8. Заливает `postgres_dump.sql.gz` через `psql`.
-9. Поднимает Redis service.
-10. Поднимает весь compose-проект.
-
-## S3 retention
-
-Скрипт удаляет из S3 только custom backup файлы:
-
-```text
-custom_bot_*.tar.gz
-```
-
-Срок задаётся:
-
-```env
-S3_RETENTION_DAYS=10
-```
-
-Оригинальные архивы панели Remnawave не затрагиваются:
-
-```text
-remnawave_backup_*.tar.gz
-```
-
-## Диагностика структуры сервера
-
-Скрипт:
-
-```bash
-sudo ./scripts/collect-bot-structure.sh
-```
-
-Он создаёт отчёт:
-
-```text
-/root/bot-structure-report-<hostname>-<timestamp>.txt
-```
-
-Отчёт маскирует пароли, токены, database URLs и JWT.
-
-## Сценарии серверов
-
-### Сервер с Remnawave panel + bot
-
-Использовать:
-
-```bash
-sudo rw-backup-full backup-all
-```
-
-Cron:
-
-```cron
-0 */3 * * * /usr/local/bin/rw-backup-full backup-all >> /var/log/rw-backup-full.log 2>&1
-```
-
-### Сервер только с bot без panel
-
-Использовать:
-
-```bash
-sudo rw-backup-full custom-backup
-```
-
-Cron:
-
-```cron
-0 */3 * * * /usr/local/bin/rw-backup-full custom-backup >> /var/log/rw-backup-full.log 2>&1
-```
-
-Отсутствие панели не блокирует custom backup.
-
-### Сервер только с panel без bot
-
-Использовать оригинальный `rw-backup` или:
-
-```bash
-sudo rw-backup-full panel-backup
-```
-
-## Проверка после установки
-
-```bash
-sudo bash -n /opt/rw-backup-restore/rw-backup-full.sh
-sudo rw-backup-full config
-sudo rw-backup-full list
-sudo rw-backup-full custom-backup
-```
-
-Проверка последнего архива:
-
-```bash
-LATEST="$(ls -1t /opt/rw-backup-restore/backup/custom_bot_*.tar.gz | head -n 1)"
-echo "$LATEST"
-sudo tar -tzf "$LATEST" | head -100
-sudo tar -tzf "$LATEST" | grep 'postgres_dump.sql.gz'
-sudo tar -tzf "$LATEST" | grep 'redis_dump.rdb'
-sudo tar -tzf "$LATEST" | grep 'project_dir.tar.gz'
-```
-
-## Безопасность
-
-- Не публикуй реальный `/opt/rw-backup-restore/config.env` в GitHub.
-- Не публикуй `.env` ботов.
-- В GitHub должен попадать только `config.env.example`.
-- Custom backup содержит секреты, потому что архивирует `.env`; хранить его нужно в закрытом Telegram topic или S3 bucket с ограниченными правами.
+Потому что PostgreSQL восстанавливается из `postgres_dump.sql.gz`, а Redis — из `redis_dump.rdb`.

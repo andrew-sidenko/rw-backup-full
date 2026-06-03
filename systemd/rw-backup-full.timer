@@ -2,7 +2,8 @@
 Description=Run rw-backup-full every 3 hours
 
 [Timer]
-OnCalendar=*-*-* 00/3:00:00
+OnBootSec=10min
+OnUnitActiveSec=3h
 Persistent=true
 Unit=rw-backup-full.service
 

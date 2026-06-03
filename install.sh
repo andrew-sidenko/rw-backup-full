@@ -1,80 +1,84 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/rw-backup-restore}"
-BIN_LINK="${BIN_LINK:-/usr/local/bin/rw-backup-full}"
-SCRIPT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/rw-backup-full.sh"
-CONFIG_EXAMPLE_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config/config.env.example"
-CONFIG_FILE="${INSTALL_DIR}/config.env"
+INSTALL_DIR="/opt/rw-backup-restore"
+BIN_PATH="/usr/local/bin/rw-backup-full"
+UPSTREAM_RAW_URL="https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh"
+AUTO_INSTALL_ORIGINAL="true"
 
-msg() {
-  echo "[install] $*"
-}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-auto-install-rw-backup)
+      AUTO_INSTALL_ORIGINAL="false"
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: sudo ./install.sh [--no-auto-install-rw-backup]"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      exit 1
+      ;;
+  esac
+done
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root: sudo ./install.sh"
+if [[ "$EUID" -ne 0 ]]; then
+  echo "[ERROR] Run as root: sudo ./install.sh"
   exit 1
 fi
 
-if [[ ! -f "$SCRIPT_SRC" ]]; then
-  echo "Script not found: $SCRIPT_SRC"
-  exit 1
-fi
+mkdir -p "$INSTALL_DIR/backup"
 
-msg "Creating ${INSTALL_DIR}"
-mkdir -p "${INSTALL_DIR}/backup"
+install -m 0755 scripts/rw-backup-full.sh "$INSTALL_DIR/rw-backup-full.sh"
+ln -sf "$INSTALL_DIR/rw-backup-full.sh" "$BIN_PATH"
 
-msg "Installing rw-backup-full.sh"
-install -m 0755 "$SCRIPT_SRC" "${INSTALL_DIR}/rw-backup-full.sh"
-ln -sf "${INSTALL_DIR}/rw-backup-full.sh" "$BIN_LINK"
-
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  msg "Creating config from example: ${CONFIG_FILE}"
-  install -m 0600 "$CONFIG_EXAMPLE_SRC" "$CONFIG_FILE"
+if [[ ! -f "$INSTALL_DIR/rw-backup-full.env" ]]; then
+  install -m 0600 config/rw-backup-full.env.example "$INSTALL_DIR/rw-backup-full.env"
+  echo "[OK] Created $INSTALL_DIR/rw-backup-full.env"
 else
-  msg "Config exists, not overwriting: ${CONFIG_FILE}"
-  if ! grep -q 'rw-backup-full custom bot settings' "$CONFIG_FILE" 2>/dev/null; then
-    cat >> "$CONFIG_FILE" <<'CFG'
+  echo "[INFO] $INSTALL_DIR/rw-backup-full.env exists, not overwritten"
+fi
 
-# ==========================================================
-# rw-backup-full custom bot settings
-# ==========================================================
+if [[ ! -f "$INSTALL_DIR/config.env" ]]; then
+  install -m 0600 config/original-config.env.example "$INSTALL_DIR/config.env"
+  echo "[WARN] Created minimal original config: $INSTALL_DIR/config.env"
+  echo "[WARN] Fill Telegram/S3 settings there or run original rw-backup setup."
+else
+  echo "[INFO] Original $INSTALL_DIR/config.env exists, not overwritten"
+fi
 
-# telegram | s3 | both | local
-UPLOAD_METHOD="telegram"
-
-# Local retention for custom_bot_*.tar.gz
-RETAIN_BACKUPS_DAYS=3
-
-# S3 retention for custom_bot_*.tar.gz
-S3_RETENTION_DAYS=10
-S3_RETAIN_DAYS=10
-
-# Optional explicit Telegram aliases.
-# If original config.env already has BOT_TOKEN/CHAT_ID/MESSAGE_THREAD_ID, these are not required.
-# TG_BOT_TOKEN=""
-# TG_CHAT_ID=""
-# TG_MESSAGE_THREAD_ID=""
-# TG_PROXY=""
-
-# Optional explicit S3 aliases.
-# If original config.env already has S3_BUCKET/S3_ACCESS_KEY/S3_SECRET_KEY, these are not required.
-# S3_BUCKET=""
-# S3_ACCESS_KEY=""
-# S3_SECRET_KEY=""
-# S3_REGION="us-east-1"
-# S3_ENDPOINT=""
-# S3_PREFIX="rw-backup"
-CFG
-    msg "Appended rw-backup-full settings block to existing config"
+if [[ "$AUTO_INSTALL_ORIGINAL" == "true" ]]; then
+  if [[ ! -x "$INSTALL_DIR/backup-restore.sh" && ! -x /usr/local/bin/rw-backup ]]; then
+    if command -v curl >/dev/null 2>&1; then
+      tmp="$(mktemp)"
+      if curl -fsSL "$UPSTREAM_RAW_URL" -o "$tmp"; then
+        install -m 0755 "$tmp" "$INSTALL_DIR/backup-restore.sh"
+        ln -sf "$INSTALL_DIR/backup-restore.sh" /usr/local/bin/rw-backup
+        echo "[OK] Original rw-backup installed"
+      else
+        echo "[WARN] Failed to download original rw-backup from $UPSTREAM_RAW_URL"
+      fi
+      rm -f "$tmp"
+    else
+      echo "[WARN] curl not found, original rw-backup auto-install skipped"
+    fi
+  else
+    echo "[INFO] Original rw-backup exists, not overwritten"
   fi
 fi
 
-msg "Checking syntax"
-bash -n "${INSTALL_DIR}/rw-backup-full.sh"
+if [[ -d systemd ]]; then
+  install -m 0644 systemd/rw-backup-full.service /etc/systemd/system/rw-backup-full.service
+  install -m 0644 systemd/rw-backup-full.timer /etc/systemd/system/rw-backup-full.timer
+  systemctl daemon-reload || true
+  echo "[OK] systemd unit templates installed, timer is not enabled automatically"
+fi
 
-msg "Installed: ${BIN_LINK}"
-msg "Next commands:"
+echo
+ echo "[OK] Installed rw-backup-full"
+echo "Next steps:"
 echo "  sudo rw-backup-full config"
 echo "  sudo rw-backup-full list"
-echo "  sudo rw-backup-full custom-backup"
+echo "  sudo rw-backup-full configure"
+echo "  sudo rw-backup-full install-timer"
