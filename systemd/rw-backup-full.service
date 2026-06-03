@@ -1,0 +1,11 @@
+[Unit]
+Description=rw-backup-full scheduled backup
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rw-backup-full backup-all
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

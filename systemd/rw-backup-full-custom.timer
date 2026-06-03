@@ -1,0 +1,10 @@
+[Unit]
+Description=Run rw-backup-full custom bot backup every 3 hours
+
+[Timer]
+OnCalendar=*-*-* 00/3:00:00
+Persistent=true
+Unit=rw-backup-full-custom.service
+
+[Install]
+WantedBy=timers.target
