@@ -1,7 +1,6 @@
+*.log
 *.tar.gz
 *.zip
-*.log
 .env
-config.env
-rw-backup-full.env
-backup/
+*.env.local
+.DS_Store

@@ -5,7 +5,7 @@ After=network-online.target docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/rw-backup-full custom-backup
+ExecStart=/usr/local/bin/rw-backup-full run-timer
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

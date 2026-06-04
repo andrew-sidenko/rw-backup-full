@@ -1,27 +1,26 @@
-# Systemd timer
+# systemd timer
 
-Установка/обновление timer:
+Install or update timer:
 
 ```bash
 sudo rw-backup-full install-timer
 ```
 
-Настройка режима и интервала:
+Timer settings are stored in:
 
-```bash
-sudo rw-backup-full configure
+```text
+/opt/rw-backup-restore/rw-backup-full.env
 ```
 
-Проверка:
+Variables:
 
-```bash
-systemctl list-timers | grep rw-backup
-sudo systemctl status rw-backup-full.timer
-sudo journalctl -u rw-backup-full.service -n 100 --no-pager
+```env
+FULL_TIMER_MODE="backup-all"
+FULL_TIMER_INTERVAL_HOURS="3"
 ```
 
-Удаление:
+Modes:
 
-```bash
-sudo rw-backup-full remove-timer
-```
+- `backup-all`
+- `panel-backup`
+- `custom-backup`

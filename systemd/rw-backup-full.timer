@@ -1,5 +1,5 @@
 [Unit]
-Description=Run rw-backup-full every 3 hours
+Description=Run rw-backup-full every configured interval
 
 [Timer]
 OnBootSec=10min

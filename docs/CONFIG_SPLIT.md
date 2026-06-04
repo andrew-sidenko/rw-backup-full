@@ -1,8 +1,29 @@
-# Разделение конфигов
+# Configuration split
 
-- `/opt/rw-backup-restore/config.env` — оригинальный config.env для distillium/remnawave-backup-restore.
-- `/opt/rw-backup-restore/rw-backup-full.env` — параметры только rw-backup-full.
+`rw-backup-full` v3 intentionally keeps two different config files.
 
-`rw-backup-full` читает из оригинального config.env только параметры доставки: Telegram/S3 и `UPLOAD_METHOD`, если `FULL_UPLOAD_METHOD=inherit`.
+## Original config
 
-Так оригинальный скрипт можно обновлять отдельно, а параметры custom backup не смешиваются с его настройками.
+```text
+/opt/rw-backup-restore/config.env
+```
+
+Used by original `distillium/remnawave-backup-restore`.
+
+Do not store `FULL_*` variables here.
+
+## Full config
+
+```text
+/opt/rw-backup-restore/rw-backup-full.env
+```
+
+Stores only `rw-backup-full` settings:
+
+- external S3 duplication;
+- Telegram notifications;
+- local/S3 retention;
+- timer mode and interval;
+- whether original rw-backup should be auto-installed.
+
+External S3 in this file is independent from original rw-backup S3 settings.
