@@ -119,7 +119,7 @@ For every successfully uploaded file, a separate Telegram message is sent if ena
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR-USER/rw-backup-full.git
+git clone https://github.com/andrew-sidenko/rw-backup-full.git
 cd rw-backup-full
 chmod +x install.sh
 sudo ./install.sh
@@ -329,7 +329,11 @@ Install awscli:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y awscli curl
+sudo apt-get install -y unzip curl
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+
 # optional, for encryption:
 sudo apt-get install -y age
 ```
