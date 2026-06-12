@@ -1,4 +1,4 @@
-# rw-backup-full v3
+# rw-backup-full
 
 `rw-backup-full` is an extension wrapper for `distillium/remnawave-backup-restore`.
 It adds automatic backups for custom Docker bots in `/home`, independent external S3 duplication, and Telegram notifications for every archive saved to the external S3.
