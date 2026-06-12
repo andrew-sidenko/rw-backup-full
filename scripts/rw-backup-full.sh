@@ -58,6 +58,12 @@ FULL_AGE_RECIPIENT=""
 FULL_AGE_RECIPIENTS_FILE=""
 FULL_AGE_IDENTITY_FILE=""
 
+# Результат maybe_encrypt_for_upload / encrypt_archive_age и причина последней ошибки age
+ENCRYPT_RESULT_FILE=""
+AGE_LAST_ERROR=""
+AGE_LAST_ERROR=""
+ENCRYPT_RESULT_FILE=""
+
 msg() {
   local type="$1"
   local text="$2"
@@ -199,6 +205,118 @@ full_s3_prefix_normalized() {
 
 full_s3_ready() {
   [[ -n "${FULL_EXTERNAL_S3_BUCKET:-}" && -n "${FULL_EXTERNAL_S3_ACCESS_KEY:-}" && -n "${FULL_EXTERNAL_S3_SECRET_KEY:-}" ]]
+}
+
+original_s3_available() {
+  # Есть ли в оригинальном config.env пригодные S3-настройки для копирования
+  [[ -n "${ORIG_S3_BUCKET:-}" && -n "${ORIG_S3_ACCESS_KEY:-}" && -n "${ORIG_S3_SECRET_KEY:-}" ]]
+}
+
+copy_original_s3_to_full() {
+  # Копирует bucket/keys/region/endpoint из оригинального rw-backup в FULL external S3.
+  # FULL_EXTERNAL_S3_PREFIX намеренно НЕ трогаем: full-архивы остаются под своим
+  # префиксом (rw-backup-full/...), и retention не заденет файлы оригинального скрипта.
+  if ! original_s3_available; then
+    msg ERR "В оригинальном config.env нет полных S3-настроек (bucket/access/secret)"
+    return 1
+  fi
+
+  set_full_var FULL_EXTERNAL_S3_BUCKET "$ORIG_S3_BUCKET"
+  set_full_var FULL_EXTERNAL_S3_ACCESS_KEY "$ORIG_S3_ACCESS_KEY"
+  set_full_var FULL_EXTERNAL_S3_SECRET_KEY "$ORIG_S3_SECRET_KEY"
+  set_full_var FULL_EXTERNAL_S3_REGION "${ORIG_S3_REGION:-us-east-1}"
+  set_full_var FULL_EXTERNAL_S3_ENDPOINT "${ORIG_S3_ENDPOINT:-}"
+
+  FULL_EXTERNAL_S3_BUCKET="$ORIG_S3_BUCKET"
+  FULL_EXTERNAL_S3_ACCESS_KEY="$ORIG_S3_ACCESS_KEY"
+  FULL_EXTERNAL_S3_SECRET_KEY="$ORIG_S3_SECRET_KEY"
+  FULL_EXTERNAL_S3_REGION="${ORIG_S3_REGION:-us-east-1}"
+  FULL_EXTERNAL_S3_ENDPOINT="${ORIG_S3_ENDPOINT:-}"
+
+  msg OK "Скопировано из оригинального rw-backup: bucket=${FULL_EXTERNAL_S3_BUCKET}, region=${FULL_EXTERNAL_S3_REGION}"
+  msg INFO "Prefix остаётся независимым: ${FULL_EXTERNAL_S3_PREFIX}"
+}
+
+ensure_awscli() {
+  # Проверяет awscli; в интерактивном режиме предлагает установить.
+  command -v aws >/dev/null 2>&1 && return 0
+
+  if [[ ! -t 0 ]]; then
+    msg WARN "awscli не найден (apt-get install -y awscli)"
+    return 1
+  fi
+
+  read -r -p "awscli не найден. Установить сейчас через apt-get? [Y/n]: " ans
+  case "${ans:-Y}" in
+    y|Y|"")
+      if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y awscli
+        command -v aws >/dev/null 2>&1 && { msg OK "awscli установлен"; return 0; }
+        msg ERR "Не удалось установить awscli"
+      else
+        msg ERR "apt-get не найден, установи awscli вручную"
+      fi
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_external_s3_interactive() {
+  # Вызывается перед backup'ом. Если external S3 включён, но не настроен:
+  #   - интерактивно: предложить скопировать из оригинального rw-backup,
+  #     заполнить вручную или продолжить без S3;
+  #   - из таймера (нет TTY): только предупредить.
+  # Возврат всегда 0 — отсутствие S3 не должно блокировать локальный backup.
+  # Спрашиваем не более одного раза за запуск.
+  if [[ "${S3_INTERACTIVE_CHECKED:-0}" == "1" ]]; then
+    return 0
+  fi
+  S3_INTERACTIVE_CHECKED=1
+
+  if full_s3_ready; then
+    ensure_awscli || true
+    return 0
+  fi
+
+  if ! truthy "${FULL_PANEL_EXTERNAL_S3_ENABLED:-true}" && ! truthy "${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"; then
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    msg WARN "External S3 не настроен — архивы останутся только локально (rw-backup-full configure-s3)"
+    return 0
+  fi
+
+  echo
+  msg WARN "External S3 (2-й S3 для дублирования) не настроен."
+  echo
+  if original_s3_available; then
+    echo "  1. Скопировать настройки из оригинального rw-backup (bucket=${ORIG_S3_BUCKET})"
+  else
+    echo "  1. (недоступно: в оригинальном config.env нет S3-настроек)"
+  fi
+  echo "  2. Заполнить вручную"
+  echo "  3. Продолжить без external S3 (только локальный backup)"
+  echo
+
+  read -r -p "[?] Выбор [3]: " choice
+  case "${choice:-3}" in
+    1)
+      if copy_original_s3_to_full; then
+        ensure_awscli || true
+      fi
+      ;;
+    2)
+      configure_external_s3
+      ensure_awscli || true
+      ;;
+    *)
+      msg INFO "Продолжаю без external S3"
+      ;;
+  esac
+
+  return 0
 }
 
 full_telegram_ready() {
@@ -353,49 +471,60 @@ age_recipient_args() {
 
 encrypt_archive_age() {
   # encrypt_archive_age <input> <keep_source: true|false>
-  # Печатает путь к .age файлу в stdout. При keep_source=false удаляет оригинал.
+  # Результат кладёт в глобальную ENCRYPT_RESULT_FILE.
+  # Причина последней ошибки — в AGE_LAST_ERROR (для Telegram-уведомлений).
   local input="$1"
   local keep_source="${2:-false}"
   local output="${input}.age"
 
+  AGE_LAST_ERROR=""
+
   if ! command -v age >/dev/null 2>&1; then
-    msg ERR "FULL_AGE_ENABLED=true, но age не установлен (apt-get install -y age)"
+    AGE_LAST_ERROR="age не установлен (apt-get install -y age)"
+    msg ERR "FULL_AGE_ENABLED=true, но ${AGE_LAST_ERROR}"
     return 1
   fi
 
   local rcpt
   rcpt="$(age_recipient_args)"
   if [[ -z "$rcpt" ]]; then
-    msg ERR "FULL_AGE_ENABLED=true, но не задан FULL_AGE_RECIPIENT / FULL_AGE_RECIPIENTS_FILE"
+    AGE_LAST_ERROR="не задан FULL_AGE_RECIPIENT / FULL_AGE_RECIPIENTS_FILE в ${FULL_CONFIG_FILE}"
+    msg ERR "FULL_AGE_ENABLED=true, но ${AGE_LAST_ERROR}"
     return 1
   fi
 
+  local age_err
   # shellcheck disable=SC2086
-  if age $rcpt -o "$output" "$input"; then
+  if age_err="$(age $rcpt -o "$output" "$input" 2>&1)"; then
     if ! truthy "$keep_source"; then
       rm -f "$input"
     fi
-    msg OK "Зашифровано: $(basename "$output")" >&2
-    echo "$output"
+    msg OK "Зашифровано: $(basename "$output")"
+    ENCRYPT_RESULT_FILE="$output"
     return 0
   fi
 
   rm -f "$output" 2>/dev/null || true
-  msg ERR "Ошибка age-шифрования: ${input}"
+  AGE_LAST_ERROR="age: ${age_err}"
+  msg ERR "Ошибка age-шифрования: ${input} — ${age_err}"
   return 1
 }
 
 maybe_encrypt_for_upload() {
   # maybe_encrypt_for_upload <file> <keep_source>
-  # Если age выключен — печатает исходный путь. Иначе печатает путь к .age.
+  # Результат кладёт в глобальную ENCRYPT_RESULT_FILE (без сабшелла, чтобы
+  # сообщения об ошибках и AGE_LAST_ERROR были видны вызывающему коду).
+  # Если age выключен — результат равен исходному пути.
   local file="$1"
   local keep_source="${2:-false}"
 
+  ENCRYPT_RESULT_FILE="$file"
+
   if truthy "${FULL_AGE_ENABLED:-false}"; then
-    encrypt_archive_age "$file" "$keep_source"
-  else
-    echo "$file"
+    encrypt_archive_age "$file" "$keep_source" || return 1
   fi
+
+  return 0
 }
 
 decrypt_archive_age() {
@@ -732,11 +861,13 @@ run_panel_backup() {
     # Шифруем только S3-дубль; локальный оригинал панели не трогаем (он принадлежит
     # оригинальному rw-backup), поэтому keep_source=true и временный .age удаляем после.
     local upload_file temp_encrypted="false"
-    if ! upload_file="$(maybe_encrypt_for_upload "$after_latest" "true")"; then
+    if ! maybe_encrypt_for_upload "$after_latest" "true"; then
       notify_failure "Panel backup encryption failed
-File: $(basename "$after_latest")"
+File: $(basename "$after_latest")
+Reason: ${AGE_LAST_ERROR:-unknown}"
       return 1
     fi
+    upload_file="$ENCRYPT_RESULT_FILE"
     [[ "$upload_file" != "$after_latest" ]] && temp_encrypted="true"
 
     if ! full_s3_upload "$upload_file" "panel" "remnawave-panel"; then
@@ -1093,12 +1224,14 @@ Archive: $(basename "$FINAL_ARCHIVE")
 
   # Опциональное шифрование (age). Дальше работаем с тем файлом, который вернулся.
   local upload_file
-  if ! upload_file="$(maybe_encrypt_for_upload "$FINAL_ARCHIVE" "false")"; then
+  if ! maybe_encrypt_for_upload "$FINAL_ARCHIVE" "false"; then
     notify_failure "Encryption failed
 Project: ${PROJECT_NAME}
-Archive: $(basename "$FINAL_ARCHIVE")"
+Archive: $(basename "$FINAL_ARCHIVE")
+Reason: ${AGE_LAST_ERROR:-unknown}"
     return 1
   fi
+  upload_file="$ENCRYPT_RESULT_FILE"
 
   if truthy "$FULL_CUSTOM_EXTERNAL_S3_ENABLED"; then
     if ! full_s3_upload "$upload_file" "custom-bot" "$PROJECT_NAME"; then
@@ -1113,12 +1246,16 @@ File: $(basename "$upload_file")"
 }
 
 backup_custom_menu() {
+  ensure_external_s3_interactive
+
   local entry
   entry="$(select_custom_project)" || return 1
   backup_custom_project_entry "$entry"
 }
 
 backup_custom_all() {
+  ensure_external_s3_interactive
+
   local found=0
   local entry
 
@@ -1374,6 +1511,8 @@ restore_custom_menu() {
 backup_all() {
   msg INFO "Запускаю Backup ALL"
 
+  ensure_external_s3_interactive
+
   run_panel_backup || msg WARN "Panel backup завершился с ошибкой или был пропущен"
   backup_custom_all || msg WARN "Custom bot backup завершился с ошибкой или проекты не найдены"
 
@@ -1381,6 +1520,7 @@ backup_all() {
 }
 
 backup_panel_only() {
+  ensure_external_s3_interactive
   run_panel_backup
 }
 
@@ -1432,6 +1572,25 @@ configure_external_s3() {
   echo
   echo "Этот S3 независим от оригинального /opt/rw-backup-restore/config.env."
   echo
+
+  if original_s3_available; then
+    read -r -p "Скопировать S3-настройки из оригинального rw-backup (bucket=${ORIG_S3_BUCKET})? [y/N]: " copy_ans
+    case "${copy_ans:-N}" in
+      y|Y)
+        copy_original_s3_to_full || return 1
+
+        read -r -p "Prefix [${FULL_EXTERNAL_S3_PREFIX}]: " prefix
+        prefix="${prefix:-$FULL_EXTERNAL_S3_PREFIX}"
+        set_full_var FULL_EXTERNAL_S3_PREFIX "$prefix"
+        set_full_var FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL "false"
+        FULL_EXTERNAL_S3_PREFIX="$prefix"
+
+        msg OK "External S3 настройки обновлены"
+        return 0
+        ;;
+    esac
+    echo
+  fi
 
   read -r -p "Bucket [${FULL_EXTERNAL_S3_BUCKET}]: " bucket
   bucket="${bucket:-$FULL_EXTERNAL_S3_BUCKET}"

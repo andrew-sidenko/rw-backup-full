@@ -50,6 +50,25 @@ if [[ ! -x "$INSTALL_DIR/backup-restore.sh" && ! -x /usr/local/bin/rw-backup ]];
   echo "[WARN] You can install it later: sudo rw-backup-full install-original"
 fi
 
+# Зависимости: awscli (external S3) и curl (Telegram). Ставим, если отсутствуют.
+missing_pkgs=()
+command -v aws  >/dev/null 2>&1 || missing_pkgs+=(awscli)
+command -v curl >/dev/null 2>&1 || missing_pkgs+=(curl)
+
+if (( ${#missing_pkgs[@]} > 0 )); then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "[INFO] Installing missing dependencies: ${missing_pkgs[*]}"
+    apt-get update -qq || true
+    if apt-get install -y "${missing_pkgs[@]}"; then
+      echo "[OK] Dependencies installed: ${missing_pkgs[*]}"
+    else
+      echo "[WARN] Failed to install: ${missing_pkgs[*]} — install them manually"
+    fi
+  else
+    echo "[WARN] apt-get not found; install manually: ${missing_pkgs[*]}"
+  fi
+fi
+
 cat > /etc/systemd/system/rw-backup-full.service <<'EOF_SERVICE'
 [Unit]
 Description=rw-backup-full scheduled backup

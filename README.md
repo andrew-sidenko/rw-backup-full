@@ -121,6 +121,7 @@ For every successfully uploaded file, a separate Telegram message is sent if ena
 ```bash
 git clone https://github.com/YOUR-USER/rw-backup-full.git
 cd rw-backup-full
+chmod +x install.sh
 sudo ./install.sh
 ```
 
