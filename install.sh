@@ -22,6 +22,19 @@ if [[ ! -f "$FULL_CONFIG" ]]; then
   echo "[OK] Created $FULL_CONFIG"
 else
   echo "[OK] Existing $FULL_CONFIG preserved"
+  # Миграция: дописываем ключи, появившиеся в новых версиях, не трогая существующие значения.
+  added=0
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    [[ "$key" =~ ^FULL_[A-Z0-9_]+$ ]] || continue
+    if ! grep -q "^${key}=" "$FULL_CONFIG"; then
+      echo "$line" >> "$FULL_CONFIG"
+      added=$((added + 1))
+    fi
+  done < "$SRC_DIR/config/rw-backup-full.env.example"
+  if (( added > 0 )); then
+    echo "[OK] Added $added new config key(s) to $FULL_CONFIG (defaults, review them)"
+  fi
 fi
 
 if [[ ! -f "$ORIGINAL_CONFIG" ]]; then
@@ -49,6 +62,7 @@ ExecStart=/usr/local/bin/rw-backup-full run-timer
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+TimeoutStartSec=2h
 EOF_SERVICE
 
 cat > /etc/systemd/system/rw-backup-full.timer <<'EOF_TIMER'
@@ -59,6 +73,7 @@ Description=Run rw-backup-full every configured interval
 OnBootSec=10min
 OnUnitActiveSec=3h
 Persistent=true
+RandomizedDelaySec=5min
 Unit=rw-backup-full.service
 
 [Install]
