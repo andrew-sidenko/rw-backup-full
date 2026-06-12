@@ -967,10 +967,12 @@ print_custom_projects() {
 }
 
 select_custom_project() {
+  # Вызывается через $(...), поэтому весь UI идёт в stderr,
+  # а в stdout печатается ТОЛЬКО выбранная entry.
   mapfile -t projects < <(detect_custom_projects)
 
   if [[ "${#projects[@]}" -eq 0 ]]; then
-    msg ERR "Не найдено custom bot проектов в /home"
+    msg ERR "Не найдено custom bot проектов в /home" >&2
     return 1
   fi
 
@@ -979,29 +981,31 @@ select_custom_project() {
     return 0
   fi
 
-  echo
-  echo -e "${GREEN}${BOLD}Выбери custom bot project:${RESET}"
-  echo
+  {
+    echo
+    echo -e "${GREEN}${BOLD}Выбери custom bot project:${RESET}"
+    echo
+  } >&2
 
   local i=1
   local entry
 
   for entry in "${projects[@]}"; do
     IFS='|' read -r project dir pg pg_service redis redis_service apps <<< "$entry"
-    echo " ${i}. ${project} — ${dir}"
+    echo " ${i}. ${project} — ${dir}" >&2
     ((i++))
   done
 
-  echo
+  echo >&2
   read -r -p "[?] Номер: " choice
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-    msg ERR "Некорректный выбор"
+    msg ERR "Некорректный выбор" >&2
     return 1
   fi
 
   if (( choice < 1 || choice > ${#projects[@]} )); then
-    msg ERR "Некорректный выбор"
+    msg ERR "Некорректный выбор" >&2
     return 1
   fi
 
@@ -1272,28 +1276,34 @@ backup_custom_all() {
 }
 
 select_restore_archive() {
+  # Вызывается через $(...), поэтому весь UI идёт в stderr,
+  # а в stdout печатается ТОЛЬКО путь к выбранному архиву.
   mapfile -t archives < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name 'custom_bot_*.tar.gz' -o -name 'custom_bot_*.tar.gz.age' \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
 
-  echo
-  echo -e "${GREEN}${BOLD}Выбери архив для восстановления:${RESET}"
-  echo
+  {
+    echo
+    echo -e "${GREEN}${BOLD}Выбери архив для восстановления:${RESET}"
+    echo
+  } >&2
 
   if [[ "${#archives[@]}" -gt 0 ]]; then
     local i=1
     local a
 
     for a in "${archives[@]}"; do
-      echo " ${i}. $(basename "$a") — $(du -h "$a" | awk '{print $1}')"
+      echo " ${i}. $(basename "$a") — $(du -h "$a" | awk '{print $1}')" >&2
       ((i++))
     done
 
-    echo
+    echo >&2
   else
-    msg WARN "Локальные custom_bot архивы не найдены в ${BACKUP_DIR}"
+    msg WARN "Локальные custom_bot архивы не найдены в ${BACKUP_DIR}" >&2
   fi
 
-  echo " 0. Указать путь вручную"
-  echo
+  {
+    echo " 0. Указать путь вручную"
+    echo
+  } >&2
 
   read -r -p "[?] Номер или 0: " choice
 
@@ -1301,7 +1311,7 @@ select_restore_archive() {
     read -r -p "Путь к архиву: " manual_archive
 
     [[ -f "$manual_archive" ]] || {
-      msg ERR "Файл не найден: ${manual_archive}"
+      msg ERR "Файл не найден: ${manual_archive}" >&2
       return 1
     }
 
@@ -1310,12 +1320,12 @@ select_restore_archive() {
   fi
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-    msg ERR "Некорректный выбор"
+    msg ERR "Некорректный выбор" >&2
     return 1
   fi
 
   if (( choice < 1 || choice > ${#archives[@]} )); then
-    msg ERR "Некорректный выбор"
+    msg ERR "Некорректный выбор" >&2
     return 1
   fi
 
@@ -1502,9 +1512,135 @@ restore_custom_archive() {
   fi
 }
 
+s3_list_custom_backups() {
+  # Печатает строки "epoch|size|key" для всех custom_bot архивов во внешнем S3
+  # (все хосты под префиксом custom-bot/), сортировка: свежие сверху.
+  local endpoint_arg=()
+  if [[ -n "${FULL_EXTERNAL_S3_ENDPOINT:-}" ]]; then
+    endpoint_arg=(--endpoint-url "$FULL_EXTERNAL_S3_ENDPOINT")
+  fi
+
+  local prefix listing
+  prefix="$(full_s3_prefix_normalized)custom-bot/"
+
+  if ! listing="$(
+    AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY" \
+    AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}" \
+    aws s3 ls "s3://${FULL_EXTERNAL_S3_BUCKET}/${prefix}" "${endpoint_arg[@]}" --recursive 2>&1
+  )"; then
+    msg ERR "Не удалось получить листинг S3: ${listing}" >&2
+    return 1
+  fi
+
+  local file_size file_key base_name file_epoch
+  {
+    while read -r _ _ file_size file_key; do
+      [[ -n "${file_key:-}" ]] || continue
+      base_name="$(basename "$file_key")"
+      [[ "$base_name" =~ ^custom_bot_.*\.tar\.gz(\.age)?$ ]] || continue
+      file_epoch="$(parse_backup_timestamp_epoch "$base_name")"
+      [[ -n "$file_epoch" ]] || continue
+      printf '%s|%s|%s\n' "$file_epoch" "$file_size" "$file_key"
+    done <<< "$listing"
+  } | sort -t'|' -k1,1nr
+}
+
+s3_download_backup() {
+  # s3_download_backup <s3_key> — скачивает в BACKUP_DIR, печатает локальный путь.
+  local key="$1"
+  local dest="${BACKUP_DIR}/$(basename "$key")"
+
+  local endpoint_arg=()
+  if [[ -n "${FULL_EXTERNAL_S3_ENDPOINT:-}" ]]; then
+    endpoint_arg=(--endpoint-url "$FULL_EXTERNAL_S3_ENDPOINT")
+  fi
+
+  msg INFO "Скачиваю s3://${FULL_EXTERNAL_S3_BUCKET}/${key}" >&2
+
+  if AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY" \
+     AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY" \
+     AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}" \
+     aws s3 cp "s3://${FULL_EXTERNAL_S3_BUCKET}/${key}" "$dest" "${endpoint_arg[@]}" --quiet; then
+    msg OK "Скачано: ${dest}" >&2
+    echo "$dest"
+    return 0
+  fi
+
+  msg ERR "Не удалось скачать: ${key}" >&2
+  return 1
+}
+
+select_s3_restore_archive() {
+  # Показывает список custom_bot бэкапов из внешнего S3, скачивает выбранный,
+  # печатает локальный путь к нему.
+  if ! command -v aws >/dev/null 2>&1; then
+    msg ERR "awscli не найден" >&2
+    return 1
+  fi
+
+  if ! full_s3_ready; then
+    msg ERR "External S3 не настроен (rw-backup-full configure-s3)" >&2
+    return 1
+  fi
+
+  msg INFO "Получаю список бэкапов из S3..." >&2
+
+  local entries
+  entries="$(s3_list_custom_backups)" || return 1
+
+  if [[ -z "$entries" ]]; then
+    msg WARN "В S3 не найдено custom_bot архивов" >&2
+    return 1
+  fi
+
+  local -a keys=()
+  local epoch size key human_date human_size host
+  local i=1
+
+  {
+    echo
+    echo -e "${GREEN}${BOLD}Бэкапы во внешнем S3 (свежие сверху):${RESET}"
+    echo
+  } >&2
+
+  while IFS='|' read -r epoch size key; do
+    keys+=("$key")
+    human_date="$(date -u -d "@$epoch" +'%Y-%m-%d %H:%M UTC' 2>/dev/null || echo '?')"
+    human_size="$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "${size}B")"
+    # host — предпоследний сегмент ключа: .../custom-bot/<host>/<file>
+    host="$(basename "$(dirname "$key")")"
+    printf ' %2d. %s  %s  host=%s  %s\n' "$i" "$human_date" "$human_size" "$host" "$(basename "$key")" >&2
+    i=$((i + 1))
+    (( i > 30 )) && { echo "   ... (показаны 30 свежайших)" >&2; break; }
+  done <<< "$entries"
+
+  echo >&2
+  read -r -p "[?] Номер для скачивания и восстановления (0 — отмена): " choice
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#keys[@]} )); then
+    msg INFO "Отмена" >&2
+    return 1
+  fi
+
+  s3_download_backup "${keys[$((choice - 1))]}"
+}
+
 restore_custom_menu() {
+  echo
+  echo -e "${GREEN}${BOLD}Restore custom bot — источник архива:${RESET}"
+  echo
+  echo "  1. Локальные архивы (${BACKUP_DIR})"
+  echo "  2. Внешний S3 (скачать и восстановить)"
+  echo
+  read -r -p "[?] Выбор [1]: " src
+
   local archive
-  archive="$(select_restore_archive)" || return 1
+  case "${src:-1}" in
+    2) archive="$(select_s3_restore_archive)" || return 1 ;;
+    *) archive="$(select_restore_archive)" || return 1 ;;
+  esac
+
   restore_custom_archive "$archive"
 }
 
@@ -1849,7 +1985,9 @@ Usage:
   rw-backup-full custom-backup
   rw-backup-full backup-all
   rw-backup-full custom-restore
+  rw-backup-full custom-restore-s3
   rw-backup-full custom-restore-file /path/to/custom_bot_archive.tar.gz [--yes]
+  rw-backup-full s3-list
   rw-backup-full configure-retention
   rw-backup-full configure-s3
   rw-backup-full configure-telegram
@@ -1877,6 +2015,16 @@ case "$cmd" in
   custom-backup) backup_custom_all ;;
   backup-all) backup_all ;;
   custom-restore) restore_custom_menu ;;
+  custom-restore-s3)
+    archive="$(select_s3_restore_archive)" || exit 1
+    restore_custom_archive "$archive"
+    ;;
+  s3-list)
+    if ! full_s3_ready; then msg ERR "External S3 не настроен"; exit 1; fi
+    s3_list_custom_backups | while IFS='|' read -r epoch size key; do
+      printf '%s  %12s  %s\n' "$(date -u -d "@$epoch" +'%Y-%m-%d %H:%M UTC')" "$size" "$key"
+    done
+    ;;
   custom-restore-file)
     archive="${2:-}"
     yes_flag="${3:-}"
