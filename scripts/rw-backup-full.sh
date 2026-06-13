@@ -1130,6 +1130,8 @@ write_profile_env() {
   {
     printf 'PROJECT_NAME=%q\n' "$project_name"
     printf 'PROJECT_DIR=%q\n' "$project_dir"
+    # Реальное имя папки на диске (может отличаться регистром от PROJECT_NAME)
+    printf 'PROJECT_BASE=%q\n' "$(basename "$project_dir")"
     printf 'POSTGRES_CONTAINER=%q\n' "$pg_container"
     printf 'POSTGRES_SERVICE=%q\n' "$pg_service"
     printf 'REDIS_CONTAINER=%q\n' "$redis_container"
@@ -1560,7 +1562,7 @@ restore_custom_archive() {
 
   # ── 4. Читаем PROFILE.env БЕЗ source ──────────────────────────────────────
   # source запускает RETURN trap и сносит tmp_root — парсим вручную.
-  local PROJECT_NAME="" PROJECT_DIR="" POSTGRES_CONTAINER="" POSTGRES_SERVICE=""
+  local PROJECT_NAME="" PROJECT_DIR="" PROJECT_BASE="" POSTGRES_CONTAINER="" POSTGRES_SERVICE=""
   local REDIS_CONTAINER="" REDIS_SERVICE=""
 
   if [[ -f "$profile_env" ]]; then
@@ -1570,7 +1572,8 @@ restore_custom_archive() {
       _key="${BASH_REMATCH[1]}"
       _val="${BASH_REMATCH[2]}"
       case "$_key" in
-        PROJECT_NAME|PROJECT_DIR|POSTGRES_CONTAINER|POSTGRES_SERVICE|\
+        PROJECT_NAME|PROJECT_DIR|PROJECT_BASE|\
+        POSTGRES_CONTAINER|POSTGRES_SERVICE|\
         REDIS_CONTAINER|REDIS_SERVICE)
           printf -v "$_key" '%s' "$_val"
           ;;
@@ -1578,8 +1581,8 @@ restore_custom_archive() {
     done < "$profile_env"
   fi
 
-  # project_top: из PROFILE.env; fallback — первая директория внутри project_dir.tar.gz
-  local project_top="${PROJECT_NAME:-}"
+  # project_top: приоритет PROJECT_BASE (точное имя папки на диске) > PROJECT_NAME > tar listing
+  local project_top="${PROJECT_BASE:-${PROJECT_NAME:-}}"
   if [[ -z "$project_top" ]]; then
     project_top="$(tar -tzf "$project_tar" 2>/dev/null | head -n 1 | cut -d/ -f1)"
   fi
@@ -1633,10 +1636,26 @@ restore_custom_archive() {
 
   msg INFO "Распаковываю project_dir.tar.gz..."
 
-  tar -xzf "$project_tar" -C "$project_extract_dir"
+  if ! tar -xzf "$project_tar" -C "$project_extract_dir"; then
+    _rca_fail "Не удалось распаковать project_dir.tar.gz"; return 1
+  fi
+
+  # Берём фактическое имя директории из извлечённого содержимого.
+  # PROFILE.env хранит PROJECT_NAME строчными, а реальная папка может быть
+  # смешанного регистра (например OneOkBotNew vs oneokbotnew).
+  local actual_extracted
+  actual_extracted="$(ls -1 "$project_extract_dir" | head -1)"
+
+  if [[ -z "$actual_extracted" ]]; then
+    _rca_fail "project_dir.tar.gz пустой — ничего не извлечено"; return 1
+  fi
+
+  if [[ "$actual_extracted" != "$project_top" ]]; then
+    msg INFO "Реальное имя папки в архиве: ${actual_extracted} (в PROFILE.env: ${project_top})"
+  fi
 
   mkdir -p "$(dirname "$PROJECT_DIR")"
-  mv "$project_extract_dir/$project_top" "$PROJECT_DIR"
+  mv "$project_extract_dir/$actual_extracted" "$PROJECT_DIR"
 
   msg OK "Папка проекта восстановлена: ${PROJECT_DIR}"
 
