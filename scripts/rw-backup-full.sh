@@ -91,12 +91,16 @@ capture_original_vars() {
   ORIG_TG_MESSAGE_THREAD_ID="${TG_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID:-${MESSAGE_THREAD_ID:-}}}"
   ORIG_TG_PROXY="${TG_PROXY:-${TELEGRAM_PROXY:-}}"
 
-  ORIG_S3_BUCKET="${S3_BUCKET:-${AWS_S3_BUCKET:-}}"
-  ORIG_S3_ACCESS_KEY="${S3_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-}}"
-  ORIG_S3_SECRET_KEY="${S3_SECRET_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
-  ORIG_S3_REGION="${S3_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
-  ORIG_S3_ENDPOINT="${S3_ENDPOINT:-${AWS_ENDPOINT_URL:-}}"
-  ORIG_S3_PREFIX="${S3_PREFIX:-${AWS_S3_PREFIX:-}}"
+  # ORIG_S3_* — читаем из config.env оригинального rw-backup.
+  # Если имена переменных в config.env нестандартные, задайте ORIG_S3_BUCKET,
+  # ORIG_S3_ACCESS_KEY, ORIG_S3_SECRET_KEY напрямую в rw-backup-full.env —
+  # они имеют приоритет над автоматическим определением.
+  ORIG_S3_BUCKET="${ORIG_S3_BUCKET:-${S3_BUCKET:-${AWS_S3_BUCKET:-${BACKUP_S3_BUCKET:-}}}}"
+  ORIG_S3_ACCESS_KEY="${ORIG_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-${BACKUP_S3_ACCESS_KEY:-}}}}"
+  ORIG_S3_SECRET_KEY="${ORIG_S3_SECRET_KEY:-${S3_SECRET_KEY:-${AWS_SECRET_ACCESS_KEY:-${BACKUP_S3_SECRET_KEY:-}}}}"
+  ORIG_S3_REGION="${ORIG_S3_REGION:-${S3_REGION:-${AWS_DEFAULT_REGION:-${BACKUP_S3_REGION:-us-east-1}}}}"
+  ORIG_S3_ENDPOINT="${ORIG_S3_ENDPOINT:-${S3_ENDPOINT:-${AWS_ENDPOINT_URL:-${BACKUP_S3_ENDPOINT:-}}}}"
+  ORIG_S3_PREFIX="${ORIG_S3_PREFIX:-${S3_PREFIX:-${AWS_S3_PREFIX:-${BACKUP_S3_PREFIX:-}}}}"
   ORIG_UPLOAD_METHOD="${UPLOAD_METHOD:-${BACKUP_UPLOAD_METHOD:-}}"
 }
 
@@ -1302,7 +1306,7 @@ NOTES
 
   (
     cd "$WORK_DIR"
-    find . -type f -maxdepth 3 -print0 | xargs -0 sha256sum > SHA256SUMS 2>/dev/null || true
+    find . -maxdepth 3 -type f -print0 | xargs -0 sha256sum > SHA256SUMS 2>/dev/null || true
   )
 
   msg INFO "Создаю финальный архив..."
@@ -1344,7 +1348,9 @@ File: $(basename "$FINAL_ARCHIVE")"
       fi
       primary_s3_retention_cleanup || true
     else
-      msg INFO "Primary S3 пропущен: в config.env нет S3-настроек"
+      msg WARN "Primary S3 пропущен: в config.env нет S3-настроек"
+      msg WARN "  Проверьте: S3_BUCKET=${ORIG_S3_BUCKET:-<пусто>}, S3_ACCESS_KEY=${ORIG_S3_ACCESS_KEY:+set}, S3_SECRET_KEY=${ORIG_S3_SECRET_KEY:+set}"
+      msg WARN "  Если config.env использует нестандартные имена — задайте ORIG_S3_BUCKET/ORIG_S3_ACCESS_KEY/ORIG_S3_SECRET_KEY напрямую в rw-backup-full.env"
     fi
   fi
 
@@ -2044,7 +2050,9 @@ show_config_summary() {
   echo "FULL_TG_THREAD_ID:                  ${FULL_TG_MESSAGE_THREAD_ID:-not set}"
   echo
   echo "ORIG_UPLOAD_METHOD:                 ${ORIG_UPLOAD_METHOD:-not set}"
-  echo "ORIG_S3_BUCKET:                     ${ORIG_S3_BUCKET:-not set}"
+  echo "ORIG_S3_BUCKET:                     ${ORIG_S3_BUCKET:-not set (read from config.env)}"
+  echo "  original_s3_available:           $(original_s3_available && echo YES || echo NO)"
+  echo "FULL_CUSTOM_PRIMARY_S3_ENABLED:    ${FULL_CUSTOM_PRIMARY_S3_ENABLED}"
   echo "ORIG_TG_CHAT_ID:                    ${ORIG_TG_CHAT_ID:-not set}"
   echo
 }
