@@ -1475,41 +1475,81 @@ restore_custom_archive() {
     return 1
   }
 
-  local restore_ts="$(date +%Y%m%d_%H%M%S)"
+  local restore_ts
+  restore_ts="$(date +%Y%m%d_%H%M%S)"
   local tmp_root="/tmp/rw-custom-restore-${restore_ts}"
   local extract_dir="${tmp_root}/outer"
   local project_extract_dir="${tmp_root}/project"
 
   mkdir -p "$extract_dir" "$project_extract_dir"
 
-  cleanup_restore_tmp() {
-    rm -rf "$tmp_root"
-  }
-
+  cleanup_restore_tmp() { rm -rf "$tmp_root"; }
   trap cleanup_restore_tmp RETURN
 
-  # Зашифрованный архив (.age) сначала расшифровываем во временный файл.
+  # ── 1. Расшифровка .age ────────────────────────────────────────────────────
   if [[ "$archive" == *.age ]]; then
     msg INFO "Архив зашифрован (age), расшифровываю..."
-    local decrypted="${tmp_root}/$(basename "${archive%.age}")"
-    if ! decrypt_archive_age "$archive" "$decrypted"; then
-      msg ERR "Не удалось расшифровать архив"
+
+    if ! command -v age >/dev/null 2>&1; then
+      msg ERR "age не установлен. Установи: apt-get install -y age"
       return 1
     fi
+
+    if [[ -z "${FULL_AGE_IDENTITY_FILE:-}" || ! -f "${FULL_AGE_IDENTITY_FILE:-}" ]]; then
+      msg ERR "Для расшифровки нужен приватный ключ age."
+      msg ERR "Задай FULL_AGE_IDENTITY_FILE=/путь/к/age-key.txt в ${FULL_CONFIG_FILE}"
+      msg ERR "Если ключ не сохранён — этот архив можно открыть только при наличии ключа."
+      return 1
+    fi
+
+    local decrypted="${tmp_root}/$(basename "${archive%.age}")"
+    if ! age -d -i "$FULL_AGE_IDENTITY_FILE" -o "$decrypted" "$archive"; then
+      msg ERR "Расшифровка провалилась. Возможные причины:"
+      msg ERR "  • Неправильный приватный ключ (FULL_AGE_IDENTITY_FILE=${FULL_AGE_IDENTITY_FILE})"
+      msg ERR "  • Повреждён .age файл"
+      return 1
+    fi
+
+    # Убеждаемся что расшифрованный файл — валидный gzip
+    if ! gzip -t "$decrypted" 2>/dev/null; then
+      msg ERR "Расшифрован файл, но он не является валидным tar.gz (неверный ключ или повреждён архив)"
+      msg ERR "  Размер расшифрованного файла: $(stat -c '%s' "$decrypted" 2>/dev/null || echo '?') байт"
+      return 1
+    fi
+
+    msg OK "Расшифровано: $(basename "$decrypted") ($(du -h "$decrypted" | awk '{print $1}'))"
     archive="$decrypted"
   fi
 
+  # ── 2. Распаковка внешнего архива ─────────────────────────────────────────
   msg INFO "Распаковываю архив: ${archive}"
 
-  tar -xzf "$archive" -C "$extract_dir"
+  if ! tar -xzf "$archive" -C "$extract_dir" 2>&1; then
+    msg ERR "Не удалось распаковать архив — он повреждён или неполный"
+    return 1
+  fi
 
-  local project_tar="$(find "$extract_dir" -type f -name 'project_dir.tar.gz' | head -n 1 || true)"
-  local postgres_dump="$(find "$extract_dir" -type f -name 'postgres_dump.sql.gz' | head -n 1 || true)"
-  local redis_dump="$(find "$extract_dir" -type f -name 'redis_dump.rdb' | head -n 1 || true)"
-  local profile_env="$(find "$extract_dir" -type f -name 'PROFILE.env' | head -n 1 || true)"
+  # Диагностика: показываем что извлеклось
+  local extracted_top
+  extracted_top="$(ls -1 "$extract_dir" 2>/dev/null | head -1)"
+  if [[ -z "$extracted_top" ]]; then
+    msg ERR "После распаковки директория пуста — архив пустой или повреждён"
+    return 1
+  fi
+  msg INFO "Содержимое архива (верхний уровень): ${extracted_top}"
+
+  # ── 3. Находим компоненты restore ─────────────────────────────────────────
+  local profile_env project_tar postgres_dump redis_dump
+
+  profile_env="$(  find "$extract_dir" -maxdepth 2 -type f -name 'PROFILE.env'        | head -n 1)"
+  project_tar="$(  find "$extract_dir" -maxdepth 2 -type f -name 'project_dir.tar.gz' | head -n 1)"
+  postgres_dump="$(find "$extract_dir" -maxdepth 2 -type f -name 'postgres_dump.sql.gz' | head -n 1)"
+  redis_dump="$(   find "$extract_dir" -maxdepth 2 -type f -name 'redis_dump.rdb'     | head -n 1)"
 
   [[ -n "$project_tar" ]] || {
     msg ERR "В архиве нет project_dir.tar.gz"
+    msg ERR "Файлы в архиве:"
+    find "$extract_dir" -maxdepth 3 | sed 's|'"$extract_dir"'/||' | sort | head -30 >&2
     return 1
   }
 
@@ -1518,6 +1558,15 @@ restore_custom_archive() {
     return 1
   }
 
+  # Проверяем project_dir.tar.gz до попытки его читать
+  if ! gzip -t "$project_tar" 2>/dev/null; then
+    msg ERR "project_dir.tar.gz повреждён или не является валидным gzip"
+    msg ERR "  Путь: ${project_tar}"
+    msg ERR "  Размер: $(stat -c '%s' "$project_tar" 2>/dev/null || echo '?') байт"
+    return 1
+  fi
+
+  # ── 4. Читаем PROFILE.env и определяем project_top ────────────────────────
   if [[ -n "$profile_env" ]]; then
     set +u
     # shellcheck disable=SC1090
@@ -1525,10 +1574,17 @@ restore_custom_archive() {
     set -u
   fi
 
-  local project_top="$(tar -tzf "$project_tar" | head -n 1 | cut -d/ -f1)"
+  # Приоритет: PROJECT_NAME из PROFILE.env → top-dir внутри project_dir.tar.gz
+  local project_top="${PROJECT_NAME:-}"
+  if [[ -z "$project_top" ]]; then
+    project_top="$(tar -tzf "$project_tar" 2>/dev/null | head -n 1 | cut -d/ -f1)"
+  fi
 
   [[ -n "$project_top" ]] || {
-    msg ERR "Не могу определить папку проекта внутри project_dir.tar.gz"
+    msg ERR "Не удалось определить папку проекта"
+    msg ERR "  PROFILE.env: ${profile_env:-не найден}"
+    msg ERR "  Первые строки project_dir.tar.gz (gzip -dc | tar -t):"
+    gzip -dc "$project_tar" 2>/dev/null | tar -t 2>/dev/null | head -5 >&2 || true
     return 1
   }
 

@@ -1,4 +1,4 @@
-# rw-backup-full v8
+# rw-backup-full v3
 
 `rw-backup-full` is an extension wrapper for `distillium/remnawave-backup-restore`.
 It adds automatic backups for custom Docker bots in `/home`, independent external S3 duplication, and Telegram notifications for every archive saved to the external S3.
@@ -119,7 +119,7 @@ For every successfully uploaded file, a separate Telegram message is sent if ena
 ## Installation
 
 ```bash
-git clone https://github.com/andrew-sidenko/rw-backup-full.git
+git clone https://github.com/YOUR-USER/rw-backup-full.git
 cd rw-backup-full
 chmod +x install.sh
 sudo ./install.sh
@@ -329,11 +329,7 @@ Install awscli:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y unzip curl
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip awscliv2.zip
-sudo ./aws/install
-
+sudo apt-get install -y awscli curl
 # optional, for encryption:
 sudo apt-get install -y age
 ```
