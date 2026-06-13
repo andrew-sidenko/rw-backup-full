@@ -36,6 +36,7 @@ FULL_REQUIRE_ORIGINAL_RW_BACKUP="false"
 FULL_INCLUDE_EXTRA_CONFIGS="true"
 FULL_PANEL_EXTERNAL_S3_ENABLED="true"
 FULL_CUSTOM_EXTERNAL_S3_ENABLED="true"
+FULL_CUSTOM_PRIMARY_S3_ENABLED="true"   # upload custom bot to PRIMARY S3 (original rw-backup bucket), no encryption
 FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD="true"
 FULL_TELEGRAM_IMPORT_FROM_ORIGINAL="true"
 FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL="false"
@@ -126,6 +127,7 @@ load_config() {
   FULL_INCLUDE_EXTRA_CONFIGS="${FULL_INCLUDE_EXTRA_CONFIGS:-true}"
   FULL_PANEL_EXTERNAL_S3_ENABLED="${FULL_PANEL_EXTERNAL_S3_ENABLED:-true}"
   FULL_CUSTOM_EXTERNAL_S3_ENABLED="${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"
+  FULL_CUSTOM_PRIMARY_S3_ENABLED="${FULL_CUSTOM_PRIMARY_S3_ENABLED:-true}"
   FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD="${FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD:-true}"
   FULL_TELEGRAM_IMPORT_FROM_ORIGINAL="${FULL_TELEGRAM_IMPORT_FROM_ORIGINAL:-true}"
   FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL="${FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL:-false}"
@@ -208,37 +210,135 @@ full_s3_ready() {
 }
 
 original_s3_available() {
-  # Есть ли в оригинальном config.env пригодные S3-настройки для копирования
   [[ -n "${ORIG_S3_BUCKET:-}" && -n "${ORIG_S3_ACCESS_KEY:-}" && -n "${ORIG_S3_SECRET_KEY:-}" ]]
 }
 
-copy_original_s3_to_full() {
-  # Копирует bucket/keys/region/endpoint из оригинального rw-backup в FULL external S3.
-  # FULL_EXTERNAL_S3_PREFIX намеренно НЕ трогаем: full-архивы остаются под своим
-  # префиксом (rw-backup-full/...), и retention не заденет файлы оригинального скрипта.
-  if ! original_s3_available; then
-    msg ERR "В оригинальном config.env нет полных S3-настроек (bucket/access/secret)"
+primary_s3_prefix_normalized() {
+  local p="${ORIG_S3_PREFIX:-}"
+  [[ -z "$p" ]] && { echo ""; return 0; }
+  p="${p#/}"
+  [[ "$p" == */ ]] || p="${p}/"
+  echo "$p"
+}
+
+primary_s3_upload() {
+  # Загружает custom bot архив в ОСНОВНОЙ S3 (тот же бакет, которым пользуется
+  # оригинальный rw-backup для панели) — БЕЗ шифрования.
+  # Путь: <orig_prefix>custom-bot/<host>/<file>
+  local file_path="$1"
+  local label="$2"
+
+  if ! command -v aws >/dev/null 2>&1; then
+    msg WARN "awscli не найден — primary S3 upload пропущен"
     return 1
   fi
 
-  set_full_var FULL_EXTERNAL_S3_BUCKET "$ORIG_S3_BUCKET"
-  set_full_var FULL_EXTERNAL_S3_ACCESS_KEY "$ORIG_S3_ACCESS_KEY"
-  set_full_var FULL_EXTERNAL_S3_SECRET_KEY "$ORIG_S3_SECRET_KEY"
-  set_full_var FULL_EXTERNAL_S3_REGION "${ORIG_S3_REGION:-us-east-1}"
-  set_full_var FULL_EXTERNAL_S3_ENDPOINT "${ORIG_S3_ENDPOINT:-}"
+  if ! original_s3_available; then
+    msg WARN "В оригинальном config.env нет S3-настроек — primary S3 upload пропущен"
+    return 1
+  fi
 
-  FULL_EXTERNAL_S3_BUCKET="$ORIG_S3_BUCKET"
-  FULL_EXTERNAL_S3_ACCESS_KEY="$ORIG_S3_ACCESS_KEY"
-  FULL_EXTERNAL_S3_SECRET_KEY="$ORIG_S3_SECRET_KEY"
-  FULL_EXTERNAL_S3_REGION="${ORIG_S3_REGION:-us-east-1}"
-  FULL_EXTERNAL_S3_ENDPOINT="${ORIG_S3_ENDPOINT:-}"
+  local endpoint_arg=()
+  [[ -n "${ORIG_S3_ENDPOINT:-}" ]] && endpoint_arg=(--endpoint-url "$ORIG_S3_ENDPOINT")
 
-  msg OK "Скопировано из оригинального rw-backup: bucket=${FULL_EXTERNAL_S3_BUCKET}, region=${FULL_EXTERNAL_S3_REGION}"
-  msg INFO "Prefix остаётся независимым: ${FULL_EXTERNAL_S3_PREFIX}"
+  local host file_name s3_key size
+  host="$(hostname -s 2>/dev/null || hostname)"
+  file_name="$(basename "$file_path")"
+  s3_key="$(primary_s3_prefix_normalized)custom-bot/${host}/${file_name}"
+  size="$(du -h "$file_path" | awk '{print $1}')"
+
+  msg INFO "Primary S3 upload (без шифрования): s3://${ORIG_S3_BUCKET}/${s3_key} [${size}]"
+
+  if ! AWS_ACCESS_KEY_ID="$ORIG_S3_ACCESS_KEY" \
+       AWS_SECRET_ACCESS_KEY="$ORIG_S3_SECRET_KEY" \
+       AWS_DEFAULT_REGION="${ORIG_S3_REGION:-us-east-1}" \
+       aws s3 cp "$file_path" "s3://${ORIG_S3_BUCKET}/${s3_key}" "${endpoint_arg[@]}" --quiet; then
+    return 1
+  fi
+
+  if truthy "${FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD:-false}"; then
+    send_full_telegram_message "✅ Backup saved to primary S3
+Type: custom-bot
+Project: ${label}
+File: ${file_name} (${size})
+S3: s3://${ORIG_S3_BUCKET}/${s3_key}" || true
+  fi
+
+  return 0
+}
+
+primary_s3_retention_cleanup() {
+  # Чистит ТОЛЬКО custom_bot_* архивы под prefx/custom-bot/ в основном S3.
+  # Панельные remnawave_backup_* НИКОГДА не трогает.
+  local dry_run="false"
+  [[ "${1:-}" == "--dry-run" ]] && dry_run="true"
+
+  original_s3_available || return 0
+
+  local days="${FULL_PRIMARY_S3_RETENTION_DAYS:-${FULL_EXTERNAL_S3_RETENTION_DAYS:-10}}"
+  local min_keep="${FULL_EXTERNAL_S3_RETENTION_MIN_KEEP:-3}"
+  local endpoint_arg=()
+  [[ -n "${ORIG_S3_ENDPOINT:-}" ]] && endpoint_arg=(--endpoint-url "$ORIG_S3_ENDPOINT")
+
+  local prefix listing
+  prefix="$(primary_s3_prefix_normalized)custom-bot/"
+
+  if ! listing="$(
+    AWS_ACCESS_KEY_ID="$ORIG_S3_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$ORIG_S3_SECRET_KEY" \
+    AWS_DEFAULT_REGION="${ORIG_S3_REGION:-us-east-1}" \
+    aws s3 ls "s3://${ORIG_S3_BUCKET}/${prefix}" "${endpoint_arg[@]}" --recursive 2>&1
+  )"; then
+    msg ERR "Не удалось получить листинг primary S3 — retention прерван"
+    return 1
+  fi
+
+  local now cutoff deleted=0 kept=0
+  now="$(date -u +%s)"
+  cutoff=$(( now - days * 86400 ))
+  declare -A grp_seen=()
+  local -a entries=()
+
+  while read -r _ _ _ file_key; do
+    [[ -n "${file_key:-}" ]] || continue
+    local bname ep grp
+    bname="$(basename "$file_key")"
+    [[ "$bname" =~ ^custom_bot_.*\.tar\.gz(\.age)?$ ]] || continue
+    ep="$(parse_backup_timestamp_epoch "$bname")"
+    [[ -n "$ep" ]] || { msg WARN "retention primary: timestamp не распознан, пропускаю: ${file_key}"; continue; }
+    grp="$(dirname "$file_key")/$(sed -E 's/_?([0-9]{8}_[0-9]{6}|[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2})\.tar\.gz(\.age)?$//' <<<"$bname")"
+    entries+=("${ep}|${grp}|${file_key}")
+  done <<< "$listing"
+
+  while IFS= read -r line; do
+    local ep key grp
+    ep="${line%%|*}"; line="${line#*|}"; grp="${line%%|*}"; key="${line#*|}"
+    grp_seen["$grp"]=$(( ${grp_seen["$grp"]:-0} + 1 ))
+    if (( ${grp_seen["$grp"]} <= min_keep )); then kept=$((kept+1)); continue; fi
+    if (( ep < cutoff )); then
+      if [[ "$dry_run" == "true" ]]; then
+        msg INFO "DRY-RUN primary: удалил бы ${key}"
+        deleted=$((deleted+1))
+      else
+        if AWS_ACCESS_KEY_ID="$ORIG_S3_ACCESS_KEY" \
+           AWS_SECRET_ACCESS_KEY="$ORIG_S3_SECRET_KEY" \
+           AWS_DEFAULT_REGION="${ORIG_S3_REGION:-us-east-1}" \
+           aws s3 rm "s3://${ORIG_S3_BUCKET}/${key}" "${endpoint_arg[@]}" --quiet; then
+          msg INFO "Удалён устаревший custom-bot в primary S3: ${key}"
+          deleted=$((deleted+1))
+        else
+          msg WARN "Не удалось удалить из primary S3: ${key}"
+        fi
+      fi
+    else
+      kept=$((kept+1))
+    fi
+  done < <(printf '%s\n' "${entries[@]}" | sort -t'|' -k1,1nr)
+
+  msg OK "Primary S3 retention: deleted=${deleted}, kept=${kept}"
 }
 
 ensure_awscli() {
-  # Проверяет awscli; в интерактивном режиме предлагает установить.
   command -v aws >/dev/null 2>&1 && return 0
 
   if [[ ! -t 0 ]]; then
@@ -263,56 +363,56 @@ ensure_awscli() {
 }
 
 ensure_external_s3_interactive() {
-  # Вызывается перед backup'ом. Если external S3 включён, но не настроен:
-  #   - интерактивно: предложить скопировать из оригинального rw-backup,
-  #     заполнить вручную или продолжить без S3;
-  #   - из таймера (нет TTY): только предупредить.
-  # Возврат всегда 0 — отсутствие S3 не должно блокировать локальный backup.
-  # Спрашиваем не более одного раза за запуск.
-  if [[ "${S3_INTERACTIVE_CHECKED:-0}" == "1" ]]; then
-    return 0
-  fi
+  # Вызывается перед backup'ом. Спрашивает один раз за запуск.
+  # Возврат всегда 0 — отсутствие S3 не блокирует локальный backup.
+  [[ "${S3_INTERACTIVE_CHECKED:-0}" == "1" ]] && return 0
   S3_INTERACTIVE_CHECKED=1
 
+  ensure_awscli || true
+
   if full_s3_ready; then
-    ensure_awscli || true
     return 0
   fi
 
-  if ! truthy "${FULL_PANEL_EXTERNAL_S3_ENABLED:-true}" && ! truthy "${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"; then
+  if ! truthy "${FULL_PANEL_EXTERNAL_S3_ENABLED:-true}" && \
+     ! truthy "${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"; then
     return 0
   fi
 
   if [[ ! -t 0 ]]; then
-    msg WARN "External S3 не настроен — архивы останутся только локально (rw-backup-full configure-s3)"
+    msg WARN "FULL external S3 (дубликат) не настроен — дублирование пропущено"
+    if original_s3_available && truthy "${FULL_CUSTOM_PRIMARY_S3_ENABLED:-true}"; then
+      msg INFO "Custom bot будет загружен в основной S3 без шифрования"
+    fi
     return 0
   fi
 
   echo
-  msg WARN "External S3 (2-й S3 для дублирования) не настроен."
+  msg WARN "FULL external S3 (дубликат для шифрованного хранения) не настроен."
   echo
+  echo "  Логика двух S3:"
   if original_s3_available; then
-    echo "  1. Скопировать настройки из оригинального rw-backup (bucket=${ORIG_S3_BUCKET})"
+    echo "  • Основной S3 (из config.env, bucket=${ORIG_S3_BUCKET}):"
+    echo "    ↳ панель — загружает оригинальный rw-backup"
+    echo "    ↳ custom bot — загружает этот скрипт, БЕЗ шифрования"
   else
-    echo "  1. (недоступно: в оригинальном config.env нет S3-настроек)"
+    echo "  • Основной S3: не настроен в config.env"
   fi
-  echo "  2. Заполнить вручную"
-  echo "  3. Продолжить без external S3 (только локальный backup)"
+  echo "  • FULL external S3 (дубликат, отдельный бакет/кредсы):"
+  echo "    ↳ панель + custom bot — этот скрипт, С шифрованием (если age включён)"
+  echo
+  echo "  1. Настроить FULL external S3 (дубликат) сейчас"
+  echo "  2. Продолжить без дубликата"
   echo
 
-  read -r -p "[?] Выбор [3]: " choice
-  case "${choice:-3}" in
+  read -r -p "[?] Выбор [2]: " choice
+  case "${choice:-2}" in
     1)
-      if copy_original_s3_to_full; then
-        ensure_awscli || true
-      fi
-      ;;
-    2)
       configure_external_s3
       ensure_awscli || true
       ;;
     *)
-      msg INFO "Продолжаю без external S3"
+      msg INFO "Продолжаю без FULL external S3"
       ;;
   esac
 
@@ -1226,24 +1326,52 @@ Archive: $(basename "$FINAL_ARCHIVE")
     return 1
   fi
 
-  # Опциональное шифрование (age). Дальше работаем с тем файлом, который вернулся.
-  local upload_file
-  if ! maybe_encrypt_for_upload "$FINAL_ARCHIVE" "false"; then
-    notify_failure "Encryption failed
+  # ── S3 загрузка: два независимых потока ─────────────────────────────────
+  #
+  # 1. ОСНОВНОЙ S3 (тот же бакет, куда оригинальный rw-backup кладёт панель)
+  #    custom bot → БЕЗ шифрования, .tar.gz как есть
+  #
+  # 2. FULL external S3 (дубликат, отдельный бакет/кредсы)
+  #    custom bot → С шифрованием через временный файл (локальный .tar.gz не трогается)
+  # ────────────────────────────────────────────────────────────────────────
+
+  if truthy "${FULL_CUSTOM_PRIMARY_S3_ENABLED:-true}"; then
+    if original_s3_available; then
+      if ! primary_s3_upload "$FINAL_ARCHIVE" "$PROJECT_NAME"; then
+        notify_failure "Primary S3 upload failed
+Project: ${PROJECT_NAME}
+File: $(basename "$FINAL_ARCHIVE")"
+      fi
+      primary_s3_retention_cleanup || true
+    else
+      msg INFO "Primary S3 пропущен: в config.env нет S3-настроек"
+    fi
+  fi
+
+  if truthy "${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"; then
+    if full_s3_ready; then
+      # Шифруем временную копию; локальный .tar.gz и копия на основном S3 — открытые
+      local upload_file temp_encrypted="false"
+      if maybe_encrypt_for_upload "$FINAL_ARCHIVE" "true"; then
+        upload_file="$ENCRYPT_RESULT_FILE"
+        [[ "$upload_file" != "$FINAL_ARCHIVE" ]] && temp_encrypted="true"
+
+        if ! full_s3_upload "$upload_file" "custom-bot" "$PROJECT_NAME"; then
+          notify_failure "External S3 (duplicate) upload failed
+Project: ${PROJECT_NAME}
+File: $(basename "$upload_file")"
+        fi
+        truthy "$temp_encrypted" && rm -f "$upload_file"
+      else
+        notify_failure "Encryption failed (external S3 duplicate skipped)
 Project: ${PROJECT_NAME}
 Archive: $(basename "$FINAL_ARCHIVE")
 Reason: ${AGE_LAST_ERROR:-unknown}"
-    return 1
-  fi
-  upload_file="$ENCRYPT_RESULT_FILE"
-
-  if truthy "$FULL_CUSTOM_EXTERNAL_S3_ENABLED"; then
-    if ! full_s3_upload "$upload_file" "custom-bot" "$PROJECT_NAME"; then
-      notify_failure "External S3 upload failed
-Project: ${PROJECT_NAME}
-File: $(basename "$upload_file")"
+      fi
+      full_s3_retention_cleanup || true
+    else
+      msg INFO "FULL external S3 (дубликат) не настроен — пропущено"
     fi
-    full_s3_retention_cleanup || true
   fi
 
   cleanup_local_custom_backups
@@ -1704,29 +1832,22 @@ configure_retention() {
 
 configure_external_s3() {
   echo
-  echo -e "${GREEN}${BOLD}Настройка собственного external S3 для rw-backup-full${RESET}"
+  echo -e "${GREEN}${BOLD}Настройка FULL external S3 (дубликат)${RESET}"
   echo
-  echo "Этот S3 независим от оригинального /opt/rw-backup-restore/config.env."
+  echo "  Это ВТОРОЙ, независимый S3 для шифрованного дублирования."
+  echo "  Не путать с ОСНОВНЫМ S3:"
   echo
-
   if original_s3_available; then
-    read -r -p "Скопировать S3-настройки из оригинального rw-backup (bucket=${ORIG_S3_BUCKET})? [y/N]: " copy_ans
-    case "${copy_ans:-N}" in
-      y|Y)
-        copy_original_s3_to_full || return 1
-
-        read -r -p "Prefix [${FULL_EXTERNAL_S3_PREFIX}]: " prefix
-        prefix="${prefix:-$FULL_EXTERNAL_S3_PREFIX}"
-        set_full_var FULL_EXTERNAL_S3_PREFIX "$prefix"
-        set_full_var FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL "false"
-        FULL_EXTERNAL_S3_PREFIX="$prefix"
-
-        msg OK "External S3 настройки обновлены"
-        return 0
-        ;;
-    esac
-    echo
+    echo "  • Основной S3 (bucket=${ORIG_S3_BUCKET}, из config.env):"
+    echo "    ↳ панель → оригинальный rw-backup (без изменений)"
+    echo "    ↳ custom bot → этот скрипт, БЕЗ шифрования (при FULL_CUSTOM_PRIMARY_S3_ENABLED=true)"
+  else
+    echo "  • Основной S3: не настроен в config.env"
   fi
+  echo
+  echo "  • FULL external S3 (настраиваете здесь) — отдельный бакет/кредсы:"
+  echo "    ↳ панель + custom bot → этот скрипт, С шифрованием (age)"
+  echo
 
   read -r -p "Bucket [${FULL_EXTERNAL_S3_BUCKET}]: " bucket
   bucket="${bucket:-$FULL_EXTERNAL_S3_BUCKET}"
@@ -1752,7 +1873,6 @@ configure_external_s3() {
   set_full_var FULL_EXTERNAL_S3_REGION "$region"
   set_full_var FULL_EXTERNAL_S3_ENDPOINT "$endpoint"
   set_full_var FULL_EXTERNAL_S3_PREFIX "$prefix"
-  set_full_var FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL "false"
 
   msg OK "External S3 настройки обновлены"
 }
