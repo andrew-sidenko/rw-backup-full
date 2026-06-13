@@ -1130,6 +1130,8 @@ write_profile_env() {
   {
     printf 'PROJECT_NAME=%q\n' "$project_name"
     printf 'PROJECT_DIR=%q\n' "$project_dir"
+    # Реальное имя папки на диске (может отличаться регистром от PROJECT_NAME)
+    printf 'PROJECT_BASE=%q\n' "$(basename "$project_dir")"
     printf 'POSTGRES_CONTAINER=%q\n' "$pg_container"
     printf 'POSTGRES_SERVICE=%q\n' "$pg_service"
     printf 'REDIS_CONTAINER=%q\n' "$redis_container"
@@ -1212,7 +1214,7 @@ backup_custom_project_entry() {
 
   if ! docker exec "$POSTGRES_CONTAINER" sh -lc '
     export PGPASSWORD="${POSTGRES_PASSWORD:-}"
-    pg_dumpall -c -U "${POSTGRES_USER:-postgres}"
+    pg_dumpall -c --if-exists -U "${POSTGRES_USER:-postgres}"
   ' | gzip -9 > "$WORK_DIR/postgres_dump.sql.gz"; then
     notify_failure "PostgreSQL dump failed
 Project: ${PROJECT_NAME}
@@ -1483,38 +1485,37 @@ restore_custom_archive() {
 
   mkdir -p "$extract_dir" "$project_extract_dir"
 
-  cleanup_restore_tmp() { rm -rf "$tmp_root"; }
-  trap cleanup_restore_tmp RETURN
+  # Явный cleanup — НЕ trap RETURN: trap RETURN срабатывает на ЛЮБОЙ source/function
+  # внутри этой функции и сносит tmp_root ещё в процессе работы.
+  _rca_fail() { local m="$1"; rm -rf "$tmp_root"; msg ERR "$m"; return 1; }
 
   # ── 1. Расшифровка .age ────────────────────────────────────────────────────
   if [[ "$archive" == *.age ]]; then
     msg INFO "Архив зашифрован (age), расшифровываю..."
 
     if ! command -v age >/dev/null 2>&1; then
-      msg ERR "age не установлен. Установи: apt-get install -y age"
-      return 1
+      _rca_fail "age не установлен. Установи: apt-get install -y age"; return 1
     fi
 
     if [[ -z "${FULL_AGE_IDENTITY_FILE:-}" || ! -f "${FULL_AGE_IDENTITY_FILE:-}" ]]; then
       msg ERR "Для расшифровки нужен приватный ключ age."
       msg ERR "Задай FULL_AGE_IDENTITY_FILE=/путь/к/age-key.txt в ${FULL_CONFIG_FILE}"
       msg ERR "Если ключ не сохранён — этот архив можно открыть только при наличии ключа."
-      return 1
+      rm -rf "$tmp_root"; return 1
     fi
 
     local decrypted="${tmp_root}/$(basename "${archive%.age}")"
     if ! age -d -i "$FULL_AGE_IDENTITY_FILE" -o "$decrypted" "$archive"; then
       msg ERR "Расшифровка провалилась. Возможные причины:"
-      msg ERR "  • Неправильный приватный ключ (FULL_AGE_IDENTITY_FILE=${FULL_AGE_IDENTITY_FILE})"
+      msg ERR "  • Неправильный приватный ключ (${FULL_AGE_IDENTITY_FILE})"
       msg ERR "  • Повреждён .age файл"
-      return 1
+      rm -rf "$tmp_root"; return 1
     fi
 
-    # Убеждаемся что расшифрованный файл — валидный gzip
     if ! gzip -t "$decrypted" 2>/dev/null; then
       msg ERR "Расшифрован файл, но он не является валидным tar.gz (неверный ключ или повреждён архив)"
-      msg ERR "  Размер расшифрованного файла: $(stat -c '%s' "$decrypted" 2>/dev/null || echo '?') байт"
-      return 1
+      msg ERR "  Размер: $(stat -c '%s' "$decrypted" 2>/dev/null || echo '?') байт"
+      rm -rf "$tmp_root"; return 1
     fi
 
     msg OK "Расшифровано: $(basename "$decrypted") ($(du -h "$decrypted" | awk '{print $1}'))"
@@ -1524,69 +1525,73 @@ restore_custom_archive() {
   # ── 2. Распаковка внешнего архива ─────────────────────────────────────────
   msg INFO "Распаковываю архив: ${archive}"
 
-  if ! tar -xzf "$archive" -C "$extract_dir" 2>&1; then
-    msg ERR "Не удалось распаковать архив — он повреждён или неполный"
-    return 1
+  if ! tar -xzf "$archive" -C "$extract_dir"; then
+    _rca_fail "Не удалось распаковать архив — он повреждён или неполный"; return 1
   fi
 
-  # Диагностика: показываем что извлеклось
   local extracted_top
   extracted_top="$(ls -1 "$extract_dir" 2>/dev/null | head -1)"
   if [[ -z "$extracted_top" ]]; then
-    msg ERR "После распаковки директория пуста — архив пустой или повреждён"
-    return 1
+    _rca_fail "После распаковки директория пуста"; return 1
   fi
   msg INFO "Содержимое архива (верхний уровень): ${extracted_top}"
 
-  # ── 3. Находим компоненты restore ─────────────────────────────────────────
+  # ── 3. Находим компоненты ─────────────────────────────────────────────────
   local profile_env project_tar postgres_dump redis_dump
 
-  profile_env="$(  find "$extract_dir" -maxdepth 2 -type f -name 'PROFILE.env'        | head -n 1)"
-  project_tar="$(  find "$extract_dir" -maxdepth 2 -type f -name 'project_dir.tar.gz' | head -n 1)"
-  postgres_dump="$(find "$extract_dir" -maxdepth 2 -type f -name 'postgres_dump.sql.gz' | head -n 1)"
-  redis_dump="$(   find "$extract_dir" -maxdepth 2 -type f -name 'redis_dump.rdb'     | head -n 1)"
+  profile_env="$(  find "$extract_dir" -maxdepth 2 -type f -name 'PROFILE.env'         | head -n 1)"
+  project_tar="$(  find "$extract_dir" -maxdepth 2 -type f -name 'project_dir.tar.gz'  | head -n 1)"
+  postgres_dump="$(find "$extract_dir" -maxdepth 2 -type f -name 'postgres_dump.sql.gz'| head -n 1)"
+  redis_dump="$(   find "$extract_dir" -maxdepth 2 -type f -name 'redis_dump.rdb'      | head -n 1)"
 
-  [[ -n "$project_tar" ]] || {
-    msg ERR "В архиве нет project_dir.tar.gz"
-    msg ERR "Файлы в архиве:"
-    find "$extract_dir" -maxdepth 3 | sed 's|'"$extract_dir"'/||' | sort | head -30 >&2
-    return 1
-  }
+  if [[ -z "$project_tar" ]]; then
+    msg ERR "В архиве нет project_dir.tar.gz. Файлы найдены:"
+    find "$extract_dir" -maxdepth 3 | sed "s|${extract_dir}/||" | sort | head -30 >&2
+    rm -rf "$tmp_root"; return 1
+  fi
 
-  [[ -n "$postgres_dump" ]] || {
-    msg ERR "В архиве нет postgres_dump.sql.gz"
-    return 1
-  }
+  if [[ -z "$postgres_dump" ]]; then
+    _rca_fail "В архиве нет postgres_dump.sql.gz"; return 1
+  fi
 
-  # Проверяем project_dir.tar.gz до попытки его читать
   if ! gzip -t "$project_tar" 2>/dev/null; then
     msg ERR "project_dir.tar.gz повреждён или не является валидным gzip"
-    msg ERR "  Путь: ${project_tar}"
     msg ERR "  Размер: $(stat -c '%s' "$project_tar" 2>/dev/null || echo '?') байт"
-    return 1
+    rm -rf "$tmp_root"; return 1
   fi
 
-  # ── 4. Читаем PROFILE.env и определяем project_top ────────────────────────
-  if [[ -n "$profile_env" ]]; then
-    set +u
-    # shellcheck disable=SC1090
-    source "$profile_env"
-    set -u
+  # ── 4. Читаем PROFILE.env БЕЗ source ──────────────────────────────────────
+  # source запускает RETURN trap и сносит tmp_root — парсим вручную.
+  local PROJECT_NAME="" PROJECT_DIR="" PROJECT_BASE="" POSTGRES_CONTAINER="" POSTGRES_SERVICE=""
+  local REDIS_CONTAINER="" REDIS_SERVICE=""
+
+  if [[ -f "$profile_env" ]]; then
+    local _key _val _line
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+      [[ "$_line" =~ ^([A-Z_]+)=\"?([^\"]*)\"?$ ]] || continue
+      _key="${BASH_REMATCH[1]}"
+      _val="${BASH_REMATCH[2]}"
+      case "$_key" in
+        PROJECT_NAME|PROJECT_DIR|PROJECT_BASE|\
+        POSTGRES_CONTAINER|POSTGRES_SERVICE|\
+        REDIS_CONTAINER|REDIS_SERVICE)
+          printf -v "$_key" '%s' "$_val"
+          ;;
+      esac
+    done < "$profile_env"
   fi
 
-  # Приоритет: PROJECT_NAME из PROFILE.env → top-dir внутри project_dir.tar.gz
-  local project_top="${PROJECT_NAME:-}"
+  # project_top: приоритет PROJECT_BASE (точное имя папки на диске) > PROJECT_NAME > tar listing
+  local project_top="${PROJECT_BASE:-${PROJECT_NAME:-}}"
   if [[ -z "$project_top" ]]; then
     project_top="$(tar -tzf "$project_tar" 2>/dev/null | head -n 1 | cut -d/ -f1)"
   fi
 
-  [[ -n "$project_top" ]] || {
-    msg ERR "Не удалось определить папку проекта"
-    msg ERR "  PROFILE.env: ${profile_env:-не найден}"
-    msg ERR "  Первые строки project_dir.tar.gz (gzip -dc | tar -t):"
-    gzip -dc "$project_tar" 2>/dev/null | tar -t 2>/dev/null | head -5 >&2 || true
-    return 1
-  }
+  if [[ -z "$project_top" ]]; then
+    msg ERR "Не удалось определить папку проекта (PROFILE.env и tar -tzf оба вернули пусто)"
+    msg ERR "  profile_env: ${profile_env:-не найден}"
+    rm -rf "$tmp_root"; return 1
+  fi
 
   PROJECT_NAME="${PROJECT_NAME:-$project_top}"
   PROJECT_DIR="${PROJECT_DIR:-/home/$project_top}"
@@ -1609,7 +1614,7 @@ restore_custom_archive() {
 
     if [[ "$confirm" != "RESTORE" ]]; then
       msg WARN "Restore отменён"
-      return 1
+      rm -rf "$tmp_root"; return 1
     fi
   fi
 
@@ -1631,10 +1636,26 @@ restore_custom_archive() {
 
   msg INFO "Распаковываю project_dir.tar.gz..."
 
-  tar -xzf "$project_tar" -C "$project_extract_dir"
+  if ! tar -xzf "$project_tar" -C "$project_extract_dir"; then
+    _rca_fail "Не удалось распаковать project_dir.tar.gz"; return 1
+  fi
+
+  # Берём фактическое имя директории из извлечённого содержимого.
+  # PROFILE.env хранит PROJECT_NAME строчными, а реальная папка может быть
+  # смешанного регистра (например OneOkBotNew vs oneokbotnew).
+  local actual_extracted
+  actual_extracted="$(ls -1 "$project_extract_dir" | head -1)"
+
+  if [[ -z "$actual_extracted" ]]; then
+    _rca_fail "project_dir.tar.gz пустой — ничего не извлечено"; return 1
+  fi
+
+  if [[ "$actual_extracted" != "$project_top" ]]; then
+    msg INFO "Реальное имя папки в архиве: ${actual_extracted} (в PROFILE.env: ${project_top})"
+  fi
 
   mkdir -p "$(dirname "$PROJECT_DIR")"
-  mv "$project_extract_dir/$project_top" "$PROJECT_DIR"
+  mv "$project_extract_dir/$actual_extracted" "$PROJECT_DIR"
 
   msg OK "Папка проекта восстановлена: ${PROJECT_DIR}"
 
@@ -1671,15 +1692,45 @@ restore_custom_archive() {
   if [[ "$ready" != "yes" ]]; then
     msg ERR "PostgreSQL не стал готовым"
     docker logs "$POSTGRES_CONTAINER" --tail 100 || true
-    return 1
+    rm -rf "$tmp_root"; return 1
   fi
 
   msg INFO "Заливаю PostgreSQL dump..."
 
-  gzip -dc "$postgres_dump" | docker exec -i "$POSTGRES_CONTAINER" sh -lc '
+  # pg_dumpall -c генерирует DROP ROLE <current_user>, что PostgreSQL запрещает
+  # (нельзя дропнуть текущего пользователя). Это не ошибка данных — роли уже
+  # существуют, данные всё равно заливаются. Используем ON_ERROR_STOP=0 и
+  # фильтруем только данные об ошибках.
+  local pg_restore_log="${tmp_root}/pg_restore.log"
+
+  if ! gzip -dc "$postgres_dump" | docker exec -i "$POSTGRES_CONTAINER" sh -lc '
     export PGPASSWORD="${POSTGRES_PASSWORD:-}"
-    psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d postgres
-  '
+    psql -v ON_ERROR_STOP=0 -U "${POSTGRES_USER:-postgres}" -d postgres 2>&1
+  ' > "$pg_restore_log" 2>&1; then
+    # Классифицируем ошибки: harmless vs реальные.
+    # ВАЖНО: grep -c возвращает exit 1 при 0 совпадениях — не используем || echo.
+    local real_errors=0 safe_errors=0 _eline
+    while IFS= read -r _eline; do
+      [[ "$_eline" =~ ^ERROR: ]] || continue
+      real_errors=$(( real_errors + 1 ))
+      if [[ "$_eline" == *"cannot be dropped"* \
+         || "$_eline" == *"already exists"* \
+         || "$_eline" == *"does not exist"* ]]; then
+        safe_errors=$(( safe_errors + 1 ))
+      fi
+    done < "$pg_restore_log"
+
+    if (( real_errors > safe_errors )); then
+      msg ERR "PostgreSQL dump залит с критическими ошибками (${real_errors} ошибок):"
+      grep '^ERROR:' "$pg_restore_log" | grep -v 'cannot be dropped\|already exists\|does not exist' | head -10 >&2
+      rm -rf "$tmp_root"; return 1
+    fi
+
+    msg WARN "PostgreSQL dump залит с предупреждениями (ожидаемо при pg_dumpall restore — ${safe_errors} known-harmless):"
+    grep '^ERROR:' "$pg_restore_log" | head -5 >&2 || true
+  fi
+
+  grep -v '^ERROR:' "$pg_restore_log" 2>/dev/null | tail -3 || true
 
   msg OK "PostgreSQL восстановлен"
 
@@ -1700,6 +1751,8 @@ restore_custom_archive() {
   if [[ -d "$old_dir" ]]; then
     msg INFO "Старая папка сохранена: ${old_dir}"
   fi
+
+  rm -rf "$tmp_root"
 }
 
 s3_list_custom_backups() {
