@@ -171,7 +171,7 @@ load_config() {
 ensure_tools() {
   # Машинный статус не требует docker: веб-сервис должен получать JSON
   # даже с сервера, где docker временно недоступен.
-  if [[ "${1:-}" == "status" && "${2:-}" == "--json" ]]; then
+  if [[ "${1:-}" == "fleet-manifest" ]] || [[ "${1:-}" == "status" && "${2:-}" == "--json" ]]; then
     return 0
   fi
   command -v docker >/dev/null 2>&1 || {
@@ -1530,6 +1530,46 @@ status_json() {
   printf '\n'
 }
 
+# Манифест сервера для fleet-verify (песочница забирает его через веб-сервис
+# по SSH): источник, S3-бэкенды С РЕКВИЗИТАМИ, инстансы с типами и параметрами
+# проверок, настройки Telegram. Только stdout, чистый JSON.
+fleet_manifest() {
+  local first n f
+  printf '{'
+  printf '"manifest_version":1,'
+  printf '"source":"%s",' "$(declare -F rw_source_id >/dev/null && rw_source_id || hostname -s)"
+  printf '"telegram":{"token":"%s","chat_id":"%s","thread_id":"%s"},'     "${FULL_TG_BOT_TOKEN:-}" "${FULL_TG_CHAT_ID:-}" "${FULL_TG_MESSAGE_THREAD_ID:-}"
+
+  printf '"backends":['
+  first=1
+  for n in $(s3m_backends 2>/dev/null); do
+    s3m_load "$n" 2>/dev/null || continue
+    (( first )) || printf ','
+    first=0
+    printf '{"name":"%s","enabled":%s,"endpoint":"%s","bucket":"%s","access_key":"%s","secret_key":"%s","region":"%s","prefix":"%s","panel":%s,"custom":%s,"wal":%s}'       "$n" "$(truthy "$B_ENABLED" && echo true || echo false)"       "$B_ENDPOINT" "$B_BUCKET" "$B_ACCESS_KEY" "$B_SECRET_KEY" "$B_REGION" "$B_PREFIX"       "$(truthy "$B_UPLOAD_PANEL" && echo true || echo false)"       "$(truthy "$B_UPLOAD_CUSTOM" && echo true || echo false)"       "$(truthy "$B_UPLOAD_WAL" && echo true || echo false)"
+  done
+  printf '],'
+
+  printf '"instances":['
+  first=1
+  if [[ -d "$INSTANCES_DIR" ]]; then
+    for f in "$INSTANCES_DIR"/*.env; do
+      [[ -e "$f" ]] || continue
+      local i_name i_kind i_tables i_user i_db
+      i_name="$(basename "$f" .env)"
+      i_kind="$(grep -E '^INST_KIND=' "$f" 2>/dev/null | head -n1 | cut -d'"' -f2 || true)"
+      i_tables="$(grep -E '^INST_VERIFY_TABLES=' "$f" 2>/dev/null | head -n1 | cut -d'"' -f2 || true)"
+      i_user="$(grep -E '^INST_PGUSER=' "$f" 2>/dev/null | head -n1 | cut -d'"' -f2 || true)"
+      i_db="$(grep -E '^INST_PGDATABASE=' "$f" 2>/dev/null | head -n1 | cut -d'"' -f2 || true)"
+      (( first )) || printf ','
+      first=0
+      printf '{"name":"%s","kind":"%s","verify_tables":"%s","pguser":"%s","pgdatabase":"%s"}'         "$i_name" "${i_kind:-bot}" "$i_tables" "${i_user:-postgres}" "${i_db:-postgres}"
+    done
+  fi
+  printf ']}'
+  printf '\n'
+}
+
 sandbox_timer_install() {
   local times="${SANDBOX_VERIFY_TIMES:-}" ih="${SANDBOX_VERIFY_INTERVAL_HOURS:-}" tz="${FULL_SCHEDULE_TZ:-}"
   local d="/etc/systemd/system/rw-sandbox-verify.timer.d"
@@ -1706,6 +1746,10 @@ WAL / PITR (v4):
   rw-backup-full panel-restore [файл|--from-s3] восстановление панели (встроенное)
   rw-backup-full status [--json]                статус сервера (JSON для веб-сервиса)
   rw-backup-full metrics-export                 выгрузка метрик сейчас
+  rw-backup-full fleet-manifest                 JSON-манифест сервера для песочницы
+  rw-backup-full verify-fleet [--server ID] [--backend N] [--depth D]
+                                                проверка парка: сервер × хранилище
+  rw-backup-full fleet-pack pack|unpack         перенос настроек песочницы одним файлом
 EOF_USAGE
 }
 
@@ -1770,8 +1814,14 @@ case "$cmd" in
     if [[ "${2:-}" == "--json" ]]; then status_json; else wal_status_all; fi ;;
   metrics-export)
     exec "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" ;;
+  fleet-manifest)
+    fleet_manifest ;;
   verify)
-    shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" "$@" ;;
+    shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-entry.sh" "$@" ;;
+  verify-fleet)
+    shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" "$@" ;;
+  fleet-pack)
+    shift; exec "${SANDBOX_SCRIPTS_DIR}/fleet-pack.sh" "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac

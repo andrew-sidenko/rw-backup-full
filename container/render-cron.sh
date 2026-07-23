@@ -80,7 +80,13 @@ if [[ "$ROLE" == "host-agent" ]]; then
 fi
 
 if [[ "$ROLE" == "sandbox" ]]; then
-  if [[ -n "${SANDBOX_VERIFY_TIMES:-}" ]]; then
+  # Fleet-режим: расписание из fleet.json (settings.schedule), проверка —
+  # verify-fleet (каждый сервер × каждое хранилище, параметры из веб-сервиса).
+  FLEET_FILE="${RW_FLEET_FILE:-${INSTALL_DIR}/fleet.json}"
+  if [[ -f "$FLEET_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    fl_sched="$(jq -r '.settings.schedule // "05:30"' "$FLEET_FILE" 2>/dev/null || echo 05:30)"
+    emit_sched "$fl_sched" "30 5 * * *" "${INSTALL_DIR}/scripts/sandbox/verify-fleet.sh"
+  elif [[ -n "${SANDBOX_VERIFY_TIMES:-}" ]]; then
     emit_sched "${SANDBOX_VERIFY_TIMES}" "" "${INSTALL_DIR}/scripts/sandbox/verify-backup.sh"
   elif [[ -n "${SANDBOX_VERIFY_INTERVAL_HOURS:-}" ]] && [[ "${SANDBOX_VERIFY_INTERVAL_HOURS}" =~ ^[0-9]+$ ]]; then
     echo "30 */${SANDBOX_VERIFY_INTERVAL_HOURS} * * * ${INSTALL_DIR}/scripts/sandbox/verify-backup.sh"

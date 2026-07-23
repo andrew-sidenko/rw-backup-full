@@ -94,6 +94,7 @@ if (( ${#miss[@]} )); then
 fi
 command -v aws  >/dev/null || warn "awscli не найден — S3 работать не будет (apt install awscli)"
 command -v zstd >/dev/null || warn "zstd не найден — сжатие через gzip (рекомендуется: apt install zstd)"
+command -v jq   >/dev/null || warn "jq не найден — fleet-verify на песочнице требует jq (apt install jq)"
 command -v age  >/dev/null || say  "age не найден — шифрование недоступно (нужно при INST_ENCRYPT=true)"
 ok "Зависимости проверены"
 
@@ -119,7 +120,17 @@ if ask "Шаг 2: копирование файлов v5" \
   for f in "$SRC_DIR"/scripts/wal/*.sh;     do put 0755 "$f" "${INSTALL_DIR}/scripts/wal/$(basename "$f")"; done
   for f in "$SRC_DIR"/scripts/panel/*.sh;   do put 0755 "$f" "${INSTALL_DIR}/scripts/panel/$(basename "$f")"; done
   for f in "$SRC_DIR"/scripts/metrics/*.sh; do put 0755 "$f" "${INSTALL_DIR}/scripts/metrics/$(basename "$f")"; done
-  put 0755 "$SRC_DIR/scripts/sandbox/verify-backup.sh" "${INSTALL_DIR}/scripts/sandbox/verify-backup.sh"
+  for f in "$SRC_DIR"/scripts/sandbox/*.sh; do
+    put 0755 "$f" "${INSTALL_DIR}/scripts/sandbox/$(basename "$f")"
+  done
+  # Профили проверок по типам БД: активные не перезаписываются
+  mkdir -p "${INSTALL_DIR}/verify-profiles.d" "${INSTALL_DIR}/config-examples/verify-profiles.d"
+  for f in "$SRC_DIR"/config/verify-profiles.d/*; do
+    put 0644 "$f" "${INSTALL_DIR}/config-examples/verify-profiles.d/$(basename "$f")"
+    case "$f" in *.example) ;; *)
+      [[ -f "${INSTALL_DIR}/verify-profiles.d/$(basename "$f")" ]] ||         install -m 0644 "$f" "${INSTALL_DIR}/verify-profiles.d/$(basename "$f")" ;;
+    esac
+  done
   [[ -f "$SRC_DIR/scripts/collect-bot-structure.sh" ]] && {
     put 0755 "$SRC_DIR/scripts/collect-bot-structure.sh" "$INSTALL_DIR/collect-bot-structure.sh"
     ln -sf "$INSTALL_DIR/collect-bot-structure.sh" /usr/local/bin/collect-bot-structure; }

@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/rw-backup-restore/scripts/sandbox/verify-backup.sh
+ExecStart=/opt/rw-backup-restore/scripts/sandbox/verify-entry.sh
 Nice=15
 IOSchedulingClass=idle
 TimeoutStartSec=3h

@@ -20,6 +20,7 @@
 
 import json
 import os
+import time
 import re
 import shlex
 import subprocess
@@ -33,7 +34,10 @@ import uvicorn
 
 INSTALL_DIR = os.environ.get("RW_INSTALL_DIR", "/opt/rw-backup-restore")
 DATA_DIR = Path(os.environ.get("RW_WEB_DATA", f"{INSTALL_DIR}/web-data"))
-SERVERS_FILE = DATA_DIR / "servers.json"
+SERVERS_FILE = DATA_DIR / "servers.json"          # legacy, мигрируется
+FLEET_FILE = Path(os.environ.get("RW_FLEET_FILE", f"{INSTALL_DIR}/fleet.json"))
+MANIFEST_CACHE = DATA_DIR / "manifest-cache.json"
+MANIFEST_TTL = int(os.environ.get("RW_MANIFEST_TTL", "600"))  # сек
 SSH_KEY = os.environ.get("RW_WEB_SSH_KEY", str(DATA_DIR / "id_ed25519"))
 WEB_TOKEN = os.environ.get("WEB_TOKEN", "")
 METRICS_DIR = os.environ.get("RW_METRICS_DIR", "/var/lib/node_exporter/textfile_collector")
@@ -75,16 +79,48 @@ def auth(request: Request):
         raise HTTPException(401, "bad token")
 
 
+DEFAULT_SETTINGS = {
+    # Настройки проверок песочницы; сервер посвящён только песочнице и
+    # управлению, поэтому глубину/параллелизм можно поднимать смело.
+    "depth": "standard",        # quick | standard | deep
+    "parallel": 2,              # одновременных проверок
+    "history": 1,               # сколько последних архивов проверять на источник (deep: 3+)
+    "schedule": "05:30",        # времена запуска verify (список через пробел)
+    "tg_summary": {"token": "", "chat_id": ""},   # сводный отчёт песочницы (опц.)
+}
+
+
+def load_fleet() -> dict:
+    """fleet.json — ЕДИНСТВЕННЫЙ файл состояния этого сервера (компактный,
+    переносимый). Миграция из legacy servers.json выполняется прозрачно."""
+    if FLEET_FILE.exists():
+        d = json.loads(FLEET_FILE.read_text())
+    elif SERVERS_FILE.exists():
+        d = {"version": 1, "settings": dict(DEFAULT_SETTINGS),
+             "servers": json.loads(SERVERS_FILE.read_text()).get("servers", [])}
+        save_fleet(d)
+    else:
+        d = {"version": 1, "settings": dict(DEFAULT_SETTINGS), "servers": []}
+    for k, v in DEFAULT_SETTINGS.items():
+        d.setdefault("settings", {}).setdefault(k, v)
+    return d
+
+
+def save_fleet(data: dict):
+    tmp = FLEET_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(FLEET_FILE)
+    os.chmod(FLEET_FILE, 0o600)
+
+
 def load_servers() -> dict:
-    if SERVERS_FILE.exists():
-        return json.loads(SERVERS_FILE.read_text())
-    return {"servers": []}
+    return {"servers": load_fleet()["servers"]}
 
 
 def save_servers(data: dict):
-    tmp = SERVERS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-    tmp.replace(SERVERS_FILE)
+    fleet = load_fleet()
+    fleet["servers"] = data["servers"]
+    save_fleet(fleet)
 
 
 def get_server(sid: str) -> dict:
@@ -248,6 +284,60 @@ RW_WEB_EOF
         raise HTTPException(502, err.strip() or "write failed")
     return {"ok": True, "note": "старая версия сохранена рядом (*.web-backup.<ts>); "
                                 "маскированные секреты не изменены"}
+
+
+@app.get("/api/fleet/settings", dependencies=[Depends(auth)])
+def api_get_settings():
+    return {"ok": True, "settings": load_fleet()["settings"]}
+
+
+@app.put("/api/fleet/settings", dependencies=[Depends(auth)])
+def api_put_settings(body: dict):
+    fleet = load_fleet()
+    allowed = set(DEFAULT_SETTINGS)
+    for k, v in (body or {}).items():
+        if k in allowed:
+            fleet["settings"][k] = v
+    save_fleet(fleet)
+    return {"ok": True, "settings": fleet["settings"]}
+
+
+@app.get("/api/fleet/manifest", dependencies=[Depends(auth)])
+def api_fleet_manifest(force: int = 0):
+    """Агрегированный манифест парка для verify-fleet: по каждому серверу —
+    его источник, S3-бэкенды с реквизитами, инстансы с типами, Telegram.
+    Собирается по SSH (rw-backup-full fleet-manifest), кэшируется."""
+    if not force and MANIFEST_CACHE.exists():
+        try:
+            cached = json.loads(MANIFEST_CACHE.read_text())
+            if time.time() - cached.get("collected_at", 0) < MANIFEST_TTL:
+                return cached
+        except Exception:
+            pass
+
+    fleet = load_fleet()
+    out = {"ok": True, "collected_at": int(time.time()),
+           "settings": fleet["settings"], "servers": []}
+    for srv in fleet["servers"]:
+        entry = {"id": srv["id"], "type": srv.get("type", "ssh"), "reachable": False}
+        if srv.get("type", "ssh") != "ssh":
+            entry["error"] = "k8s transport not implemented yet"
+            out["servers"].append(entry)
+            continue
+        rc, so, se = ssh_run(srv, ["rw-backup-full", "fleet-manifest"])
+        if rc == 0:
+            try:
+                entry.update(json.loads(so.strip().splitlines()[-1]))
+                entry["reachable"] = True
+            except Exception:
+                entry["error"] = "invalid manifest json"
+        else:
+            entry["error"] = (se or f"rc={rc}").strip()[-300:]
+        out["servers"].append(entry)
+
+    MANIFEST_CACHE.write_text(json.dumps(out, ensure_ascii=False))
+    os.chmod(MANIFEST_CACHE, 0o600)
+    return out
 
 
 @app.get("/api/sandbox/summary", dependencies=[Depends(auth)])
