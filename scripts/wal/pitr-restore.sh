@@ -224,6 +224,19 @@ if (( staged == 0 )); then
 fi
 
 # --------------------------------------------------------------------------
+# Определение образа
+# --------------------------------------------------------------------------
+IMAGE="${IMAGE:-}"
+if [[ -z "$IMAGE" ]]; then
+  IMAGE="$(docker inspect -f '{{.Config.Image}}' "$INST_CONTAINER" 2>/dev/null || true)"
+fi
+if [[ -z "$IMAGE" ]]; then
+  major=$(( PG_VERSION_NUM / 10000 ))
+  IMAGE="postgres:${major}"
+fi
+msg INFO "Образ для восстановления: ${IMAGE}"
+
+# --------------------------------------------------------------------------
 # Конфигурация восстановления
 # --------------------------------------------------------------------------
 AUTOCONF="${PGDATA_DIR}/postgresql.auto.conf"
@@ -262,23 +275,18 @@ AUTOCONF="${PGDATA_DIR}/postgresql.auto.conf"
 touch "${PGDATA_DIR}/recovery.signal"
 rm -f "${PGDATA_DIR}/postmaster.pid"
 
-chown -R 999:999 "$PGDATA_DIR" "$WAL_STAGE_DIR" 2>/dev/null || true
+# Владелец PGDATA внутри контейнера почти всегда 999 (и в Debian-, и в
+# Alpine-образах postgres), но угадывание — частая причина мгновенного
+# падения ("data directory has invalid permissions") на нестандартных
+# образах. Выясняем UID у ТОГО ЖЕ образа, что будем восстанавливать.
+restore_uid="$(docker run --rm --entrypoint id "$IMAGE" -u postgres 2>/dev/null || true)"
+[[ "$restore_uid" =~ ^[0-9]+$ ]] || restore_uid=999
+chown -R "${restore_uid}:${restore_uid}" "$PGDATA_DIR" "$WAL_STAGE_DIR" 2>/dev/null || true
 chmod 0700 "$PGDATA_DIR"
+msg INFO "PGDATA передан пользователю uid=${restore_uid} (образ: ${IMAGE})"
 
 msg OK "Параметры восстановления записаны (режим: ${TARGET_MODE})"
 
-# --------------------------------------------------------------------------
-# Определение образа
-# --------------------------------------------------------------------------
-IMAGE="${IMAGE:-}"
-if [[ -z "$IMAGE" ]]; then
-  IMAGE="$(docker inspect -f '{{.Config.Image}}' "$INST_CONTAINER" 2>/dev/null || true)"
-fi
-if [[ -z "$IMAGE" ]]; then
-  major=$(( PG_VERSION_NUM / 10000 ))
-  IMAGE="postgres:${major}"
-fi
-msg INFO "Образ для восстановления: ${IMAGE}"
 
 # --------------------------------------------------------------------------
 # Восстановление на месте (деструктивно)
@@ -323,7 +331,12 @@ PG_PORT="${PG_PORT:-$(shuf -i 15432-25432 -n 1)}"
 
 msg INFO "Поднимаю временный контейнер ${CONTAINER} на порту ${PG_PORT}..."
 
-docker run -d --rm \
+# БЕЗ --rm: при падении нужно успеть прочитать логи и код выхода. Контейнер
+# убирается явно ниже (успех/неудача) либо через trap при прерывании скрипта.
+# Раньше --rm удалял контейнер мгновенно при падении, и `docker logs` после
+# этого бил в "No such container" — ошибка диагностики глушилась `|| true`,
+# и сообщение о падении оставалось без единой зацепки.
+docker run -d \
   --name "$CONTAINER" \
   -v "${PGDATA_DIR}:/var/lib/postgresql/data" \
   -v "${WAL_STAGE_DIR}:/wal-archive:ro" \
@@ -331,6 +344,32 @@ docker run -d --rm \
   -e POSTGRES_PASSWORD=rw_restore_tmp \
   "$IMAGE" \
   -c listen_addresses='*' >/dev/null
+
+# Контейнер больше не эфемерный — прибираем его при любом завершении скрипта,
+# КРОМЕ случая успеха с --keep-running (тогда его должен убрать вызывающий,
+# как и раньше: `docker stop`, путь напечатан в конце).
+restore_cleanup() {
+  local ec=$?
+  if [[ "${_KEEP_ON_EXIT:-false}" != "true" ]]; then
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  fi
+  exit $ec
+}
+trap restore_cleanup EXIT
+
+diagnose_and_fail() { # <заголовок>
+  local exitcode error oom
+  exitcode="$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER" 2>/dev/null || echo '?')"
+  oom="$(docker inspect -f '{{.State.OOMKilled}}' "$CONTAINER" 2>/dev/null || echo '?')"
+  error="$(docker inspect -f '{{.State.Error}}' "$CONTAINER" 2>/dev/null || true)"
+  msg ERR "$1 (exit_code=${exitcode}, oom_killed=${oom}${error:+, docker_error=${error}})"
+  msg ERR "Логи контейнера (последние 60 строк):"
+  docker logs "$CONTAINER" --tail 60 2>&1 | sed 's/^/    /' >&2
+  if [[ "$exitcode" == "1" ]] || grep -qi 'permission denied\|invalid permissions\|must not run as root'        <<<"$(docker logs "$CONTAINER" 2>&1 | tail -20)"; then
+    msg ERR "Похоже на проблему прав PGDATA. Проверьте: ls -la ${PGDATA_DIR} | head"
+  fi
+  exit 1
+}
 
 recovered=false
 for i in $(seq 1 300); do
@@ -340,18 +379,13 @@ for i in $(seq 1 300); do
     if [[ "$in_recovery" == "f" ]]; then recovered=true; break; fi
   fi
   if ! docker ps -q -f "name=${CONTAINER}" | grep -q .; then
-    msg ERR "Контейнер восстановления упал"
-    docker logs "$CONTAINER" --tail 60 2>&1 || true
-    exit 1
+    diagnose_and_fail "Контейнер восстановления упал"
   fi
   sleep 2
 done
 
 if [[ "$recovered" != "true" ]]; then
-  msg ERR "Восстановление не завершилось за 10 минут"
-  docker logs "$CONTAINER" --tail 60 2>&1 || true
-  docker stop "$CONTAINER" >/dev/null 2>&1 || true
-  exit 1
+  diagnose_and_fail "Восстановление не завершилось за 10 минут"
 fi
 
 last_ts="$(docker exec "$CONTAINER" psql -h localhost -U "$INST_PGUSER" -d postgres -qtAX \
@@ -364,9 +398,10 @@ msg INFO "  psql -h 127.0.0.1 -p ${PG_PORT} -U ${INST_PGUSER} ${INST_PGDATABASE}
 echo "$CONTAINER" > "${WORK_DIR}/container"
 echo "$PG_PORT" > "${WORK_DIR}/port"
 
-if ! truthy "$KEEP_RUNNING"; then
-  msg INFO "Контейнер оставлен запущенным. Остановить: docker stop ${CONTAINER}"
-  msg INFO "Удалить данные: rm -rf ${WORK_DIR}"
-fi
+# Контейнер поднят и восстановлен успешно — он и есть результат работы
+# скрипта (песочница/оператор подключаются к нему), поэтому trap его не трогает.
+_KEEP_ON_EXIT="true"
+msg INFO "Контейнер оставлен запущенным. Остановить: docker rm -f ${CONTAINER}"
+msg INFO "Удалить данные: rm -rf ${WORK_DIR}"
 
 exit 0
