@@ -55,11 +55,18 @@ render_dropin() {
     echo "# ${desc}"
     echo "[Timer]"
     echo "OnUnitActiveSec="
+    echo "OnBootSec="
     if [[ -n "$times" ]]; then
-      echo "OnBootSec="
       echo "OnCalendar="
       wal_render_calendar_lines "$times" "$TZ_OPT"
     else
+      # ЯКОРЬ ПЕРВОГО ЗАПУСКА. OnUnitActiveSec отсчитывается от последней
+      # активности СЕРВИСА — если сервис ни разу не запускался, интервал
+      # никогда не сработает (а OnBootSec шаблона к этому моменту давно
+      # в прошлом: монотонные таймеры Persistent не догоняет).
+      # OnActiveSec тикает от активации ТАЙМЕРА: срабатывает вскоре после
+      # enable --now и после каждой загрузки, дальше ритм задаёт интервал.
+      echo "OnActiveSec=45s"
       echo "OnUnitActiveSec=${interval}"
     fi
   } > "$file"
@@ -96,8 +103,12 @@ render_dropin "${d2}/override.conf" "$base_times" "${base_h}h" \
   "Базовый бэкап: $([[ -n "$base_times" ]] && echo "по времени: ${base_times}${TZ_OPT:+ ($TZ_OPT)}" || echo "каждые ${base_h} ч")"
 
 systemctl daemon-reload
-systemctl enable --now "rw-wal-ship@${INSTANCE}.timer"
-systemctl enable --now "rw-basebackup@${INSTANCE}.timer"
+# restart, а не только enable --now: активный таймер должен перечитать drop-in
+# и заново взвести OnActiveSec-якорь.
+systemctl enable "rw-wal-ship@${INSTANCE}.timer" >/dev/null 2>&1 || true
+systemctl enable "rw-basebackup@${INSTANCE}.timer" >/dev/null 2>&1 || true
+systemctl restart "rw-wal-ship@${INSTANCE}.timer"
+systemctl restart "rw-basebackup@${INSTANCE}.timer"
 
 msg OK "[${INSTANCE}] расписания применены:"
 msg INFO "  WAL-ship:  $([[ -n "$ship_times" ]] && echo "${ship_times}${TZ_OPT:+ ($TZ_OPT)}" || echo "каждые ${ship_min} мин")"

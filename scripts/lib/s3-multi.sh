@@ -123,8 +123,9 @@ s3m_upload_all() {
     local key uri attempt done=false
     key="$(s3m_logical_key "$category" "$fname")"
     uri="s3://${B_BUCKET}/${key}"
+    local up_err; up_err="$(mktemp)"
     for attempt in 1 2 3; do
-      if s3m_aws s3 cp "$file" "$uri" --only-show-errors 2>/dev/null; then done=true; break; fi
+      if s3m_aws s3 cp "$file" "$uri" --only-show-errors 2>"$up_err"; then done=true; break; fi
       sleep $((attempt*3))
     done
     if [[ "$done" == "true" ]]; then
@@ -135,8 +136,11 @@ s3m_upload_all() {
 ${uri}" || true
       fi
     else
-      msg ERR "S3[${name}]: не удалось загрузить ${fname}"
+      msg ERR "S3[${name}]: не удалось загрузить ${fname}. Причина (aws):"
+      sed 's/^/    /' "$up_err" | tail -n 3 >&2
+      msg ERR "Диагностика подключения: rw-backup-full s3-test ${name}"
     fi
+    rm -f "$up_err"
   done
   (( targeted == 0 )) && return 0
   (( ok > 0 ))
@@ -186,4 +190,81 @@ s3m_retention_one() {  # <backend> <category> <days>
   done <<<"$listing"
   (( removed > 0 )) && msg OK "S3[${name}] ${category}: удалено ${removed} архивов старше ${days} дн."
   return 0
+}
+
+# --------------------------------------------------------------------------
+# Диагностика подключения к бэкенду: конфиг -> листинг -> запись -> чтение ->
+# удаление. Ошибки aws показываются КАК ЕСТЬ — это главное отличие от рабочих
+# операций, где stderr подавлен ради чистоты логов.
+# --------------------------------------------------------------------------
+s3m_test_backend() {
+  local name="$1" errf rc=0 key
+  errf="$(mktemp)"
+  echo "── S3-бэкенд: ${name} ──"
+
+  if ! s3m_load "$name"; then
+    echo "  ✗ конфиг: не загрузился или не заполнены bucket/ключи (${S3D_DIR}/${name}.env)"
+    rm -f "$errf"; return 1
+  fi
+  echo "  конфиг: bucket=${B_BUCKET}  endpoint=${B_ENDPOINT:-AWS}  region=${B_REGION}"
+  echo "          prefix=${B_PREFIX}  access_key=${B_ACCESS_KEY:0:4}***  enabled=${B_ENABLED}"
+  truthy "$B_ENABLED" || echo "  ⚠ бэкенд выключен (B_ENABLED=${B_ENABLED}) — операции его пропускают"
+
+  if [[ -n "$B_ENDPOINT" ]]; then
+    local host="${B_ENDPOINT#*://}"; host="${host%%/*}"; host="${host%%:*}"
+    if command -v getent >/dev/null 2>&1 && ! getent hosts "$host" >/dev/null 2>&1; then
+      echo "  ✗ DNS: имя ${host} не резолвится — проверьте B_ENDPOINT"
+      rm -f "$errf"; return 1
+    fi
+    echo "  ✓ DNS: ${host} резолвится"
+  fi
+
+  if s3m_aws s3 ls "s3://${B_BUCKET}/" --page-size 5 >/dev/null 2>"$errf"; then
+    echo "  ✓ листинг бакета: доступ есть"
+  else
+    echo "  ✗ листинг бакета не удался. Ответ aws:"
+    sed 's/^/      /' "$errf" | tail -n 4
+    echo "    Частые причины: неверные ключи (InvalidAccessKeyId/SignatureDoesNotMatch),"
+    echo "    нет бакета (NoSuchBucket), не тот endpoint/region, закрыт исходящий 443."
+    rm -f "$errf"; return 1
+  fi
+
+  key="${B_PREFIX}/.rw-s3-test.$(hostname -s 2>/dev/null || hostname).$$"
+  if printf 'rw-backup-full connectivity test\n' | s3m_aws s3 cp - "s3://${B_BUCKET}/${key}" 2>"$errf"; then
+    echo "  ✓ запись тестового объекта"
+  else
+    echo "  ✗ запись не удалась (листинг работает — вероятно, ключ read-only). Ответ aws:"
+    sed 's/^/      /' "$errf" | tail -n 4
+    rm -f "$errf"; return 1
+  fi
+
+  if s3m_aws s3 cp "s3://${B_BUCKET}/${key}" - >/dev/null 2>"$errf"; then
+    echo "  ✓ чтение тестового объекта"
+  else
+    echo "  ✗ чтение не удалось. Ответ aws:"; sed 's/^/      /' "$errf" | tail -n 4; rc=1
+  fi
+
+  if s3m_aws s3 rm "s3://${B_BUCKET}/${key}" >/dev/null 2>"$errf"; then
+    echo "  ✓ удаление тестового объекта"
+  else
+    echo "  ⚠ удаление не удалось (для write-only политик это нормально; retention"
+    echo "    тогда должен делаться lifecycle-политикой бакета). Ответ aws:"
+    sed 's/^/      /' "$errf" | tail -n 2
+  fi
+
+  rm -f "$errf"
+  (( rc == 0 )) && echo "  ИТОГ: ✓ бэкенд ${name} работоспособен" || echo "  ИТОГ: ✗ есть проблемы"
+  return $rc
+}
+
+s3m_test_all() {
+  local n found=0 fails=0
+  command -v aws >/dev/null 2>&1 || { echo "✗ awscli не установлен (apt install awscli)"; return 1; }
+  for n in $(s3m_backends); do
+    found=1
+    s3m_test_backend "$n" || fails=$((fails+1))
+    echo
+  done
+  (( found )) || { echo "S3-бэкенды не настроены (s3.d/*.env). Добавить: rw-backup-full s3-add"; return 1; }
+  (( fails == 0 ))
 }

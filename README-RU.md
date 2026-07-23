@@ -336,6 +336,7 @@ rw-backup-full verify                проверка бэкапов в песо
 rw-backup-full sandbox-timer         применить расписание песочницы из конфига
 rw-backup-full s3-backends           список S3-бэкендов
 rw-backup-full s3-add / s3-remove    добавить / удалить S3-бэкенд
+rw-backup-full s3-test [имя]         диагностика подключений к S3 (шаги + реальные ошибки aws)
 rw-backup-full panel-restore         восстановление панели (встроенное)
 rw-backup-full status [--json]       статус сервера (JSON — для веб-сервиса)
 rw-backup-full metrics-export        выгрузить метрики для Grafana сейчас

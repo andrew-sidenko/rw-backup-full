@@ -1630,7 +1630,7 @@ wal_status_all() {
     local last_meta
     last_meta="$(find "${wal_root}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | sort -r | head -n1)"
     if [[ -n "$last_meta" ]]; then
-      echo "    последний базовый: $(grep -E '^CREATED_AT=' "$last_meta" | cut -d'\"' -f2)"
+      echo "    последний базовый: $(grep -E '^CREATED_AT=' "$last_meta" | cut -d'"' -f2)"
     fi
 
     systemctl is-active "rw-wal-ship@${name}.timer" >/dev/null 2>&1 \
@@ -1696,9 +1696,9 @@ main_menu() {
       15) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
       16)
         s3_backends_list
-        echo; echo "  a) добавить   r) удалить   Enter) назад"
+        echo; echo "  a) добавить   r) удалить   t) тест подключений   Enter) назад"
         read -r -p "  > " s3act
-        case "$s3act" in a) s3_backend_add ;; r) s3_backend_remove ;; esac
+        case "$s3act" in a) s3_backend_add ;; r) s3_backend_remove ;; t) s3m_test_all ;; esac
         pause ;;
       17) "${PANEL_SCRIPTS_DIR}/panel-restore.sh" || true; pause ;;
       18) "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" || true; pause ;;
@@ -1743,6 +1743,7 @@ WAL / PITR (v4):
 Мульти-S3 и панель (v5):
   rw-backup-full s3-backends                    список S3-бэкендов
   rw-backup-full s3-add | s3-remove             добавить / удалить бэкенд
+  rw-backup-full s3-test [имя]                  диагностика подключения к S3 (все или один)
   rw-backup-full panel-restore [файл|--from-s3] восстановление панели (встроенное)
   rw-backup-full status [--json]                статус сервера (JSON для веб-сервиса)
   rw-backup-full metrics-export                 выгрузка метрик сейчас
@@ -1808,6 +1809,8 @@ case "$cmd" in
     s3_backend_add ;;
   s3-remove)
     s3_backend_remove ;;
+  s3-test)
+    if [[ -n "${2:-}" ]]; then s3m_test_backend "$2"; else s3m_test_all; fi ;;
   panel-restore)
     shift; exec "${PANEL_SCRIPTS_DIR}/panel-restore.sh" "$@" ;;
   status)

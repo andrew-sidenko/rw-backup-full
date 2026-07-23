@@ -178,9 +178,10 @@ if [[ "$NO_S3" != "--no-s3" ]] && wal_s3_ready; then
     s3_total=$((s3_total + 1))
     wal_s3_select "$backend" || continue
     b_ok=false
+    bb_err="$(mktemp)"
     for attempt in 1 2 3; do
-      if wal_aws s3 cp "$out_file" "$(wal_s3_uri "basebackup/$(basename "$out_file")")" --only-show-errors 2>/dev/null &&
-         wal_aws s3 cp "$meta_file" "$(wal_s3_uri "basebackup/$(basename "$meta_file")")" --only-show-errors 2>/dev/null; then
+      if wal_aws s3 cp "$out_file" "$(wal_s3_uri "basebackup/$(basename "$out_file")")" --only-show-errors 2>"$bb_err" &&
+         wal_aws s3 cp "$meta_file" "$(wal_s3_uri "basebackup/$(basename "$meta_file")")" --only-show-errors 2>>"$bb_err"; then
         b_ok=true
         break
       fi
@@ -190,8 +191,11 @@ if [[ "$NO_S3" != "--no-s3" ]] && wal_s3_ready; then
       s3_ok_count=$((s3_ok_count + 1))
       msg OK "[${INSTANCE}] S3[${backend}]: $(wal_s3_uri "basebackup/$(basename "$out_file")")"
     else
-      msg WARN "[${INSTANCE}] S3[${backend}]: выгрузка базового бэкапа не удалась"
+      msg WARN "[${INSTANCE}] S3[${backend}]: выгрузка базового бэкапа не удалась. Причина (aws):"
+      sed 's/^/    /' "$bb_err" | tail -n 3 >&2
+      msg WARN "Диагностика: rw-backup-full s3-test ${backend}"
     fi
+    rm -f "$bb_err"
   done < <(wal_s3_backends)
   if (( s3_total > 0 )); then
     s3_ok="${s3_ok_count}/${s3_total}"

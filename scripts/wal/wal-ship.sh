@@ -44,6 +44,9 @@ shipped=0
 failed=0
 s3_failed=0
 
+incoming_count="$(find "${INST_SPOOL_DIR}/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ')"
+msg INFO "[${INSTANCE}] шиппер: в спуле ${incoming_count} сегментов"
+
 mapfile -t WAL_BACKENDS < <(wal_s3_backends)
 s3_enabled=false
 (( ${#WAL_BACKENDS[@]} > 0 )) && s3_enabled=true
@@ -101,9 +104,12 @@ done < <(find "$SPOOL_IN" -maxdepth 1 -type f -name '0*' 2>/dev/null | sort)
 # 2. Локальный архив -> S3 (всё, что ещё не отмечено как выгруженное)
 # --------------------------------------------------------------------------
 if [[ "$s3_enabled" == "true" ]]; then
+  aws_err="$(mktemp)"
   for backend in "${WAL_BACKENDS[@]}"; do
     wal_s3_select "$backend" || continue
     mkdir -p "${INST_STATE_DIR}/uploaded/${backend}"
+    backend_dead=false
+    backend_skipped=0
     while IFS= read -r arc_path; do
       [[ -n "$arc_path" ]] || continue
       arc="$(basename "$arc_path")"
@@ -112,9 +118,17 @@ if [[ "$s3_enabled" == "true" ]]; then
       marker="${INST_STATE_DIR}/uploaded/${backend}/${arc}"
       [[ -f "$marker" ]] && continue
 
+      # После первого провала не долбим этот бэкенд остальными сегментами:
+      # причина у всех одна, а ретраи только растягивают прогон.
+      if [[ "$backend_dead" == "true" ]]; then
+        backend_skipped=$((backend_skipped + 1))
+        s3_failed=$((s3_failed + 1))
+        continue
+      fi
+
       ok=false
       for attempt in 1 2 3; do
-        if wal_aws s3 cp "$arc_path" "$(wal_s3_uri "wal/${arc}")" --only-show-errors 2>/dev/null; then
+        if wal_aws s3 cp "$arc_path" "$(wal_s3_uri "wal/${arc}")" --only-show-errors 2>"$aws_err"; then
           ok=true
           break
         fi
@@ -124,11 +138,16 @@ if [[ "$s3_enabled" == "true" ]]; then
       if [[ "$ok" == "true" ]]; then
         : > "$marker"
       else
-        msg WARN "[${INSTANCE}] S3[${backend}]: не выгружен ${arc}, повтор на следующем запуске"
         s3_failed=$((s3_failed + 1))
+        backend_dead=true
+        msg WARN "[${INSTANCE}] S3[${backend}]: выгрузка не удалась. Причина (aws):"
+        sed 's/^/    /' "$aws_err" | tail -n 3 >&2
+        msg WARN "[${INSTANCE}] S3[${backend}]: остальные сегменты этого прогона пропущены; диагностика: rw-backup-full s3-test ${backend}"
       fi
     done < <(find "$INST_ARCHIVE_DIR" -maxdepth 1 -type f -name '0*' 2>/dev/null | sort)
+    (( backend_skipped > 0 )) && msg WARN "[${INSTANCE}] S3[${backend}]: отложено ${backend_skipped} сегментов до восстановления связи"
   done
+  rm -f "$aws_err"
 fi
 
 # --------------------------------------------------------------------------
