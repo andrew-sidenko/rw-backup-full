@@ -101,7 +101,10 @@ tar -czf "${WORK}/${FINAL}" -C "$WORK" "$DUMP_FILE" "$DIR_ARCHIVE" backup_meta.i
   || fail "сборка финального архива"
 
 gzip -t "${WORK}/${FINAL}" || fail "финальный архив не проходит gzip -t"
-tar -tzf "${WORK}/${FINAL}" | grep -q backup_meta.info || fail "в архиве нет backup_meta.info"
+# Листинг в файл, затем grep: конвейер `tar | grep -q` под pipefail ловит
+# SIGPIPE при раннем выходе grep и даёт ложные провалы.
+tar -tzf "${WORK}/${FINAL}" > "${WORK}/members.txt" || fail "финальный архив не читается tar"
+grep -q backup_meta.info "${WORK}/members.txt" || fail "в архиве нет backup_meta.info"
 
 mv "${WORK}/${FINAL}" "${BACKUP_DIR}/${FINAL}"
 size_h="$(du -h "${BACKUP_DIR}/${FINAL}" | awk '{print $1}')"

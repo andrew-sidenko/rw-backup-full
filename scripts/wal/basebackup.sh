@@ -107,13 +107,26 @@ fi
 # Для зашифрованных архивов распаковку проверить нельзя (приватного ключа
 # на сервере нет по дизайну) — проверяем только размер.
 if [[ -z "$enc_ext" ]]; then
-  if ! wal_decompress_stream "$out_file" < "$tmp_file" | tar -tf - >/dev/null 2>&1; then
-    rm -f "$tmp_file"
-    fail "архив не проходит проверку tar"
+  members_file="${INST_STATE_DIR}/last_basebackup_members.txt"
+  if ! wal_decompress_stream "$out_file" < "$tmp_file" | tar -tf - > "$members_file" 2>"${INST_STATE_DIR}/tar.err"; then
+    invalid="${INST_BASEBACKUP_DIR}/${base_name}.INVALID"
+    mv -f "$tmp_file" "$invalid"
+    msg ERR "tar-ошибка: $(tail -n2 "${INST_STATE_DIR}/tar.err" | tr '\n' ' ')"
+    fail "архив не проходит проверку tar; сохранён для разбора: ${invalid}"
   fi
-  if ! wal_decompress_stream "$out_file" < "$tmp_file" | tar -tf - 2>/dev/null | grep -q 'PG_VERSION'; then
-    rm -f "$tmp_file"
-    fail "в архиве нет PG_VERSION — структура повреждена"
+  # Ключевой критерий восстановимости — global/pg_control: без него бэкап мёртв.
+  # PG_VERSION проверяем вторично (в разных версиях/раскладках имена членов
+  # могут иметь префиксы вроде ./).
+  if ! grep -Eq '(^|/)global/pg_control$' "$members_file"; then
+    invalid="${INST_BASEBACKUP_DIR}/${base_name}.INVALID"
+    mv -f "$tmp_file" "$invalid"
+    msg ERR "Первые члены архива:"
+    head -n 15 "$members_file" | sed 's/^/    /' >&2
+    msg ERR "Всего членов: $(wc -l < "$members_file"); полный список: ${members_file}"
+    fail "в архиве нет global/pg_control — это не базовый бэкап PGDATA; файл сохранён: ${invalid}"
+  fi
+  if ! grep -Eq '(^|/)PG_VERSION$' "$members_file"; then
+    msg WARN "[${INSTANCE}] PG_VERSION не найден среди членов (нестандартная раскладка?), но global/pg_control есть — продолжаю"
   fi
 fi
 
