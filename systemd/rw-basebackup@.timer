@@ -1,0 +1,12 @@
+[Unit]
+Description=rw-backup-full: periodic base backup (%i)
+
+[Timer]
+OnBootSec=15min
+# Интервал переопределяется drop-in'ом из INST_BASEBACKUP_INTERVAL_HOURS (wal-timers.sh)
+OnUnitActiveSec=24h
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

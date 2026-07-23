@@ -1,5 +1,7 @@
 # rw-backup-full v3
 
+> **v4**: добавлены WAL-архивация PostgreSQL, PITR-восстановление и песочница автопроверки бэкапов. Полная инструкция на русском: [README-RU.md](README-RU.md).
+
 `rw-backup-full` is an extension wrapper for `distillium/remnawave-backup-restore`.
 It adds automatic backups for custom Docker bots in `/home`, independent external S3 duplication, and Telegram notifications for every archive saved to the external S3.
 
@@ -121,7 +123,6 @@ For every successfully uploaded file, a separate Telegram message is sent if ena
 ```bash
 git clone https://github.com/YOUR-USER/rw-backup-full.git
 cd rw-backup-full
-chmod +x install.sh
 sudo ./install.sh
 ```
 
@@ -261,62 +262,6 @@ The old project directory is not deleted; it is moved to:
 /home/<project>.before_restore_YYYYMMDD_HHMMSS
 ```
 
-## Archive verification
-
-Every custom bot archive is verified before external S3 upload:
-
-- gzip stream integrity (`gzip -t`);
-- tar listing readability;
-- required members present: `project_dir.tar.gz`, `postgres_dump.sql.gz`, `PROFILE.env`;
-- `postgres_dump.sql.gz` is larger than `FULL_VERIFY_MIN_PGDUMP_BYTES` (an empty dump means `pg_dumpall` failed).
-
-A broken or incomplete archive is never uploaded, and a Telegram failure
-notification is sent if `FULL_NOTIFY_ON_FAILURE="true"`.
-
-## Safe S3 retention
-
-External S3 retention determines archive age from the **timestamp in the file
-name** (both `YYYY-MM-DD_HH_MM_SS` panel format and `YYYYMMDD_HHMMSS` bot
-format), not from S3 `LastModified`. Additional guarantees:
-
-- at least `FULL_EXTERNAL_S3_RETENTION_MIN_KEEP` newest copies are always kept
-  per panel and per each bot, regardless of age;
-- objects with an unrecognized timestamp are never touched;
-- if the S3 listing fails, nothing is deleted;
-- dry run: `sudo rw-backup-full s3-cleanup --dry-run`.
-
-## Encryption (age)
-
-Archives contain `.env` files with bot tokens and database passwords, so
-encrypting them before upload is strongly recommended.
-
-One-time setup on a **trusted machine** (not the backup server):
-
-```
-age-keygen -o age-key.txt
-```
-
-Put the public key (`age1...`) into the config and keep `age-key.txt` offline:
-
-```
-FULL_AGE_ENABLED="true"
-FULL_AGE_RECIPIENT="age1..."
-```
-
-With encryption enabled, custom bot archives are stored as `.tar.gz.age`
-locally and in S3; the panel S3 duplicate is encrypted while the local
-original panel archive stays untouched. The server only holds the public key,
-so a compromised server cannot read old backups.
-
-Restore accepts `.tar.gz.age` archives and requires the private key:
-
-```
-FULL_AGE_IDENTITY_FILE="/root/age-key.txt"
-sudo rw-backup-full custom-restore
-```
-
-Install age: `sudo apt-get install -y age`
-
 ## Requirements
 
 - Docker
@@ -330,6 +275,4 @@ Install awscli:
 ```bash
 sudo apt-get update
 sudo apt-get install -y awscli curl
-# optional, for encryption:
-sudo apt-get install -y age
 ```

@@ -1,0 +1,12 @@
+[Unit]
+Description=rw-backup-full: sandbox backup verification
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rw-backup-restore/scripts/sandbox/verify-backup.sh
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=3h

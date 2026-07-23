@@ -1,0 +1,12 @@
+[Unit]
+Description=rw-backup-full: periodic WAL shipping (%i)
+
+[Timer]
+OnBootSec=2min
+# Интервал переопределяется drop-in'ом из INST_WAL_SHIP_INTERVAL_MIN (wal-timers.sh)
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

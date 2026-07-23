@@ -7,6 +7,9 @@ ORIGINAL_CONFIG_FILE="${ORIGINAL_CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 FULL_CONFIG_FILE="${FULL_CONFIG_FILE:-${INSTALL_DIR}/rw-backup-full.env}"
 ORIGINAL_RW_BACKUP_BIN="${ORIGINAL_RW_BACKUP_BIN:-rw-backup}"
 ORIGINAL_RW_BACKUP_SCRIPT="${ORIGINAL_RW_BACKUP_SCRIPT:-${INSTALL_DIR}/backup-restore.sh}"
+WAL_SCRIPTS_DIR="${WAL_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/wal}"
+SANDBOX_SCRIPTS_DIR="${SANDBOX_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/sandbox}"
+INSTANCES_DIR="${INSTANCES_DIR:-${INSTALL_DIR}/instances.d}"
 
 RED=$'\e[31m'
 GREEN=$'\e[32m'
@@ -36,7 +39,6 @@ FULL_REQUIRE_ORIGINAL_RW_BACKUP="false"
 FULL_INCLUDE_EXTRA_CONFIGS="true"
 FULL_PANEL_EXTERNAL_S3_ENABLED="true"
 FULL_CUSTOM_EXTERNAL_S3_ENABLED="true"
-FULL_CUSTOM_PRIMARY_S3_ENABLED="true"   # upload custom bot to PRIMARY S3 (original rw-backup bucket), no encryption
 FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD="true"
 FULL_TELEGRAM_IMPORT_FROM_ORIGINAL="true"
 FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL="false"
@@ -50,20 +52,6 @@ FULL_EXTERNAL_S3_SECRET_KEY=""
 FULL_EXTERNAL_S3_REGION="us-east-1"
 FULL_EXTERNAL_S3_ENDPOINT=""
 FULL_EXTERNAL_S3_PREFIX="rw-backup-full"
-FULL_EXTERNAL_S3_RETENTION_MIN_KEEP="3"
-FULL_NOTIFY_ON_FAILURE="true"
-FULL_VERIFY_MIN_ARCHIVE_BYTES="1024"
-FULL_VERIFY_MIN_PGDUMP_BYTES="60"
-FULL_AGE_ENABLED="false"
-FULL_AGE_RECIPIENT=""
-FULL_AGE_RECIPIENTS_FILE=""
-FULL_AGE_IDENTITY_FILE=""
-
-# Результат maybe_encrypt_for_upload / encrypt_archive_age и причина последней ошибки age
-ENCRYPT_RESULT_FILE=""
-AGE_LAST_ERROR=""
-AGE_LAST_ERROR=""
-ENCRYPT_RESULT_FILE=""
 
 msg() {
   local type="$1"
@@ -91,16 +79,12 @@ capture_original_vars() {
   ORIG_TG_MESSAGE_THREAD_ID="${TG_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID:-${MESSAGE_THREAD_ID:-}}}"
   ORIG_TG_PROXY="${TG_PROXY:-${TELEGRAM_PROXY:-}}"
 
-  # ORIG_S3_* — читаем из config.env оригинального rw-backup.
-  # Если имена переменных в config.env нестандартные, задайте ORIG_S3_BUCKET,
-  # ORIG_S3_ACCESS_KEY, ORIG_S3_SECRET_KEY напрямую в rw-backup-full.env —
-  # они имеют приоритет над автоматическим определением.
-  ORIG_S3_BUCKET="${ORIG_S3_BUCKET:-${S3_BUCKET:-${AWS_S3_BUCKET:-${BACKUP_S3_BUCKET:-}}}}"
-  ORIG_S3_ACCESS_KEY="${ORIG_S3_ACCESS_KEY:-${S3_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-${BACKUP_S3_ACCESS_KEY:-}}}}"
-  ORIG_S3_SECRET_KEY="${ORIG_S3_SECRET_KEY:-${S3_SECRET_KEY:-${AWS_SECRET_ACCESS_KEY:-${BACKUP_S3_SECRET_KEY:-}}}}"
-  ORIG_S3_REGION="${ORIG_S3_REGION:-${S3_REGION:-${AWS_DEFAULT_REGION:-${BACKUP_S3_REGION:-us-east-1}}}}"
-  ORIG_S3_ENDPOINT="${ORIG_S3_ENDPOINT:-${S3_ENDPOINT:-${AWS_ENDPOINT_URL:-${BACKUP_S3_ENDPOINT:-}}}}"
-  ORIG_S3_PREFIX="${ORIG_S3_PREFIX:-${S3_PREFIX:-${AWS_S3_PREFIX:-${BACKUP_S3_PREFIX:-}}}}"
+  ORIG_S3_BUCKET="${S3_BUCKET:-${AWS_S3_BUCKET:-}}"
+  ORIG_S3_ACCESS_KEY="${S3_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-}}"
+  ORIG_S3_SECRET_KEY="${S3_SECRET_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
+  ORIG_S3_REGION="${S3_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+  ORIG_S3_ENDPOINT="${S3_ENDPOINT:-${AWS_ENDPOINT_URL:-}}"
+  ORIG_S3_PREFIX="${S3_PREFIX:-${AWS_S3_PREFIX:-}}"
   ORIG_UPLOAD_METHOD="${UPLOAD_METHOD:-${BACKUP_UPLOAD_METHOD:-}}"
 }
 
@@ -131,18 +115,9 @@ load_config() {
   FULL_INCLUDE_EXTRA_CONFIGS="${FULL_INCLUDE_EXTRA_CONFIGS:-true}"
   FULL_PANEL_EXTERNAL_S3_ENABLED="${FULL_PANEL_EXTERNAL_S3_ENABLED:-true}"
   FULL_CUSTOM_EXTERNAL_S3_ENABLED="${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"
-  FULL_CUSTOM_PRIMARY_S3_ENABLED="${FULL_CUSTOM_PRIMARY_S3_ENABLED:-true}"
   FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD="${FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD:-true}"
   FULL_TELEGRAM_IMPORT_FROM_ORIGINAL="${FULL_TELEGRAM_IMPORT_FROM_ORIGINAL:-true}"
   FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL="${FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL:-false}"
-  FULL_EXTERNAL_S3_RETENTION_MIN_KEEP="${FULL_EXTERNAL_S3_RETENTION_MIN_KEEP:-3}"
-  FULL_NOTIFY_ON_FAILURE="${FULL_NOTIFY_ON_FAILURE:-true}"
-  FULL_VERIFY_MIN_ARCHIVE_BYTES="${FULL_VERIFY_MIN_ARCHIVE_BYTES:-1024}"
-  FULL_VERIFY_MIN_PGDUMP_BYTES="${FULL_VERIFY_MIN_PGDUMP_BYTES:-60}"
-  FULL_AGE_ENABLED="${FULL_AGE_ENABLED:-false}"
-  FULL_AGE_RECIPIENT="${FULL_AGE_RECIPIENT:-}"
-  FULL_AGE_RECIPIENTS_FILE="${FULL_AGE_RECIPIENTS_FILE:-}"
-  FULL_AGE_IDENTITY_FILE="${FULL_AGE_IDENTITY_FILE:-}"
 
   if [[ "$FULL_TELEGRAM_IMPORT_FROM_ORIGINAL" == "true" ]]; then
     FULL_TG_BOT_TOKEN="${FULL_TG_BOT_TOKEN:-$ORIG_TG_BOT_TOKEN}"
@@ -213,216 +188,6 @@ full_s3_ready() {
   [[ -n "${FULL_EXTERNAL_S3_BUCKET:-}" && -n "${FULL_EXTERNAL_S3_ACCESS_KEY:-}" && -n "${FULL_EXTERNAL_S3_SECRET_KEY:-}" ]]
 }
 
-original_s3_available() {
-  [[ -n "${ORIG_S3_BUCKET:-}" && -n "${ORIG_S3_ACCESS_KEY:-}" && -n "${ORIG_S3_SECRET_KEY:-}" ]]
-}
-
-primary_s3_prefix_normalized() {
-  local p="${ORIG_S3_PREFIX:-}"
-  [[ -z "$p" ]] && { echo ""; return 0; }
-  p="${p#/}"
-  [[ "$p" == */ ]] || p="${p}/"
-  echo "$p"
-}
-
-primary_s3_upload() {
-  # Загружает custom bot архив в ОСНОВНОЙ S3 (тот же бакет, которым пользуется
-  # оригинальный rw-backup для панели) — БЕЗ шифрования.
-  # Путь: <orig_prefix>custom-bot/<host>/<file>
-  local file_path="$1"
-  local label="$2"
-
-  if ! command -v aws >/dev/null 2>&1; then
-    msg WARN "awscli не найден — primary S3 upload пропущен"
-    return 1
-  fi
-
-  if ! original_s3_available; then
-    msg WARN "В оригинальном config.env нет S3-настроек — primary S3 upload пропущен"
-    return 1
-  fi
-
-  local endpoint_arg=()
-  [[ -n "${ORIG_S3_ENDPOINT:-}" ]] && endpoint_arg=(--endpoint-url "$ORIG_S3_ENDPOINT")
-
-  local host file_name s3_key size
-  host="$(hostname -s 2>/dev/null || hostname)"
-  file_name="$(basename "$file_path")"
-  s3_key="$(primary_s3_prefix_normalized)custom-bot/${host}/${file_name}"
-  size="$(du -h "$file_path" | awk '{print $1}')"
-
-  msg INFO "Primary S3 upload (без шифрования): s3://${ORIG_S3_BUCKET}/${s3_key} [${size}]"
-
-  if ! AWS_ACCESS_KEY_ID="$ORIG_S3_ACCESS_KEY" \
-       AWS_SECRET_ACCESS_KEY="$ORIG_S3_SECRET_KEY" \
-       AWS_DEFAULT_REGION="${ORIG_S3_REGION:-us-east-1}" \
-       aws s3 cp "$file_path" "s3://${ORIG_S3_BUCKET}/${s3_key}" "${endpoint_arg[@]}" --quiet; then
-    return 1
-  fi
-
-  if truthy "${FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD:-false}"; then
-    send_full_telegram_message "✅ Backup saved to primary S3
-Type: custom-bot
-Project: ${label}
-File: ${file_name} (${size})
-S3: s3://${ORIG_S3_BUCKET}/${s3_key}" || true
-  fi
-
-  return 0
-}
-
-primary_s3_retention_cleanup() {
-  # Чистит ТОЛЬКО custom_bot_* архивы под prefx/custom-bot/ в основном S3.
-  # Панельные remnawave_backup_* НИКОГДА не трогает.
-  local dry_run="false"
-  [[ "${1:-}" == "--dry-run" ]] && dry_run="true"
-
-  original_s3_available || return 0
-
-  local days="${FULL_PRIMARY_S3_RETENTION_DAYS:-${FULL_EXTERNAL_S3_RETENTION_DAYS:-10}}"
-  local min_keep="${FULL_EXTERNAL_S3_RETENTION_MIN_KEEP:-3}"
-  local endpoint_arg=()
-  [[ -n "${ORIG_S3_ENDPOINT:-}" ]] && endpoint_arg=(--endpoint-url "$ORIG_S3_ENDPOINT")
-
-  local prefix listing
-  prefix="$(primary_s3_prefix_normalized)custom-bot/"
-
-  if ! listing="$(
-    AWS_ACCESS_KEY_ID="$ORIG_S3_ACCESS_KEY" \
-    AWS_SECRET_ACCESS_KEY="$ORIG_S3_SECRET_KEY" \
-    AWS_DEFAULT_REGION="${ORIG_S3_REGION:-us-east-1}" \
-    aws s3 ls "s3://${ORIG_S3_BUCKET}/${prefix}" "${endpoint_arg[@]}" --recursive 2>&1
-  )"; then
-    msg ERR "Не удалось получить листинг primary S3 — retention прерван"
-    return 1
-  fi
-
-  local now cutoff deleted=0 kept=0
-  now="$(date -u +%s)"
-  cutoff=$(( now - days * 86400 ))
-  declare -A grp_seen=()
-  local -a entries=()
-
-  while read -r _ _ _ file_key; do
-    [[ -n "${file_key:-}" ]] || continue
-    local bname ep grp
-    bname="$(basename "$file_key")"
-    [[ "$bname" =~ ^custom_bot_.*\.tar\.gz(\.age)?$ ]] || continue
-    ep="$(parse_backup_timestamp_epoch "$bname")"
-    [[ -n "$ep" ]] || { msg WARN "retention primary: timestamp не распознан, пропускаю: ${file_key}"; continue; }
-    grp="$(dirname "$file_key")/$(sed -E 's/_?([0-9]{8}_[0-9]{6}|[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2})\.tar\.gz(\.age)?$//' <<<"$bname")"
-    entries+=("${ep}|${grp}|${file_key}")
-  done <<< "$listing"
-
-  while IFS= read -r line; do
-    local ep key grp
-    ep="${line%%|*}"; line="${line#*|}"; grp="${line%%|*}"; key="${line#*|}"
-    grp_seen["$grp"]=$(( ${grp_seen["$grp"]:-0} + 1 ))
-    if (( ${grp_seen["$grp"]} <= min_keep )); then kept=$((kept+1)); continue; fi
-    if (( ep < cutoff )); then
-      if [[ "$dry_run" == "true" ]]; then
-        msg INFO "DRY-RUN primary: удалил бы ${key}"
-        deleted=$((deleted+1))
-      else
-        if AWS_ACCESS_KEY_ID="$ORIG_S3_ACCESS_KEY" \
-           AWS_SECRET_ACCESS_KEY="$ORIG_S3_SECRET_KEY" \
-           AWS_DEFAULT_REGION="${ORIG_S3_REGION:-us-east-1}" \
-           aws s3 rm "s3://${ORIG_S3_BUCKET}/${key}" "${endpoint_arg[@]}" --quiet; then
-          msg INFO "Удалён устаревший custom-bot в primary S3: ${key}"
-          deleted=$((deleted+1))
-        else
-          msg WARN "Не удалось удалить из primary S3: ${key}"
-        fi
-      fi
-    else
-      kept=$((kept+1))
-    fi
-  done < <(printf '%s\n' "${entries[@]}" | sort -t'|' -k1,1nr)
-
-  msg OK "Primary S3 retention: deleted=${deleted}, kept=${kept}"
-}
-
-ensure_awscli() {
-  command -v aws >/dev/null 2>&1 && return 0
-
-  if [[ ! -t 0 ]]; then
-    msg WARN "awscli не найден (apt-get install -y awscli)"
-    return 1
-  fi
-
-  read -r -p "awscli не найден. Установить сейчас через apt-get? [Y/n]: " ans
-  case "${ans:-Y}" in
-    y|Y|"")
-      if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y awscli
-        command -v aws >/dev/null 2>&1 && { msg OK "awscli установлен"; return 0; }
-        msg ERR "Не удалось установить awscli"
-      else
-        msg ERR "apt-get не найден, установи awscli вручную"
-      fi
-      return 1
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-ensure_external_s3_interactive() {
-  # Вызывается перед backup'ом. Спрашивает один раз за запуск.
-  # Возврат всегда 0 — отсутствие S3 не блокирует локальный backup.
-  [[ "${S3_INTERACTIVE_CHECKED:-0}" == "1" ]] && return 0
-  S3_INTERACTIVE_CHECKED=1
-
-  ensure_awscli || true
-
-  if full_s3_ready; then
-    return 0
-  fi
-
-  if ! truthy "${FULL_PANEL_EXTERNAL_S3_ENABLED:-true}" && \
-     ! truthy "${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"; then
-    return 0
-  fi
-
-  if [[ ! -t 0 ]]; then
-    msg WARN "FULL external S3 (дубликат) не настроен — дублирование пропущено"
-    if original_s3_available && truthy "${FULL_CUSTOM_PRIMARY_S3_ENABLED:-true}"; then
-      msg INFO "Custom bot будет загружен в основной S3 без шифрования"
-    fi
-    return 0
-  fi
-
-  echo
-  msg WARN "FULL external S3 (дубликат для шифрованного хранения) не настроен."
-  echo
-  echo "  Логика двух S3:"
-  if original_s3_available; then
-    echo "  • Основной S3 (из config.env, bucket=${ORIG_S3_BUCKET}):"
-    echo "    ↳ панель — загружает оригинальный rw-backup"
-    echo "    ↳ custom bot — загружает этот скрипт, БЕЗ шифрования"
-  else
-    echo "  • Основной S3: не настроен в config.env"
-  fi
-  echo "  • FULL external S3 (дубликат, отдельный бакет/кредсы):"
-  echo "    ↳ панель + custom bot — этот скрипт, С шифрованием (если age включён)"
-  echo
-  echo "  1. Настроить FULL external S3 (дубликат) сейчас"
-  echo "  2. Продолжить без дубликата"
-  echo
-
-  read -r -p "[?] Выбор [2]: " choice
-  case "${choice:-2}" in
-    1)
-      configure_external_s3
-      ensure_awscli || true
-      ;;
-    *)
-      msg INFO "Продолжаю без FULL external S3"
-      ;;
-  esac
-
-  return 0
-}
-
 full_telegram_ready() {
   [[ -n "${FULL_TG_BOT_TOKEN:-}" && -n "${FULL_TG_CHAT_ID:-}" ]]
 }
@@ -454,200 +219,6 @@ send_full_telegram_message() {
   fi
 
   curl "${args[@]}" >/dev/null 2>&1
-}
-
-# --- Failure notifications -------------------------------------------------
-
-notify_failure() {
-  # notify_failure <короткое описание>
-  # Шлёт Telegram об ошибке, если включено. Тихий отказ при недоступном TG.
-  local text="$1"
-  local host
-  host="$(hostname -s 2>/dev/null || hostname)"
-
-  msg ERR "$text"
-
-  if truthy "${FULL_NOTIFY_ON_FAILURE:-true}"; then
-    send_full_telegram_message "❌ rw-backup-full FAILURE
-Host: ${host}
-${text}" || true
-  fi
-}
-
-# --- Archive verification ---------------------------------------------------
-
-tar_member_size() {
-  # tar_member_size <archive> <member-suffix>
-  # Печатает размер первого члена, чьё имя оканчивается на suffix; -1 если нет.
-  local archive="$1" suffix="$2"
-  tar -tzvf "$archive" 2>/dev/null \
-    | awk -v s="$suffix" 'index($NF, s) == length($NF) - length(s) + 1 {print $3; found=1; exit} END{if(!found) print -1}'
-}
-
-verify_custom_archive() {
-  # Проверяет финальный custom_bot архив ДО загрузки в S3.
-  # Ловит случай "архив создан, но битый/пустой" (например, упавший pg_dumpall).
-  local archive="$1"
-
-  if [[ ! -f "$archive" ]]; then
-    msg ERR "verify: архив не найден: ${archive}"
-    return 1
-  fi
-
-  local size
-  size="$(stat -c '%s' "$archive" 2>/dev/null || echo 0)"
-  if (( size < ${FULL_VERIFY_MIN_ARCHIVE_BYTES:-1024} )); then
-    msg ERR "verify: архив подозрительно мал (${size} байт): ${archive}"
-    return 1
-  fi
-
-  if ! gzip -t "$archive" 2>/dev/null; then
-    msg ERR "verify: повреждён gzip-поток: ${archive}"
-    return 1
-  fi
-
-  local listing
-  if ! listing="$(tar -tzf "$archive" 2>/dev/null)"; then
-    msg ERR "verify: повреждён tar (оглавление не читается): ${archive}"
-    return 1
-  fi
-
-  # Члены лежат внутри подпапки custom_bot_<proj>_<ts>/, поэтому матчим по суффиксу.
-  local member
-  for member in "/project_dir.tar.gz" "/postgres_dump.sql.gz" "/PROFILE.env"; do
-    if ! grep -q "${member}$" <<<"$listing"; then
-      msg ERR "verify: в архиве нет обязательного файла ...${member}: ${archive}"
-      return 1
-    fi
-  done
-
-  if ! grep -q "/redis_dump.rdb$" <<<"$listing"; then
-    msg WARN "verify: в архиве нет redis_dump.rdb (Redis dump не снялся)"
-  fi
-
-  local pg_size
-  pg_size="$(tar_member_size "$archive" "/postgres_dump.sql.gz")"
-  if (( pg_size < ${FULL_VERIFY_MIN_PGDUMP_BYTES:-60} )); then
-    msg ERR "verify: postgres_dump.sql.gz слишком мал (${pg_size} байт) — дамп, вероятно, упал: ${archive}"
-    return 1
-  fi
-
-  msg OK "verify: архив валиден (${size} байт): $(basename "$archive")"
-  return 0
-}
-
-# --- Timestamp parsing for retention ----------------------------------------
-
-parse_backup_timestamp_epoch() {
-  # Извлекает timestamp из имени файла и печатает epoch (UTC).
-  # Поддерживает оба формата проекта:
-  #   remnawave_backup_YYYY-MM-DD_HH_MM_SS.tar.gz   (панель)
-  #   custom_bot_<proj>_YYYYMMDD_HHMMSS.tar.gz      (боты)
-  # Печатает пусто, если не распознано — такой файл retention НЕ трогает.
-  local name ts
-  name="$(basename "$1")"
-
-  ts="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}' <<<"$name" | tail -n1 || true)"
-  if [[ -n "$ts" ]]; then
-    date -u -d "${ts:0:10} ${ts:11:2}:${ts:14:2}:${ts:17:2}" +%s 2>/dev/null || true
-    return 0
-  fi
-
-  ts="$(grep -oE '[0-9]{8}_[0-9]{6}' <<<"$name" | tail -n1 || true)"
-  if [[ -n "$ts" ]]; then
-    date -u -d "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:9:2}:${ts:11:2}:${ts:13:2}" +%s 2>/dev/null || true
-    return 0
-  fi
-}
-
-# --- age encryption ----------------------------------------------------------
-# Асимметричное шифрование: на сервере хранится только ПУБЛИЧНЫЙ ключ (recipient).
-# Приватный ключ (identity) нужен только при restore и должен храниться офлайн.
-# Генерация пары на доверенной машине: age-keygen -o age-key.txt
-
-age_recipient_args() {
-  if [[ -n "${FULL_AGE_RECIPIENTS_FILE:-}" && -f "$FULL_AGE_RECIPIENTS_FILE" ]]; then
-    echo "-R ${FULL_AGE_RECIPIENTS_FILE}"
-  elif [[ -n "${FULL_AGE_RECIPIENT:-}" ]]; then
-    echo "-r ${FULL_AGE_RECIPIENT}"
-  fi
-}
-
-encrypt_archive_age() {
-  # encrypt_archive_age <input> <keep_source: true|false>
-  # Результат кладёт в глобальную ENCRYPT_RESULT_FILE.
-  # Причина последней ошибки — в AGE_LAST_ERROR (для Telegram-уведомлений).
-  local input="$1"
-  local keep_source="${2:-false}"
-  local output="${input}.age"
-
-  AGE_LAST_ERROR=""
-
-  if ! command -v age >/dev/null 2>&1; then
-    AGE_LAST_ERROR="age не установлен (apt-get install -y age)"
-    msg ERR "FULL_AGE_ENABLED=true, но ${AGE_LAST_ERROR}"
-    return 1
-  fi
-
-  local rcpt
-  rcpt="$(age_recipient_args)"
-  if [[ -z "$rcpt" ]]; then
-    AGE_LAST_ERROR="не задан FULL_AGE_RECIPIENT / FULL_AGE_RECIPIENTS_FILE в ${FULL_CONFIG_FILE}"
-    msg ERR "FULL_AGE_ENABLED=true, но ${AGE_LAST_ERROR}"
-    return 1
-  fi
-
-  local age_err
-  # shellcheck disable=SC2086
-  if age_err="$(age $rcpt -o "$output" "$input" 2>&1)"; then
-    if ! truthy "$keep_source"; then
-      rm -f "$input"
-    fi
-    msg OK "Зашифровано: $(basename "$output")"
-    ENCRYPT_RESULT_FILE="$output"
-    return 0
-  fi
-
-  rm -f "$output" 2>/dev/null || true
-  AGE_LAST_ERROR="age: ${age_err}"
-  msg ERR "Ошибка age-шифрования: ${input} — ${age_err}"
-  return 1
-}
-
-maybe_encrypt_for_upload() {
-  # maybe_encrypt_for_upload <file> <keep_source>
-  # Результат кладёт в глобальную ENCRYPT_RESULT_FILE (без сабшелла, чтобы
-  # сообщения об ошибках и AGE_LAST_ERROR были видны вызывающему коду).
-  # Если age выключен — результат равен исходному пути.
-  local file="$1"
-  local keep_source="${2:-false}"
-
-  ENCRYPT_RESULT_FILE="$file"
-
-  if truthy "${FULL_AGE_ENABLED:-false}"; then
-    encrypt_archive_age "$file" "$keep_source" || return 1
-  fi
-
-  return 0
-}
-
-decrypt_archive_age() {
-  # decrypt_archive_age <input.age> <output>
-  local input="$1"
-  local output="$2"
-  local identity="${FULL_AGE_IDENTITY_FILE:-}"
-
-  if ! command -v age >/dev/null 2>&1; then
-    msg ERR "Архив зашифрован, но age не установлен"
-    return 1
-  fi
-
-  if [[ -z "$identity" || ! -f "$identity" ]]; then
-    msg ERR "Для расшифровки нужен приватный ключ: задай FULL_AGE_IDENTITY_FILE в ${FULL_CONFIG_FILE}"
-    return 1
-  fi
-
-  age -d -i "$identity" -o "$output" "$input"
 }
 
 full_s3_upload() {
@@ -700,17 +271,6 @@ S3: s3://${FULL_EXTERNAL_S3_BUCKET}/${s3_key}" || true
 }
 
 full_s3_retention_cleanup() {
-  # full_s3_retention_cleanup [--dry-run]
-  # Безопасный retention внешнего FULL S3:
-  #   - возраст определяется по timestamp в ИМЕНИ файла (надёжнее LastModified);
-  #   - файлы с нераспознанным timestamp не трогаются;
-  #   - всегда сохраняются FULL_EXTERNAL_S3_RETENTION_MIN_KEEP свежайших копий
-  #     в каждой категории (panel / custom-bot per project) — защита от полного сноса;
-  #   - при ошибке листинга ничего не удаляется;
-  #   - --dry-run только показывает, что было бы удалено.
-  local dry_run="false"
-  [[ "${1:-}" == "--dry-run" ]] && dry_run="true"
-
   if ! command -v aws >/dev/null 2>&1; then
     msg WARN "awscli не найден, external S3 retention cleanup пропущен"
     return 0
@@ -722,15 +282,10 @@ full_s3_retention_cleanup() {
   fi
 
   local retention_days="${FULL_EXTERNAL_S3_RETENTION_DAYS:-10}"
-  local min_keep="${FULL_EXTERNAL_S3_RETENTION_MIN_KEEP:-3}"
 
   if ! [[ "$retention_days" =~ ^[0-9]+$ ]]; then
     msg WARN "Некорректный FULL_EXTERNAL_S3_RETENTION_DAYS=${retention_days}, использую 10"
     retention_days="10"
-  fi
-
-  if ! [[ "$min_keep" =~ ^[0-9]+$ ]]; then
-    min_keep="3"
   fi
 
   if (( retention_days <= 0 )); then
@@ -743,94 +298,52 @@ full_s3_retention_cleanup() {
     endpoint_arg=(--endpoint-url "$FULL_EXTERNAL_S3_ENDPOINT")
   fi
 
-  local prefix s3_path cutoff_epoch
+  local prefix
+  local s3_path
+  local cutoff_epoch
+  local checked_count=0
+  local deleted_count=0
+
   prefix="$(full_s3_prefix_normalized)"
   s3_path="s3://${FULL_EXTERNAL_S3_BUCKET}/${prefix}"
   cutoff_epoch="$(date -u -d "-${retention_days} days" +%s)"
 
-  msg INFO "External S3 retention: ${retention_days} дней, min_keep=${min_keep}, dry_run=${dry_run}, path=${s3_path}"
+  msg INFO "External S3 retention: ${retention_days} дней, path=${s3_path}"
 
-  # 1) Листинг. При ошибке — выходим, НИЧЕГО не удаляя.
-  local listing
-  if ! listing="$(
-    AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY"     AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY"     AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}"     aws s3 ls "$s3_path" "${endpoint_arg[@]}" --recursive 2>&1
-  )"; then
-    msg ERR "Не удалось получить листинг external S3 — retention прерван, ничего не удалено"
-    return 1
-  fi
-
-  # 2) Собираем "epoch|group|key" только для наших архивов с валидным timestamp.
-  #    group = category/dirname ключа, чтобы min_keep считался отдельно
-  #    для панели и для каждого бота на каждом хосте.
-  local entries=()
-  local file_key base_name file_epoch group
-
-  while read -r _ _ _ file_key; do
+  while read -r file_date file_time file_size file_key; do
     [[ -n "${file_key:-}" ]] || continue
+
+    local base_name
+    local file_epoch
 
     base_name="$(basename "$file_key")"
 
-    # Чистим только архивы, созданные full-дублированием (включая зашифрованные .age).
-    if [[ ! "$base_name" =~ ^custom_bot_.*\.tar\.gz(\.age)?$ && ! "$base_name" =~ ^remnawave_backup_.*\.tar\.gz(\.age)?$ ]]; then
+    # Чистим только архивы, созданные full-дублированием: custom_bot_* и remnawave_backup_*.
+    if [[ ! "$base_name" =~ ^custom_bot_.*\.tar\.gz$ && ! "$base_name" =~ ^remnawave_backup_.*\.tar\.gz$ ]]; then
       continue
     fi
-
-    file_epoch="$(parse_backup_timestamp_epoch "$base_name")"
-    if [[ -z "$file_epoch" ]]; then
-      msg WARN "retention: timestamp не распознан, пропускаю: ${file_key}"
-      continue
-    fi
-
-    # Группа для min_keep: папка + имя без timestamp. Так у каждого бота (и панели)
-    # своя квота свежих копий — активный сосед не вытеснит копии остановившегося бота.
-    group="$(dirname "$file_key")/$(sed -E 's/_?([0-9]{8}_[0-9]{6}|[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2})\.tar\.gz(\.age)?$//' <<<"$base_name")"
-    entries+=("${file_epoch}|${group}|${file_key}")
-  done <<< "$listing"
-
-  if (( ${#entries[@]} == 0 )); then
-    msg OK "External S3 retention: подходящих архивов не найдено"
-    return 0
-  fi
-
-  # 3) Сортируем свежие -> старые и удаляем старше cutoff, пропуская min_keep свежих в каждой группе.
-  local checked_count=0 deleted_count=0 kept_count=0
-  local line epoch key
-  declare -A group_seen=()
-
-  while IFS= read -r line; do
-    epoch="${line%%|*}"
-    line="${line#*|}"
-    group="${line%%|*}"
-    key="${line#*|}"
 
     checked_count=$((checked_count + 1))
-    group_seen["$group"]=$(( ${group_seen["$group"]:-0} + 1 ))
+    file_epoch="$(date -u -d "${file_date} ${file_time}" +%s 2>/dev/null || echo 0)"
 
-    if (( group_seen["$group"] <= min_keep )); then
-      kept_count=$((kept_count + 1))
-      continue
+    if (( file_epoch > 0 && file_epoch < cutoff_epoch )); then
+      msg INFO "Удаляю старый external S3 backup: ${file_key}"
+
+      AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY" \
+      AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY" \
+      AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}" \
+      aws s3 rm "s3://${FULL_EXTERNAL_S3_BUCKET}/${file_key}" "${endpoint_arg[@]}" --quiet || true
+
+      deleted_count=$((deleted_count + 1))
     fi
+  done < <(
+    AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY" \
+    AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}" \
+    aws s3 ls "$s3_path" "${endpoint_arg[@]}" --recursive 2>/dev/null || true
+  )
 
-    if (( epoch < cutoff_epoch )); then
-      if truthy "$dry_run"; then
-        msg INFO "DRY-RUN: удалил бы ${key}"
-        deleted_count=$((deleted_count + 1))
-      else
-        msg INFO "Удаляю старый external S3 backup: ${key}"
-
-        if AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY"            AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY"            AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}"            aws s3 rm "s3://${FULL_EXTERNAL_S3_BUCKET}/${key}" "${endpoint_arg[@]}" --quiet; then
-          deleted_count=$((deleted_count + 1))
-        else
-          msg WARN "Не удалось удалить: ${key}"
-        fi
-      fi
-    else
-      kept_count=$((kept_count + 1))
-    fi
-  done < <(printf '%s
-' "${entries[@]}" | sort -t'|' -k1,1nr)
-
-  msg OK "External S3 retention complete: checked=${checked_count}, deleted=${deleted_count}, kept=${kept_count}, min_keep=${min_keep}, retention_days=${retention_days}"
+  msg OK "External S3 retention complete: checked=${checked_count}, deleted=${deleted_count}, retention_days=${retention_days}"
 }
 
 cleanup_local_custom_backups() {
@@ -849,9 +362,8 @@ cleanup_local_custom_backups() {
   msg INFO "Очищаю локальные custom_bot_*.tar.gz старше ${retention_days} дней"
 
   find "$BACKUP_DIR" \
-    -maxdepth 1 \
     -type f \
-    \( -name 'custom_bot_*.tar.gz' -o -name 'custom_bot_*.tar.gz.age' \) \
+    -name 'custom_bot_*.tar.gz' \
     -mtime "+${retention_days}" \
     -delete 2>/dev/null || true
 }
@@ -962,26 +474,8 @@ run_panel_backup() {
       msg WARN "Latest panel backup не изменился, но будет продублирован во внешний S3"
     fi
 
-    # Шифруем только S3-дубль; локальный оригинал панели не трогаем (он принадлежит
-    # оригинальному rw-backup), поэтому keep_source=true и временный .age удаляем после.
-    local upload_file temp_encrypted="false"
-    if ! maybe_encrypt_for_upload "$after_latest" "true"; then
-      notify_failure "Panel backup encryption failed
-File: $(basename "$after_latest")
-Reason: ${AGE_LAST_ERROR:-unknown}"
-      return 1
-    fi
-    upload_file="$ENCRYPT_RESULT_FILE"
-    [[ "$upload_file" != "$after_latest" ]] && temp_encrypted="true"
-
-    if ! full_s3_upload "$upload_file" "panel" "remnawave-panel"; then
-      notify_failure "External S3 upload failed (panel)
-File: $(basename "$upload_file")"
-    fi
-
-    truthy "$temp_encrypted" && rm -f "$upload_file"
-
-    full_s3_retention_cleanup || true
+    full_s3_upload "$after_latest" "panel" "remnawave-panel" || msg WARN "Не удалось загрузить panel backup во внешний S3"
+    full_s3_retention_cleanup
   fi
 }
 
@@ -1071,12 +565,10 @@ print_custom_projects() {
 }
 
 select_custom_project() {
-  # Вызывается через $(...), поэтому весь UI идёт в stderr,
-  # а в stdout печатается ТОЛЬКО выбранная entry.
   mapfile -t projects < <(detect_custom_projects)
 
   if [[ "${#projects[@]}" -eq 0 ]]; then
-    msg ERR "Не найдено custom bot проектов в /home" >&2
+    msg ERR "Не найдено custom bot проектов в /home"
     return 1
   fi
 
@@ -1085,31 +577,29 @@ select_custom_project() {
     return 0
   fi
 
-  {
-    echo
-    echo -e "${GREEN}${BOLD}Выбери custom bot project:${RESET}"
-    echo
-  } >&2
+  echo
+  echo -e "${GREEN}${BOLD}Выбери custom bot project:${RESET}"
+  echo
 
   local i=1
   local entry
 
   for entry in "${projects[@]}"; do
     IFS='|' read -r project dir pg pg_service redis redis_service apps <<< "$entry"
-    echo " ${i}. ${project} — ${dir}" >&2
+    echo " ${i}. ${project} — ${dir}"
     ((i++))
   done
 
-  echo >&2
+  echo
   read -r -p "[?] Номер: " choice
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-    msg ERR "Некорректный выбор" >&2
+    msg ERR "Некорректный выбор"
     return 1
   fi
 
   if (( choice < 1 || choice > ${#projects[@]} )); then
-    msg ERR "Некорректный выбор" >&2
+    msg ERR "Некорректный выбор"
     return 1
   fi
 
@@ -1130,8 +620,6 @@ write_profile_env() {
   {
     printf 'PROJECT_NAME=%q\n' "$project_name"
     printf 'PROJECT_DIR=%q\n' "$project_dir"
-    # Реальное имя папки на диске (может отличаться регистром от PROJECT_NAME)
-    printf 'PROJECT_BASE=%q\n' "$(basename "$project_dir")"
     printf 'POSTGRES_CONTAINER=%q\n' "$pg_container"
     printf 'POSTGRES_SERVICE=%q\n' "$pg_service"
     printf 'REDIS_CONTAINER=%q\n' "$redis_container"
@@ -1212,16 +700,10 @@ backup_custom_project_entry() {
 
   msg INFO "Создаю PostgreSQL dump..."
 
-  if ! docker exec "$POSTGRES_CONTAINER" sh -lc '
+  docker exec "$POSTGRES_CONTAINER" sh -lc '
     export PGPASSWORD="${POSTGRES_PASSWORD:-}"
-    pg_dumpall -c --if-exists -U "${POSTGRES_USER:-postgres}"
-  ' | gzip -9 > "$WORK_DIR/postgres_dump.sql.gz"; then
-    notify_failure "PostgreSQL dump failed
-Project: ${PROJECT_NAME}
-Container: ${POSTGRES_CONTAINER}"
-    rm -rf "$WORK_DIR"
-    return 1
-  fi
+    pg_dumpall -c -U "${POSTGRES_USER:-postgres}"
+  ' | gzip -9 > "$WORK_DIR/postgres_dump.sql.gz"
 
   msg INFO "Создаю Redis dump..."
 
@@ -1308,7 +790,7 @@ NOTES
 
   (
     cd "$WORK_DIR"
-    find . -maxdepth 3 -type f -print0 | xargs -0 sha256sum > SHA256SUMS 2>/dev/null || true
+    find . -type f -maxdepth 3 -print0 | xargs -0 sha256sum > SHA256SUMS 2>/dev/null || true
   )
 
   msg INFO "Создаю финальный архив..."
@@ -1323,79 +805,21 @@ NOTES
   msg OK "Backup создан: ${FINAL_ARCHIVE}"
   du -h "$FINAL_ARCHIVE" || true
 
-  # Верификация ДО загрузки: битый или неполный архив не уезжает в S3.
-  if ! verify_custom_archive "$FINAL_ARCHIVE"; then
-    notify_failure "Backup verification failed
-Project: ${PROJECT_NAME}
-Archive: $(basename "$FINAL_ARCHIVE")
-Архив создан, но не прошёл проверку и НЕ будет загружен в S3."
-    return 1
-  fi
-
-  # ── S3 загрузка: два независимых потока ─────────────────────────────────
-  #
-  # 1. ОСНОВНОЙ S3 (тот же бакет, куда оригинальный rw-backup кладёт панель)
-  #    custom bot → БЕЗ шифрования, .tar.gz как есть
-  #
-  # 2. FULL external S3 (дубликат, отдельный бакет/кредсы)
-  #    custom bot → С шифрованием через временный файл (локальный .tar.gz не трогается)
-  # ────────────────────────────────────────────────────────────────────────
-
-  if truthy "${FULL_CUSTOM_PRIMARY_S3_ENABLED:-true}"; then
-    if original_s3_available; then
-      if ! primary_s3_upload "$FINAL_ARCHIVE" "$PROJECT_NAME"; then
-        notify_failure "Primary S3 upload failed
-Project: ${PROJECT_NAME}
-File: $(basename "$FINAL_ARCHIVE")"
-      fi
-      primary_s3_retention_cleanup || true
-    else
-      msg WARN "Primary S3 пропущен: в config.env нет S3-настроек"
-      msg WARN "  Проверьте: S3_BUCKET=${ORIG_S3_BUCKET:-<пусто>}, S3_ACCESS_KEY=${ORIG_S3_ACCESS_KEY:+set}, S3_SECRET_KEY=${ORIG_S3_SECRET_KEY:+set}"
-      msg WARN "  Если config.env использует нестандартные имена — задайте ORIG_S3_BUCKET/ORIG_S3_ACCESS_KEY/ORIG_S3_SECRET_KEY напрямую в rw-backup-full.env"
-    fi
-  fi
-
-  if truthy "${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"; then
-    if full_s3_ready; then
-      # Шифруем временную копию; локальный .tar.gz и копия на основном S3 — открытые
-      local upload_file temp_encrypted="false"
-      if maybe_encrypt_for_upload "$FINAL_ARCHIVE" "true"; then
-        upload_file="$ENCRYPT_RESULT_FILE"
-        [[ "$upload_file" != "$FINAL_ARCHIVE" ]] && temp_encrypted="true"
-
-        if ! full_s3_upload "$upload_file" "custom-bot" "$PROJECT_NAME"; then
-          notify_failure "External S3 (duplicate) upload failed
-Project: ${PROJECT_NAME}
-File: $(basename "$upload_file")"
-        fi
-        truthy "$temp_encrypted" && rm -f "$upload_file"
-      else
-        notify_failure "Encryption failed (external S3 duplicate skipped)
-Project: ${PROJECT_NAME}
-Archive: $(basename "$FINAL_ARCHIVE")
-Reason: ${AGE_LAST_ERROR:-unknown}"
-      fi
-      full_s3_retention_cleanup || true
-    else
-      msg INFO "FULL external S3 (дубликат) не настроен — пропущено"
-    fi
+  if truthy "$FULL_CUSTOM_EXTERNAL_S3_ENABLED"; then
+    full_s3_upload "$FINAL_ARCHIVE" "custom-bot" "$PROJECT_NAME" || msg WARN "Не удалось загрузить custom bot backup во внешний S3"
+    full_s3_retention_cleanup
   fi
 
   cleanup_local_custom_backups
 }
 
 backup_custom_menu() {
-  ensure_external_s3_interactive
-
   local entry
   entry="$(select_custom_project)" || return 1
   backup_custom_project_entry "$entry"
 }
 
 backup_custom_all() {
-  ensure_external_s3_interactive
-
   local found=0
   local entry
 
@@ -1412,34 +836,28 @@ backup_custom_all() {
 }
 
 select_restore_archive() {
-  # Вызывается через $(...), поэтому весь UI идёт в stderr,
-  # а в stdout печатается ТОЛЬКО путь к выбранному архиву.
-  mapfile -t archives < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name 'custom_bot_*.tar.gz' -o -name 'custom_bot_*.tar.gz.age' \) -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
+  mapfile -t archives < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'custom_bot_*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
 
-  {
-    echo
-    echo -e "${GREEN}${BOLD}Выбери архив для восстановления:${RESET}"
-    echo
-  } >&2
+  echo
+  echo -e "${GREEN}${BOLD}Выбери архив для восстановления:${RESET}"
+  echo
 
   if [[ "${#archives[@]}" -gt 0 ]]; then
     local i=1
     local a
 
     for a in "${archives[@]}"; do
-      echo " ${i}. $(basename "$a") — $(du -h "$a" | awk '{print $1}')" >&2
+      echo " ${i}. $(basename "$a") — $(du -h "$a" | awk '{print $1}')"
       ((i++))
     done
 
-    echo >&2
+    echo
   else
-    msg WARN "Локальные custom_bot архивы не найдены в ${BACKUP_DIR}" >&2
+    msg WARN "Локальные custom_bot архивы не найдены в ${BACKUP_DIR}"
   fi
 
-  {
-    echo " 0. Указать путь вручную"
-    echo
-  } >&2
+  echo " 0. Указать путь вручную"
+  echo
 
   read -r -p "[?] Номер или 0: " choice
 
@@ -1447,7 +865,7 @@ select_restore_archive() {
     read -r -p "Путь к архиву: " manual_archive
 
     [[ -f "$manual_archive" ]] || {
-      msg ERR "Файл не найден: ${manual_archive}" >&2
+      msg ERR "Файл не найден: ${manual_archive}"
       return 1
     }
 
@@ -1456,12 +874,12 @@ select_restore_archive() {
   fi
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-    msg ERR "Некорректный выбор" >&2
+    msg ERR "Некорректный выбор"
     return 1
   fi
 
   if (( choice < 1 || choice > ${#archives[@]} )); then
-    msg ERR "Некорректный выбор" >&2
+    msg ERR "Некорректный выбор"
     return 1
   fi
 
@@ -1477,121 +895,51 @@ restore_custom_archive() {
     return 1
   }
 
-  local restore_ts
-  restore_ts="$(date +%Y%m%d_%H%M%S)"
+  local restore_ts="$(date +%Y%m%d_%H%M%S)"
   local tmp_root="/tmp/rw-custom-restore-${restore_ts}"
   local extract_dir="${tmp_root}/outer"
   local project_extract_dir="${tmp_root}/project"
 
   mkdir -p "$extract_dir" "$project_extract_dir"
 
-  # Явный cleanup — НЕ trap RETURN: trap RETURN срабатывает на ЛЮБОЙ source/function
-  # внутри этой функции и сносит tmp_root ещё в процессе работы.
-  _rca_fail() { local m="$1"; rm -rf "$tmp_root"; msg ERR "$m"; return 1; }
+  cleanup_restore_tmp() {
+    rm -rf "$tmp_root"
+  }
 
-  # ── 1. Расшифровка .age ────────────────────────────────────────────────────
-  if [[ "$archive" == *.age ]]; then
-    msg INFO "Архив зашифрован (age), расшифровываю..."
+  trap cleanup_restore_tmp RETURN
 
-    if ! command -v age >/dev/null 2>&1; then
-      _rca_fail "age не установлен. Установи: apt-get install -y age"; return 1
-    fi
-
-    if [[ -z "${FULL_AGE_IDENTITY_FILE:-}" || ! -f "${FULL_AGE_IDENTITY_FILE:-}" ]]; then
-      msg ERR "Для расшифровки нужен приватный ключ age."
-      msg ERR "Задай FULL_AGE_IDENTITY_FILE=/путь/к/age-key.txt в ${FULL_CONFIG_FILE}"
-      msg ERR "Если ключ не сохранён — этот архив можно открыть только при наличии ключа."
-      rm -rf "$tmp_root"; return 1
-    fi
-
-    local decrypted="${tmp_root}/$(basename "${archive%.age}")"
-    if ! age -d -i "$FULL_AGE_IDENTITY_FILE" -o "$decrypted" "$archive"; then
-      msg ERR "Расшифровка провалилась. Возможные причины:"
-      msg ERR "  • Неправильный приватный ключ (${FULL_AGE_IDENTITY_FILE})"
-      msg ERR "  • Повреждён .age файл"
-      rm -rf "$tmp_root"; return 1
-    fi
-
-    if ! gzip -t "$decrypted" 2>/dev/null; then
-      msg ERR "Расшифрован файл, но он не является валидным tar.gz (неверный ключ или повреждён архив)"
-      msg ERR "  Размер: $(stat -c '%s' "$decrypted" 2>/dev/null || echo '?') байт"
-      rm -rf "$tmp_root"; return 1
-    fi
-
-    msg OK "Расшифровано: $(basename "$decrypted") ($(du -h "$decrypted" | awk '{print $1}'))"
-    archive="$decrypted"
-  fi
-
-  # ── 2. Распаковка внешнего архива ─────────────────────────────────────────
   msg INFO "Распаковываю архив: ${archive}"
 
-  if ! tar -xzf "$archive" -C "$extract_dir"; then
-    _rca_fail "Не удалось распаковать архив — он повреждён или неполный"; return 1
+  tar -xzf "$archive" -C "$extract_dir"
+
+  local project_tar="$(find "$extract_dir" -type f -name 'project_dir.tar.gz' | head -n 1 || true)"
+  local postgres_dump="$(find "$extract_dir" -type f -name 'postgres_dump.sql.gz' | head -n 1 || true)"
+  local redis_dump="$(find "$extract_dir" -type f -name 'redis_dump.rdb' | head -n 1 || true)"
+  local profile_env="$(find "$extract_dir" -type f -name 'PROFILE.env' | head -n 1 || true)"
+
+  [[ -n "$project_tar" ]] || {
+    msg ERR "В архиве нет project_dir.tar.gz"
+    return 1
+  }
+
+  [[ -n "$postgres_dump" ]] || {
+    msg ERR "В архиве нет postgres_dump.sql.gz"
+    return 1
+  }
+
+  if [[ -n "$profile_env" ]]; then
+    set +u
+    # shellcheck disable=SC1090
+    source "$profile_env"
+    set -u
   fi
 
-  local extracted_top
-  extracted_top="$(ls -1 "$extract_dir" 2>/dev/null | head -1)"
-  if [[ -z "$extracted_top" ]]; then
-    _rca_fail "После распаковки директория пуста"; return 1
-  fi
-  msg INFO "Содержимое архива (верхний уровень): ${extracted_top}"
+  local project_top="$(tar -tzf "$project_tar" | head -n 1 | cut -d/ -f1)"
 
-  # ── 3. Находим компоненты ─────────────────────────────────────────────────
-  local profile_env project_tar postgres_dump redis_dump
-
-  profile_env="$(  find "$extract_dir" -maxdepth 2 -type f -name 'PROFILE.env'         | head -n 1)"
-  project_tar="$(  find "$extract_dir" -maxdepth 2 -type f -name 'project_dir.tar.gz'  | head -n 1)"
-  postgres_dump="$(find "$extract_dir" -maxdepth 2 -type f -name 'postgres_dump.sql.gz'| head -n 1)"
-  redis_dump="$(   find "$extract_dir" -maxdepth 2 -type f -name 'redis_dump.rdb'      | head -n 1)"
-
-  if [[ -z "$project_tar" ]]; then
-    msg ERR "В архиве нет project_dir.tar.gz. Файлы найдены:"
-    find "$extract_dir" -maxdepth 3 | sed "s|${extract_dir}/||" | sort | head -30 >&2
-    rm -rf "$tmp_root"; return 1
-  fi
-
-  if [[ -z "$postgres_dump" ]]; then
-    _rca_fail "В архиве нет postgres_dump.sql.gz"; return 1
-  fi
-
-  if ! gzip -t "$project_tar" 2>/dev/null; then
-    msg ERR "project_dir.tar.gz повреждён или не является валидным gzip"
-    msg ERR "  Размер: $(stat -c '%s' "$project_tar" 2>/dev/null || echo '?') байт"
-    rm -rf "$tmp_root"; return 1
-  fi
-
-  # ── 4. Читаем PROFILE.env БЕЗ source ──────────────────────────────────────
-  # source запускает RETURN trap и сносит tmp_root — парсим вручную.
-  local PROJECT_NAME="" PROJECT_DIR="" PROJECT_BASE="" POSTGRES_CONTAINER="" POSTGRES_SERVICE=""
-  local REDIS_CONTAINER="" REDIS_SERVICE=""
-
-  if [[ -f "$profile_env" ]]; then
-    local _key _val _line
-    while IFS= read -r _line || [[ -n "$_line" ]]; do
-      [[ "$_line" =~ ^([A-Z_]+)=\"?([^\"]*)\"?$ ]] || continue
-      _key="${BASH_REMATCH[1]}"
-      _val="${BASH_REMATCH[2]}"
-      case "$_key" in
-        PROJECT_NAME|PROJECT_DIR|PROJECT_BASE|\
-        POSTGRES_CONTAINER|POSTGRES_SERVICE|\
-        REDIS_CONTAINER|REDIS_SERVICE)
-          printf -v "$_key" '%s' "$_val"
-          ;;
-      esac
-    done < "$profile_env"
-  fi
-
-  # project_top: приоритет PROJECT_BASE (точное имя папки на диске) > PROJECT_NAME > tar listing
-  local project_top="${PROJECT_BASE:-${PROJECT_NAME:-}}"
-  if [[ -z "$project_top" ]]; then
-    project_top="$(tar -tzf "$project_tar" 2>/dev/null | head -n 1 | cut -d/ -f1)"
-  fi
-
-  if [[ -z "$project_top" ]]; then
-    msg ERR "Не удалось определить папку проекта (PROFILE.env и tar -tzf оба вернули пусто)"
-    msg ERR "  profile_env: ${profile_env:-не найден}"
-    rm -rf "$tmp_root"; return 1
-  fi
+  [[ -n "$project_top" ]] || {
+    msg ERR "Не могу определить папку проекта внутри project_dir.tar.gz"
+    return 1
+  }
 
   PROJECT_NAME="${PROJECT_NAME:-$project_top}"
   PROJECT_DIR="${PROJECT_DIR:-/home/$project_top}"
@@ -1614,7 +962,7 @@ restore_custom_archive() {
 
     if [[ "$confirm" != "RESTORE" ]]; then
       msg WARN "Restore отменён"
-      rm -rf "$tmp_root"; return 1
+      return 1
     fi
   fi
 
@@ -1636,26 +984,10 @@ restore_custom_archive() {
 
   msg INFO "Распаковываю project_dir.tar.gz..."
 
-  if ! tar -xzf "$project_tar" -C "$project_extract_dir"; then
-    _rca_fail "Не удалось распаковать project_dir.tar.gz"; return 1
-  fi
-
-  # Берём фактическое имя директории из извлечённого содержимого.
-  # PROFILE.env хранит PROJECT_NAME строчными, а реальная папка может быть
-  # смешанного регистра (например OneOkBotNew vs oneokbotnew).
-  local actual_extracted
-  actual_extracted="$(ls -1 "$project_extract_dir" | head -1)"
-
-  if [[ -z "$actual_extracted" ]]; then
-    _rca_fail "project_dir.tar.gz пустой — ничего не извлечено"; return 1
-  fi
-
-  if [[ "$actual_extracted" != "$project_top" ]]; then
-    msg INFO "Реальное имя папки в архиве: ${actual_extracted} (в PROFILE.env: ${project_top})"
-  fi
+  tar -xzf "$project_tar" -C "$project_extract_dir"
 
   mkdir -p "$(dirname "$PROJECT_DIR")"
-  mv "$project_extract_dir/$actual_extracted" "$PROJECT_DIR"
+  mv "$project_extract_dir/$project_top" "$PROJECT_DIR"
 
   msg OK "Папка проекта восстановлена: ${PROJECT_DIR}"
 
@@ -1692,45 +1024,15 @@ restore_custom_archive() {
   if [[ "$ready" != "yes" ]]; then
     msg ERR "PostgreSQL не стал готовым"
     docker logs "$POSTGRES_CONTAINER" --tail 100 || true
-    rm -rf "$tmp_root"; return 1
+    return 1
   fi
 
   msg INFO "Заливаю PostgreSQL dump..."
 
-  # pg_dumpall -c генерирует DROP ROLE <current_user>, что PostgreSQL запрещает
-  # (нельзя дропнуть текущего пользователя). Это не ошибка данных — роли уже
-  # существуют, данные всё равно заливаются. Используем ON_ERROR_STOP=0 и
-  # фильтруем только данные об ошибках.
-  local pg_restore_log="${tmp_root}/pg_restore.log"
-
-  if ! gzip -dc "$postgres_dump" | docker exec -i "$POSTGRES_CONTAINER" sh -lc '
+  gzip -dc "$postgres_dump" | docker exec -i "$POSTGRES_CONTAINER" sh -lc '
     export PGPASSWORD="${POSTGRES_PASSWORD:-}"
-    psql -v ON_ERROR_STOP=0 -U "${POSTGRES_USER:-postgres}" -d postgres 2>&1
-  ' > "$pg_restore_log" 2>&1; then
-    # Классифицируем ошибки: harmless vs реальные.
-    # ВАЖНО: grep -c возвращает exit 1 при 0 совпадениях — не используем || echo.
-    local real_errors=0 safe_errors=0 _eline
-    while IFS= read -r _eline; do
-      [[ "$_eline" =~ ^ERROR: ]] || continue
-      real_errors=$(( real_errors + 1 ))
-      if [[ "$_eline" == *"cannot be dropped"* \
-         || "$_eline" == *"already exists"* \
-         || "$_eline" == *"does not exist"* ]]; then
-        safe_errors=$(( safe_errors + 1 ))
-      fi
-    done < "$pg_restore_log"
-
-    if (( real_errors > safe_errors )); then
-      msg ERR "PostgreSQL dump залит с критическими ошибками (${real_errors} ошибок):"
-      grep '^ERROR:' "$pg_restore_log" | grep -v 'cannot be dropped\|already exists\|does not exist' | head -10 >&2
-      rm -rf "$tmp_root"; return 1
-    fi
-
-    msg WARN "PostgreSQL dump залит с предупреждениями (ожидаемо при pg_dumpall restore — ${safe_errors} known-harmless):"
-    grep '^ERROR:' "$pg_restore_log" | head -5 >&2 || true
-  fi
-
-  grep -v '^ERROR:' "$pg_restore_log" 2>/dev/null | tail -3 || true
+    psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d postgres
+  '
 
   msg OK "PostgreSQL восстановлен"
 
@@ -1751,146 +1053,16 @@ restore_custom_archive() {
   if [[ -d "$old_dir" ]]; then
     msg INFO "Старая папка сохранена: ${old_dir}"
   fi
-
-  rm -rf "$tmp_root"
-}
-
-s3_list_custom_backups() {
-  # Печатает строки "epoch|size|key" для всех custom_bot архивов во внешнем S3
-  # (все хосты под префиксом custom-bot/), сортировка: свежие сверху.
-  local endpoint_arg=()
-  if [[ -n "${FULL_EXTERNAL_S3_ENDPOINT:-}" ]]; then
-    endpoint_arg=(--endpoint-url "$FULL_EXTERNAL_S3_ENDPOINT")
-  fi
-
-  local prefix listing
-  prefix="$(full_s3_prefix_normalized)custom-bot/"
-
-  if ! listing="$(
-    AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY" \
-    AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY" \
-    AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}" \
-    aws s3 ls "s3://${FULL_EXTERNAL_S3_BUCKET}/${prefix}" "${endpoint_arg[@]}" --recursive 2>&1
-  )"; then
-    msg ERR "Не удалось получить листинг S3: ${listing}" >&2
-    return 1
-  fi
-
-  local file_size file_key base_name file_epoch
-  {
-    while read -r _ _ file_size file_key; do
-      [[ -n "${file_key:-}" ]] || continue
-      base_name="$(basename "$file_key")"
-      [[ "$base_name" =~ ^custom_bot_.*\.tar\.gz(\.age)?$ ]] || continue
-      file_epoch="$(parse_backup_timestamp_epoch "$base_name")"
-      [[ -n "$file_epoch" ]] || continue
-      printf '%s|%s|%s\n' "$file_epoch" "$file_size" "$file_key"
-    done <<< "$listing"
-  } | sort -t'|' -k1,1nr
-}
-
-s3_download_backup() {
-  # s3_download_backup <s3_key> — скачивает в BACKUP_DIR, печатает локальный путь.
-  local key="$1"
-  local dest="${BACKUP_DIR}/$(basename "$key")"
-
-  local endpoint_arg=()
-  if [[ -n "${FULL_EXTERNAL_S3_ENDPOINT:-}" ]]; then
-    endpoint_arg=(--endpoint-url "$FULL_EXTERNAL_S3_ENDPOINT")
-  fi
-
-  msg INFO "Скачиваю s3://${FULL_EXTERNAL_S3_BUCKET}/${key}" >&2
-
-  if AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY" \
-     AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY" \
-     AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}" \
-     aws s3 cp "s3://${FULL_EXTERNAL_S3_BUCKET}/${key}" "$dest" "${endpoint_arg[@]}" --quiet; then
-    msg OK "Скачано: ${dest}" >&2
-    echo "$dest"
-    return 0
-  fi
-
-  msg ERR "Не удалось скачать: ${key}" >&2
-  return 1
-}
-
-select_s3_restore_archive() {
-  # Показывает список custom_bot бэкапов из внешнего S3, скачивает выбранный,
-  # печатает локальный путь к нему.
-  if ! command -v aws >/dev/null 2>&1; then
-    msg ERR "awscli не найден" >&2
-    return 1
-  fi
-
-  if ! full_s3_ready; then
-    msg ERR "External S3 не настроен (rw-backup-full configure-s3)" >&2
-    return 1
-  fi
-
-  msg INFO "Получаю список бэкапов из S3..." >&2
-
-  local entries
-  entries="$(s3_list_custom_backups)" || return 1
-
-  if [[ -z "$entries" ]]; then
-    msg WARN "В S3 не найдено custom_bot архивов" >&2
-    return 1
-  fi
-
-  local -a keys=()
-  local epoch size key human_date human_size host
-  local i=1
-
-  {
-    echo
-    echo -e "${GREEN}${BOLD}Бэкапы во внешнем S3 (свежие сверху):${RESET}"
-    echo
-  } >&2
-
-  while IFS='|' read -r epoch size key; do
-    keys+=("$key")
-    human_date="$(date -u -d "@$epoch" +'%Y-%m-%d %H:%M UTC' 2>/dev/null || echo '?')"
-    human_size="$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "${size}B")"
-    # host — предпоследний сегмент ключа: .../custom-bot/<host>/<file>
-    host="$(basename "$(dirname "$key")")"
-    printf ' %2d. %s  %s  host=%s  %s\n' "$i" "$human_date" "$human_size" "$host" "$(basename "$key")" >&2
-    i=$((i + 1))
-    (( i > 30 )) && { echo "   ... (показаны 30 свежайших)" >&2; break; }
-  done <<< "$entries"
-
-  echo >&2
-  read -r -p "[?] Номер для скачивания и восстановления (0 — отмена): " choice
-
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#keys[@]} )); then
-    msg INFO "Отмена" >&2
-    return 1
-  fi
-
-  s3_download_backup "${keys[$((choice - 1))]}"
 }
 
 restore_custom_menu() {
-  echo
-  echo -e "${GREEN}${BOLD}Restore custom bot — источник архива:${RESET}"
-  echo
-  echo "  1. Локальные архивы (${BACKUP_DIR})"
-  echo "  2. Внешний S3 (скачать и восстановить)"
-  echo
-  read -r -p "[?] Выбор [1]: " src
-
   local archive
-  case "${src:-1}" in
-    2) archive="$(select_s3_restore_archive)" || return 1 ;;
-    *) archive="$(select_restore_archive)" || return 1 ;;
-  esac
-
+  archive="$(select_restore_archive)" || return 1
   restore_custom_archive "$archive"
 }
 
 backup_all() {
   msg INFO "Запускаю Backup ALL"
-
-  ensure_external_s3_interactive
 
   run_panel_backup || msg WARN "Panel backup завершился с ошибкой или был пропущен"
   backup_custom_all || msg WARN "Custom bot backup завершился с ошибкой или проекты не найдены"
@@ -1899,7 +1071,6 @@ backup_all() {
 }
 
 backup_panel_only() {
-  ensure_external_s3_interactive
   run_panel_backup
 }
 
@@ -1947,21 +1118,9 @@ configure_retention() {
 
 configure_external_s3() {
   echo
-  echo -e "${GREEN}${BOLD}Настройка FULL external S3 (дубликат)${RESET}"
+  echo -e "${GREEN}${BOLD}Настройка собственного external S3 для rw-backup-full${RESET}"
   echo
-  echo "  Это ВТОРОЙ, независимый S3 для шифрованного дублирования."
-  echo "  Не путать с ОСНОВНЫМ S3:"
-  echo
-  if original_s3_available; then
-    echo "  • Основной S3 (bucket=${ORIG_S3_BUCKET}, из config.env):"
-    echo "    ↳ панель → оригинальный rw-backup (без изменений)"
-    echo "    ↳ custom bot → этот скрипт, БЕЗ шифрования (при FULL_CUSTOM_PRIMARY_S3_ENABLED=true)"
-  else
-    echo "  • Основной S3: не настроен в config.env"
-  fi
-  echo
-  echo "  • FULL external S3 (настраиваете здесь) — отдельный бакет/кредсы:"
-  echo "    ↳ панель + custom bot → этот скрипт, С шифрованием (age)"
+  echo "Этот S3 независим от оригинального /opt/rw-backup-restore/config.env."
   echo
 
   read -r -p "Bucket [${FULL_EXTERNAL_S3_BUCKET}]: " bucket
@@ -1988,6 +1147,7 @@ configure_external_s3() {
   set_full_var FULL_EXTERNAL_S3_REGION "$region"
   set_full_var FULL_EXTERNAL_S3_ENDPOINT "$endpoint"
   set_full_var FULL_EXTERNAL_S3_PREFIX "$prefix"
+  set_full_var FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL "false"
 
   msg OK "External S3 настройки обновлены"
 }
@@ -2073,14 +1233,6 @@ install_timer() {
     hours="3"
   fi
 
-  case "${FULL_TIMER_MODE:-backup-all}" in
-    backup-all|panel-backup|custom-backup) ;;
-    *)
-      msg ERR "Некорректный FULL_TIMER_MODE='${FULL_TIMER_MODE}', timer не установлен"
-      return 1
-      ;;
-  esac
-
   msg INFO "Устанавливаю systemd timer: mode=${FULL_TIMER_MODE}, interval=${hours}h"
 
   cat > /etc/systemd/system/rw-backup-full.service <<EOF_SERVICE
@@ -2095,8 +1247,6 @@ ExecStart=/usr/local/bin/rw-backup-full run-timer
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-# Страховка от зависшего бэкапа
-TimeoutStartSec=2h
 EOF_SERVICE
 
   cat > /etc/systemd/system/rw-backup-full.timer <<EOF_TIMER
@@ -2107,8 +1257,6 @@ Description=Run rw-backup-full every ${hours} hours
 OnBootSec=10min
 OnUnitActiveSec=${hours}h
 Persistent=true
-# Разброс, чтобы парк серверов не бил в S3 одновременно
-RandomizedDelaySec=5min
 Unit=rw-backup-full.service
 
 [Install]
@@ -2159,11 +1307,53 @@ show_config_summary() {
   echo "FULL_TG_THREAD_ID:                  ${FULL_TG_MESSAGE_THREAD_ID:-not set}"
   echo
   echo "ORIG_UPLOAD_METHOD:                 ${ORIG_UPLOAD_METHOD:-not set}"
-  echo "ORIG_S3_BUCKET:                     ${ORIG_S3_BUCKET:-not set (read from config.env)}"
-  echo "  original_s3_available:           $(original_s3_available && echo YES || echo NO)"
-  echo "FULL_CUSTOM_PRIMARY_S3_ENABLED:    ${FULL_CUSTOM_PRIMARY_S3_ENABLED}"
+  echo "ORIG_S3_BUCKET:                     ${ORIG_S3_BUCKET:-not set}"
   echo "ORIG_TG_CHAT_ID:                    ${ORIG_TG_CHAT_ID:-not set}"
   echo
+}
+
+wal_status_all() {
+  echo -e "${BOLD}WAL-архивация (v4)${RESET}"
+  echo
+
+  if [[ ! -d "$INSTANCES_DIR" ]] || ! ls "$INSTANCES_DIR"/*.env >/dev/null 2>&1; then
+    msg WARN "Инстансы не настроены: ${INSTANCES_DIR}/*.env"
+    msg INFO "Примеры: ${INSTALL_DIR}/config-examples/instances.d/"
+    return 0
+  fi
+
+  local f name c wal_root="/var/lib/rw-wal"
+  for f in "$INSTANCES_DIR"/*.env; do
+    name="$(basename "$f" .env)"
+    c="$(grep -E '^INST_CONTAINER=' "$f" | head -n1 | cut -d'"' -f2)"
+    echo -e "${CYAN}● ${name}${RESET} (контейнер: ${c:-?})"
+
+    if [[ -n "$c" ]] && docker ps -q -f "name=^${c}$" | grep -q .; then
+      local am fc last_arch
+      am="$(docker exec "$c" psql -h localhost -U postgres -qtAX -c 'SHOW archive_mode' 2>/dev/null || echo '?')"
+      fc="$(docker exec "$c" psql -h localhost -U postgres -qtAX -c 'SELECT failed_count FROM pg_stat_archiver' 2>/dev/null || echo '?')"
+      last_arch="$(docker exec "$c" psql -h localhost -U postgres -qtAX -c 'SELECT last_archived_wal FROM pg_stat_archiver' 2>/dev/null || echo '?')"
+      echo "    archive_mode=${am}  failed_count=${fc}  last_wal=${last_arch}"
+    else
+      echo "    контейнер не запущен"
+    fi
+
+    local spool arch bb
+    spool="$(find "${wal_root}/${name}/spool/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l)"
+    arch="$(find "${wal_root}/${name}/archive" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l)"
+    bb="$(find "${wal_root}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l)"
+    echo "    спул=${spool}  локальный WAL=${arch}  базовых бэкапов=${bb}"
+
+    local last_meta
+    last_meta="$(find "${wal_root}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | sort -r | head -n1)"
+    if [[ -n "$last_meta" ]]; then
+      echo "    последний базовый: $(grep -E '^CREATED_AT=' "$last_meta" | cut -d'\"' -f2)"
+    fi
+
+    systemctl is-active "rw-wal-ship@${name}.timer" >/dev/null 2>&1 \
+      && echo "    таймеры: активны" || echo "    таймеры: НЕ активны"
+    echo
+  done
 }
 
 main_menu() {
@@ -2186,6 +1376,11 @@ main_menu() {
     echo "11. Установить оригинальный rw-backup"
     echo "12. External S3 retention cleanup сейчас"
     echo
+    echo -e " ${BOLD}--- WAL / PITR (v4) ---${RESET}"
+    echo "13. Статус WAL-архивации"
+    echo "14. Базовый бэкап инстанса сейчас"
+    echo "15. Проверка бэкапов в песочнице сейчас"
+    echo
     echo " 0. Выход"
     echo
 
@@ -2205,6 +1400,12 @@ main_menu() {
       10) show_config_summary; pause ;;
       11) install_original_rw_backup; pause ;;
       12) full_s3_retention_cleanup; pause ;;
+      13) wal_status_all; pause ;;
+      14)
+        read -r -p "[?] Имя инстанса: " winst
+        [[ -n "$winst" ]] && "${WAL_SCRIPTS_DIR}/basebackup.sh" "$winst"
+        pause ;;
+      15) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
       0) exit 0 ;;
       *) msg ERR "Некорректный выбор"; sleep 1 ;;
     esac
@@ -2222,20 +1423,25 @@ Usage:
   rw-backup-full custom-backup
   rw-backup-full backup-all
   rw-backup-full custom-restore
-  rw-backup-full custom-restore-s3
   rw-backup-full custom-restore-file /path/to/custom_bot_archive.tar.gz [--yes]
-  rw-backup-full s3-list
   rw-backup-full configure-retention
   rw-backup-full configure-s3
   rw-backup-full configure-telegram
   rw-backup-full install-timer
   rw-backup-full run-timer
   rw-backup-full install-original
-  rw-backup-full s3-cleanup [--dry-run]
+  rw-backup-full s3-cleanup
 
-Encryption (optional, see config FULL_AGE_*):
-  Archives can be encrypted with age before external S3 upload.
-  Restore accepts both .tar.gz and .tar.gz.age archives.
+WAL / PITR (v4):
+  rw-backup-full wal-enable <instance>          включить WAL-архивацию (рестарт БД!)
+  rw-backup-full wal-disable <instance>         выключить WAL-архивацию
+  rw-backup-full basebackup <instance> [--no-s3] полный базовый бэкап сейчас
+  rw-backup-full wal-ship <instance>            отправить спул в архив/S3 сейчас
+  rw-backup-full wal-retention <instance> [--dry-run]
+  rw-backup-full wal-timers <instance> [--remove]
+  rw-backup-full wal-status                     статус всех инстансов
+  rw-backup-full pitr-restore <instance> [опции]  восстановление (см. --help)
+  rw-backup-full verify [--instance X|--local]  проверка бэкапов в песочнице
 EOF_USAGE
 }
 
@@ -2252,16 +1458,6 @@ case "$cmd" in
   custom-backup) backup_custom_all ;;
   backup-all) backup_all ;;
   custom-restore) restore_custom_menu ;;
-  custom-restore-s3)
-    archive="$(select_s3_restore_archive)" || exit 1
-    restore_custom_archive "$archive"
-    ;;
-  s3-list)
-    if ! full_s3_ready; then msg ERR "External S3 не настроен"; exit 1; fi
-    s3_list_custom_backups | while IFS='|' read -r epoch size key; do
-      printf '%s  %12s  %s\n' "$(date -u -d "@$epoch" +'%Y-%m-%d %H:%M UTC')" "$size" "$key"
-    done
-    ;;
   custom-restore-file)
     archive="${2:-}"
     yes_flag="${3:-}"
@@ -2278,7 +1474,26 @@ case "$cmd" in
   install-timer) configure_timer ;;
   run-timer) run_timer_mode ;;
   install-original) install_original_rw_backup ;;
-  s3-cleanup) full_s3_retention_cleanup "${2:-}" ;;
+  s3-cleanup) full_s3_retention_cleanup ;;
+  wal-enable)
+    shift; exec "${WAL_SCRIPTS_DIR}/enable-archiving.sh" "$@" ;;
+  wal-disable)
+    inst="${2:-}"; [[ -n "$inst" ]] || { usage; exit 1; }
+    exec "${WAL_SCRIPTS_DIR}/enable-archiving.sh" "$inst" --disable ;;
+  basebackup)
+    shift; exec "${WAL_SCRIPTS_DIR}/basebackup.sh" "$@" ;;
+  wal-ship)
+    shift; exec "${WAL_SCRIPTS_DIR}/wal-ship.sh" "$@" ;;
+  wal-retention)
+    shift; exec "${WAL_SCRIPTS_DIR}/wal-retention.sh" "$@" ;;
+  wal-timers)
+    shift; exec "${WAL_SCRIPTS_DIR}/wal-timers.sh" "$@" ;;
+  pitr-restore)
+    shift; exec "${WAL_SCRIPTS_DIR}/pitr-restore.sh" "$@" ;;
+  wal-status)
+    wal_status_all ;;
+  verify)
+    shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac

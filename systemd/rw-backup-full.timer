@@ -1,12 +1,10 @@
 [Unit]
-Description=Run rw-backup-full every configured interval (default 3h; re-rendered by `rw-backup-full install-timer`)
+Description=Run rw-backup-full every configured interval
 
 [Timer]
 OnBootSec=10min
 OnUnitActiveSec=3h
 Persistent=true
-# Разброс, чтобы парк серверов не бил в S3 одновременно
-RandomizedDelaySec=5min
 Unit=rw-backup-full.service
 
 [Install]

@@ -9,5 +9,3 @@ ExecStart=/usr/local/bin/rw-backup-full run-timer
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-# Страховка от зависшего бэкапа
-TimeoutStartSec=2h

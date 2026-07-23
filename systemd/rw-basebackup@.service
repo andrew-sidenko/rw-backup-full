@@ -1,0 +1,12 @@
+[Unit]
+Description=rw-backup-full: PostgreSQL base backup (%i)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rw-backup-restore/scripts/wal/basebackup.sh %i
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=2h
