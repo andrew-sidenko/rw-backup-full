@@ -181,6 +181,16 @@ msg INFO "Готовлю WAL начиная с ${START_SEGMENT}..."
 
 stage_one() {
   local fname="$1" src="$2" seg
+  # ВАЖНО: файлы backup-label (000000010000010B000000AE.00000028.backup*,
+  # создаются pg_basebackup при каждом базовом бэкапе) имеют те же первые
+  # 24 символа, что и обычный WAL-сегмент этого же имени. Наивное
+  # ${fname:0:24} у ОБОИХ файлов даёт одинаковый seg, а PostgreSQL для
+  # restore_command никогда не запрашивает .backup-файлы — они не нужны
+  # для проигрывания WAL. Раньше это приводило к тому, что маленький
+  # backup-label (сортируется раньше по имени) занимал место под именем
+  # сегмента, а настоящий 16-МБ сегмент молча пропускался проверкой
+  # идемпотентности "уже подготовлен".
+  [[ "$fname" == *.backup* ]] && return 0
   seg="${fname:0:24}"
   # .history файлы нужны целиком, у них другое имя
   if [[ "$fname" == *.history* ]]; then
@@ -203,6 +213,7 @@ if [[ "$SOURCE" == "local" ]]; then
     [[ -n "$f" ]] || continue
     n="$(basename "$f")"
     [[ "$n" == .* ]] && continue
+    [[ "$n" == *.backup* ]] && continue
     # shellcheck disable=SC2071  # hex-имена сегментов, сравнение лексикографическое
     if [[ "$n" == *.history* ]] || [[ "${n:0:24}" > "$START_SEGMENT" ]] || [[ "${n:0:24}" == "$START_SEGMENT" ]]; then
       stage_one "$n" local && staged=$((staged + 1)) || msg WARN "не удалось подготовить ${n}"
@@ -211,6 +222,7 @@ if [[ "$SOURCE" == "local" ]]; then
 else
   while IFS= read -r n; do
     [[ -n "$n" ]] || continue
+    [[ "$n" == *.backup* ]] && continue
     # shellcheck disable=SC2071  # hex-имена сегментов, сравнение лексикографическое
     if [[ "$n" == *.history* ]] || [[ "${n:0:24}" > "$START_SEGMENT" ]] || [[ "${n:0:24}" == "$START_SEGMENT" ]]; then
       stage_one "$n" s3 && staged=$((staged + 1)) || msg WARN "не удалось подготовить ${n}"
