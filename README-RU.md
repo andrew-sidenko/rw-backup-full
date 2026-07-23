@@ -305,6 +305,16 @@ B_RETENTION_MIN_KEEP="3"
 
 Готовый дашборд — `grafana/dashboard.json` (импорт: Dashboards → Import): статусы бэкапов и песочницы, возрасты, размеры локально и по бэкендам, спул WAL, свободное место, длительности, ошибки. Подробности и рекомендуемые алерты — `grafana/README.md`.
 
+## node_exporter (если ещё не установлен)
+
+`rw-metrics-export.timer` пишет в `/var/lib/node_exporter/textfile_collector` — сами метрики забирает node_exporter, а его — ваш vmagent (push-модель, как и остальной парк). Если node_exporter на сервере ещё нет:
+
+```bash
+sudo scripts/host/install-node-exporter.sh
+```
+
+Идемпотентен, каждый шаг — с подтверждением; слушает только `127.0.0.1:9100`, наружу не публикуется. Если node_exporter уже стоит из вашего общего Ansible-кита — просто убедитесь, что у него включён `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector`, и этот скрипт не нужен.
+
 ## Мониторинг
 
 Все компоненты пишут метрики в textfile collector (`/var/lib/node_exporter/textfile_collector/`), откуда их забирает vmagent/node_exporter. Ключевые:

@@ -71,6 +71,13 @@ else
   echo "[OK] ${ENV_FILE} уже существует — не изменён"
 fi
 
+# ReadWritePaths ниже требует существования каталога В МОМЕНТ старта systemd —
+# иначе mount namespace не строится и сервис падает с 226/NAMESPACE, даже не
+# дойдя до Python. Каталог нужен только для чтения .prom-файлов песочницы
+# (/api/sandbox/summary); node_exporter может быть не установлен на этом
+# сервере вообще — тогда просто останется пустым, это не ошибка.
+mkdir -p /var/lib/node_exporter/textfile_collector
+
 unit=/etc/systemd/system/rw-backup-web.service
 if [[ -f "$unit" ]]; then
   echo "[i] Юнит уже существует и будет перезаписан новой версией."
@@ -96,6 +103,15 @@ WantedBy=multi-user.target
 EOF_U
 systemctl daemon-reload
 systemctl enable --now rw-backup-web.service
+sleep 1
+if ! systemctl is-active --quiet rw-backup-web.service; then
+  echo
+  echo "[ERR] Сервис не поднялся. Последние строки лога:"
+  journalctl -u rw-backup-web.service -n 15 --no-pager | sed 's/^/    /'
+  echo "[ERR] Если видите '226/NAMESPACE' — проверьте, что все пути из ReadWritePaths"
+  echo "      юнита (${unit}) существуют: cat ${unit} | grep ReadWritePaths"
+  exit 1
+fi
 echo
 echo "Готово: http://127.0.0.1:8787 (токен в ${ENV_FILE})."
 echo "ВАЖНО: наружу — только через reverse-proxy с TLS или VPN. Порт наружу не открывать."
