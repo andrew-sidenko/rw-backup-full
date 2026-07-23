@@ -266,7 +266,10 @@ if [[ "$ROLE" == "sandbox" ]]; then
 "Будет запущен отдельный установщик web/install-web.sh (свои подтверждения):
 venv+FastAPI, SSH-ключ сервиса, юнит rw-backup-web.service на 127.0.0.1:8787.
 Последствия: появится веб-интерфейс мониторинга/управления всеми серверами."; then
-      cp -r "$SRC_DIR/web" "${INSTALL_DIR}/web-src"
+      # cp содержимого (не каталога): повторный запуск ОБНОВЛЯЕТ web-src,
+      # а не вкладывает web внутрь существующего web-src.
+      mkdir -p "${INSTALL_DIR}/web-src"
+      cp -r "$SRC_DIR/web/." "${INSTALL_DIR}/web-src/"
       bash "${INSTALL_DIR}/web-src/install-web.sh"
     fi
   fi

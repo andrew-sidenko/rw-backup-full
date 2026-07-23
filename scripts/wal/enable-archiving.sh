@@ -44,7 +44,14 @@ COMPOSE_DIR="$(dirname "$COMPOSE_FILE")"
 OVERRIDE_FILE="${COMPOSE_DIR}/docker-compose.override.yml"
 MARKER="# managed-by: rw-backup-full"
 
-dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
+# ВАЖНО: явный -f отключает автоматическую загрузку docker-compose.override.yml,
+# поэтому override передаётся вторым -f явно. cd — чтобы работали .env и
+# относительные пути внутри compose панели.
+dc() {
+  local -a files=(-f "$COMPOSE_FILE")
+  [[ -f "$OVERRIDE_FILE" ]] && files+=(-f "$OVERRIDE_FILE")
+  ( cd "$COMPOSE_DIR" && docker compose "${files[@]}" "$@" )
+}
 
 # --------------------------------------------------------------------------
 # Отключение
@@ -65,7 +72,7 @@ if [[ "$MODE" == "--disable" ]]; then
     msg WARN "[${INSTANCE}] ${OVERRIDE_FILE} создан не нами, оставляю как есть"
   fi
 
-  ( cd "$COMPOSE_DIR" && dc up -d "$COMPOSE_SERVICE" )
+  dc up -d "$COMPOSE_SERVICE"
   "${SCRIPT_DIR}/wal-timers.sh" "$INSTANCE" --remove 2>/dev/null || true
   msg OK "[${INSTANCE}] WAL-архивация выключена"
   exit 0
@@ -166,7 +173,19 @@ if ! truthy "$ASSUME_YES"; then
   fi
 fi
 msg INFO "[${INSTANCE}] пересоздаю ${COMPOSE_SERVICE}..."
-( cd "$COMPOSE_DIR" && dc up -d "$COMPOSE_SERVICE" )
+cid_before="$(docker inspect -f '{{.Id}}' "$INST_CONTAINER" 2>/dev/null || true)"
+dc up -d "$COMPOSE_SERVICE"
+
+cid_after="$(docker inspect -f '{{.Id}}' "$INST_CONTAINER" 2>/dev/null || true)"
+if [[ -n "$cid_before" && "$cid_after" == "$cid_before" ]]; then
+  msg WARN "[${INSTANCE}] compose не пересоздал контейнер (конфиг счёл неизменным) — принудительно"
+  dc up -d --force-recreate "$COMPOSE_SERVICE"
+  cid_after="$(docker inspect -f '{{.Id}}' "$INST_CONTAINER" 2>/dev/null || true)"
+fi
+if [[ -n "$cid_before" && "$cid_after" == "$cid_before" ]]; then
+  msg ERR "[${INSTANCE}] контейнер так и не пересоздан. Проверьте: (cd ${COMPOSE_DIR} && docker compose config | grep -A5 ${COMPOSE_SERVICE})"
+  exit 1
+fi
 
 wal_wait_pg_ready 180 || { msg ERR "[${INSTANCE}] PostgreSQL не поднялся после рестарта"; exit 1; }
 
@@ -174,10 +193,28 @@ wal_wait_pg_ready 180 || { msg ERR "[${INSTANCE}] PostgreSQL не поднялс
 # 5. Сквозная проверка
 # --------------------------------------------------------------------------
 mode="$(wal_psql "SHOW archive_mode" | head -n1)"
-[[ "$mode" == "on" || "$mode" == "always" ]] || { msg ERR "[${INSTANCE}] archive_mode=${mode}"; exit 1; }
+if [[ "$mode" != "on" && "$mode" != "always" ]]; then
+  msg ERR "[${INSTANCE}] archive_mode=${mode} после рестарта."
+  msg ERR "Обычно это значит, что контейнер не был пересоздан или монтирование спула не применилось."
+  msg ERR "Диагностика:"
+  msg ERR "  docker inspect ${INST_CONTAINER} --format '{{.Created}}'   # время должно быть свежим"
+  msg ERR "  docker exec ${INST_CONTAINER} cat /var/lib/postgresql/data/postgresql.auto.conf | grep archive"
+  exit 1
+fi
 
 if ! docker exec "$INST_CONTAINER" test -x "${WAL_SPOOL_MOUNT}/archive-command.sh"; then
-  msg ERR "[${INSTANCE}] ${WAL_SPOOL_MOUNT}/archive-command.sh не виден в контейнере — проверьте override"
+  msg ERR "[${INSTANCE}] ${WAL_SPOOL_MOUNT}/archive-command.sh не виден в контейнере."
+  if docker inspect "$INST_CONTAINER" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null | grep -qx "$WAL_SPOOL_MOUNT"; then
+    msg ERR "Монтирование ${WAL_SPOOL_MOUNT} есть, но файла нет — проверьте на хосте: ls -la ${INST_SPOOL_DIR}/"
+  else
+    msg ERR "Монтирование ${WAL_SPOOL_MOUNT} ОТСУТСТВУЕТ в контейнере — он пересоздан без override."
+    msg ERR "Частая причина: параллельно исполняется старая версия этого скрипта или"
+    msg ERR "compose был запущен с явным -f без override. Проверьте версию установки и повторите."
+  fi
+  msg WARN "ВАЖНО: archive_mode сейчас включён, а archive_command падает — PostgreSQL копит WAL в pg_wal."
+  msg WARN "Либо доведите включение до конца (устраните причину и повторите wal-enable ${INSTANCE}),"
+  msg WARN "либо откатите: rw-backup-full wal-disable ${INSTANCE}"
+  msg WARN "Мониторинг: docker exec ${INST_CONTAINER} psql -U ${INST_PGUSER} -c 'SELECT failed_count FROM pg_stat_archiver'"
   exit 1
 fi
 
@@ -196,6 +233,8 @@ if [[ "$ok" != "true" ]]; then
   msg ERR "[${INSTANCE}] сегмент не появился в спуле за 30с."
   msg ERR "Диагностика: docker logs ${INST_CONTAINER} --tail 50 | grep -i archive"
   wal_psql "SELECT last_failed_wal, last_failed_time FROM pg_stat_archiver" >&2 || true
+  msg WARN "ВАЖНО: если archive_command падает, PostgreSQL копит WAL в pg_wal."
+  msg WARN "Устраните причину и повторите wal-enable, либо откатите: rw-backup-full wal-disable ${INSTANCE}"
   exit 1
 fi
 

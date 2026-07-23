@@ -12,6 +12,16 @@ ask() { local a; echo; echo -e "\e[33m$1\e[0m"; read -r -p "Продолжить
 [[ "$(id -u)" == 0 ]] || { echo "Нужен root"; exit 1; }
 command -v python3 >/dev/null || { echo "Нужен python3"; exit 1; }
 
+# venv требует ensurepip (пакет python3-venv). Проверяем ДО создания каталога,
+# чтобы не оставить битый venv, который потом маскирует проблему.
+if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+  pyver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  echo "[ERR] Не установлен python3-venv (модуль ensurepip недоступен)."
+  echo "      Установите и запустите установщик снова:"
+  echo "        apt install python${pyver}-venv    # или: apt install python3-venv"
+  exit 1
+fi
+
 echo "Будет установлено:"
 echo "  - ${WEB_DIR}/app.py + venv (${WEB_DIR}/venv, pip: fastapi uvicorn pydantic)"
 echo "  - SSH-ключ сервиса: ${DATA_DIR}/id_ed25519 (если нет)"
@@ -22,11 +32,22 @@ ask "Установить веб-сервис?" || exit 0
 mkdir -p "$WEB_DIR" "$DATA_DIR"
 install -m 0644 "${SRC_DIR}/app.py" "${WEB_DIR}/app.py"
 
-if [[ ! -d "${WEB_DIR}/venv" ]]; then
+# Валидный venv = есть работающий pip; каталог без pip — обломок неудачной
+# установки, его нужно пересоздать, а не пропустить.
+venv_ok="false"
+[[ -x "${WEB_DIR}/venv/bin/pip" ]] && "${WEB_DIR}/venv/bin/pip" --version >/dev/null 2>&1 && venv_ok="true"
+
+if [[ "$venv_ok" != "true" ]]; then
+  if [[ -d "${WEB_DIR}/venv" ]]; then
+    echo "[i] Обнаружен неполный venv (без pip) — остаток прерванной установки, будет пересоздан."
+  fi
   ask "Создать venv и установить зависимости из PyPI (fastapi, uvicorn, pydantic)?" || exit 1
-  python3 -m venv "${WEB_DIR}/venv"
+  # --clear очищает содержимое существующего каталога venv
+  python3 -m venv --clear "${WEB_DIR}/venv"
+  [[ -x "${WEB_DIR}/venv/bin/pip" ]] || { echo "[ERR] venv создан без pip — проверьте python3-venv"; exit 1; }
 fi
-"${WEB_DIR}/venv/bin/pip" install -q --upgrade fastapi uvicorn pydantic
+"${WEB_DIR}/venv/bin/pip" install -q --upgrade fastapi uvicorn pydantic \
+  || { echo "[ERR] pip install не удался (сеть/PyPI?). Повторите установку."; exit 1; }
 
 if [[ ! -f "${DATA_DIR}/id_ed25519" ]]; then
   ssh-keygen -t ed25519 -N "" -C "rw-backup-web" -f "${DATA_DIR}/id_ed25519" >/dev/null
