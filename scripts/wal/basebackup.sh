@@ -25,6 +25,7 @@ NO_S3="${2:-}"
 [[ -n "$INSTANCE" ]] || { echo "Usage: basebackup.sh <instance> [--no-s3]" >&2; exit 1; }
 
 wal_load_full_config
+require_component wal
 wal_load_instance "$INSTANCE"
 
 truthy "${INST_ENABLED:-true}" || { msg INFO "[${INSTANCE}] отключён"; exit 0; }

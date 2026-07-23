@@ -21,6 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/wal-lib.sh"
 
 wal_load_full_config
+require_component metrics
 wal_lock "metrics-exporter" || exit 0
 
 BACKUP_DIR="${BACKUP_DIR:-${INSTALL_DIR}/backup}"

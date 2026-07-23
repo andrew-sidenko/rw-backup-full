@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/wal-lib.sh"
 
 wal_load_full_config
+require_component panel-backup
 
 # Единые настройки с fallback на оригинальный config.env (без дублирования).
 PANEL_DB_CONTAINER="${PANEL_DB_CONTAINER:-remnawave-db}"

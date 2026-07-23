@@ -76,6 +76,8 @@ if [[ "$ROLE" == "host-agent" ]]; then
     done
   fi
 
+  tm="${TRACK_INTERVAL_MIN:-5}"; [[ "$tm" =~ ^[0-9]+$ ]] || tm=5
+  echo "*/${tm} * * * * ${INSTALL_DIR}/scripts/track/config-track.sh"
   echo "*/15 * * * * ${INSTALL_DIR}/scripts/metrics/metrics-exporter.sh"
 fi
 

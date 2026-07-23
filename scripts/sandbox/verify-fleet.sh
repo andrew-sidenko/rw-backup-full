@@ -215,6 +215,160 @@ check_logical_archive() { # <src> <backend_json> <category> <kind> <s3key> <resu
 }
 
 # --------------------------------------------------------------------------
+# PITR: базовый бэкап + WAL восстанавливаются НА ПЕСОЧНИЦЕ (не на проде —
+# именно ради утилизации её ресурсов и нулевой нагрузки на прод), полностью
+# по данным из манифеста (реквизиты хранилища, инстанс, профиль типа).
+# Использует тот же формат meta-файла и ТУ ЖЕ логику стейджинга WAL с
+# исключением .backup-файлов, что и pitr-restore.sh — тот же класс бага
+# здесь заведомо не повторится.
+# --------------------------------------------------------------------------
+check_pitr_instance() { # <src> <backend_json> <instance> <kind> <pguser> <pgdb> <vtables> <result_file>
+  local src="$1" bj="$2" inst="$3" kind="$4" pguser="$5" pgdb="$6" vtables="$7" rf="$8"
+  local bname bucket prefix base t0 t1
+  bname="$(jq -r .name <<<"$bj")"; bucket="$(jq -r .bucket <<<"$bj")"
+  prefix="$(jq -r '.prefix // "rw-backup-full"' <<<"$bj")"; prefix="${prefix#/}"; prefix="${prefix%/}"
+  base="${prefix}/wal/${src}/${inst}"
+  t0="$(date +%s)"
+
+  local wd="${SANDBOX_WORK}/work.$$/pitr_${src}_${bname}_${inst}"
+  mkdir -p "${wd}/pgdata" "${wd}/wal"
+  fail() { echo "FAIL [${src} × ${bname}] pitr(${inst}): $1" > "$rf"; rm -rf "$wd"; }
+
+  local meta_key meta_file="${wd}/backup.meta"
+  meta_key="$(maws "$bj" s3 ls "s3://${bucket}/${base}/basebackup/" 2>/dev/null \
+    | awk '{print $4}' | grep -E '^base_.*\.meta$' | sort -r | head -n1)"
+  [[ -n "$meta_key" ]] || { fail "нет базовых бэкапов в этом хранилище"; return; }
+  maws "$bj" s3 cp "s3://${bucket}/${base}/basebackup/${meta_key}" "$meta_file" --only-show-errors 2>/dev/null \
+    || { fail "не скачался ${meta_key}"; return; }
+
+  local BACKUP_NAME FILE SHA256 START_SEGMENT PG_VERSION_NUM ENCRYPTED CREATED_AT
+  set +u; # shellcheck disable=SC1090
+  source "$meta_file"; set -u
+
+  if truthy "${ENCRYPTED:-false}" && [[ -z "${SANDBOX_AGE_IDENTITY:-}" || ! -f "${SANDBOX_AGE_IDENTITY:-}" ]]; then
+    fail "бэкап зашифрован, SANDBOX_AGE_IDENTITY не задан"; return
+  fi
+
+  local base_file="${wd}/${FILE}"
+  maws "$bj" s3 cp "s3://${bucket}/${base}/basebackup/${FILE}" "$base_file" --only-show-errors 2>/dev/null \
+    || { fail "не скачался ${FILE}"; return; }
+  local actual_sha; actual_sha="$(sha256sum "$base_file" | awk '{print $1}')"
+  [[ "$actual_sha" == "$SHA256" ]] || { fail "SHA256 базового бэкапа не совпадает"; return; }
+
+  local unpack_stream
+  unpack_stream() {
+    local name="$1" base_n="$1"
+    if [[ "$base_n" == *.age ]]; then
+      base_n="${base_n%.age}"
+      age -d -i "$SANDBOX_AGE_IDENTITY" | wal_decompress_stream "$base_n"
+    else
+      wal_decompress_stream "$base_n"
+    fi
+  }
+  unpack_stream "$FILE" < "$base_file" | tar -xf - -C "${wd}/pgdata" 2>/dev/null
+  [[ -f "${wd}/pgdata/PG_VERSION" ]] || { fail "после распаковки нет PG_VERSION"; return; }
+
+  # Стейджинг WAL: та же логика, что в pitr-restore.sh (см. CHANGELOG v5.2.0) —
+  # .backup-файлы исключены явно, иначе backup-label подменяет собой сегмент.
+  local staged=0 key seg
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    [[ "$key" == *.backup* ]] && continue
+    seg="${key:0:24}"
+    local is_hist="false"; [[ "$key" == *.history* ]] && { is_hist="true"; seg="${key%%.history*}.history"; }
+    # shellcheck disable=SC2071
+    if [[ "$is_hist" == "true" ]] || [[ "$seg" > "$START_SEGMENT" ]] || [[ "$seg" == "$START_SEGMENT" ]]; then
+      [[ -f "${wd}/wal/${seg}" ]] && continue
+      if maws "$bj" s3 cp "s3://${bucket}/${base}/wal/${key}" - --only-show-errors 2>/dev/null \
+           | unpack_stream "$key" > "${wd}/wal/${seg}.part" 2>/dev/null; then
+        mv -f "${wd}/wal/${seg}.part" "${wd}/wal/${seg}"
+        staged=$((staged + 1))
+      fi
+    fi
+  done < <(maws "$bj" s3 ls "s3://${bucket}/${base}/wal/" 2>/dev/null | awk '{print $4}' | sort)
+
+  # Образ: тот же мажор PostgreSQL, что у бэкапа (у песочницы нет доступа к
+  # боевому контейнеру источника, чтобы спросить образ напрямую).
+  local major image
+  major=$(( PG_VERSION_NUM / 10000 ))
+  image="postgres:${major}"
+
+  local restore_uid
+  restore_uid="$(docker run --rm --entrypoint id "$image" -u postgres 2>/dev/null || true)"
+  [[ "$restore_uid" =~ ^[0-9]+$ ]] || restore_uid=999
+  chown -R "${restore_uid}:${restore_uid}" "${wd}/pgdata" "${wd}/wal" 2>/dev/null || true
+  chmod 0700 "${wd}/pgdata"
+
+  {
+    echo ""
+    echo "archive_mode = 'off'"
+    echo "archive_command = ''"
+    echo "restore_command = 'cp /wal-archive/%f %p'"
+    echo "recovery_end_command = ''"
+    echo "recovery_target_action = 'promote'"
+    echo "hot_standby = on"
+  } >> "${wd}/pgdata/postgresql.auto.conf"
+  touch "${wd}/pgdata/recovery.signal"
+  rm -f "${wd}/pgdata/postmaster.pid"
+
+  local c="rw-fleet-pitr-$$-$(tr -dc a-z0-9 </dev/urandom | head -c6)"
+  # БЕЗ --rm: при падении нужны логи (см. CHANGELOG v5.2.0 про --rm-гонку).
+  docker run -d --name "$c" --label "rw-fleet-session=$$" \
+    -v "${wd}/pgdata:/var/lib/postgresql/data" \
+    -v "${wd}/wal:/wal-archive:ro" \
+    -e POSTGRES_PASSWORD=rw_fleet_tmp \
+    "$image" -c listen_addresses='*' >/dev/null 2>&1 \
+    || { fail "временный контейнер не создался (образ ${image} недоступен?)"; return; }
+
+  local recovered=false
+  for _ in $(seq 1 180); do
+    if docker exec "$c" pg_isready -h localhost -U "$pguser" >/dev/null 2>&1; then
+      local in_rec
+      in_rec="$(docker exec "$c" psql -h localhost -U "$pguser" -d postgres -qtAX \
+        -c 'SELECT pg_is_in_recovery()' 2>/dev/null | tr -d ' ' || echo t)"
+      [[ "$in_rec" == "f" ]] && { recovered=true; break; }
+    fi
+    docker ps -q -f "name=${c}" | grep -q . || break
+    sleep 2
+  done
+
+  if [[ "$recovered" != "true" ]]; then
+    local exitcode; exitcode="$(docker inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null || echo '?')"
+    local tail_log; tail_log="$(docker logs "$c" 2>&1 | tail -5 | tr '\n' ' ')"
+    docker rm -f "$c" >/dev/null 2>&1 || true
+    fail "восстановление не завершилось (exit_code=${exitcode}): ${tail_log:0:200}"
+    return
+  fi
+
+  # ---- Профиль типа (те же проверки, что в PROFILE_* verify-profiles.d) ----
+  load_profile "$kind"
+  local prof_fail="" tbl cnt db="$pgdb"
+  local tables rows
+  tables="$(docker exec "$c" psql -qtAX -U "$pguser" -d "$db" -c "SELECT count(*) FROM pg_stat_user_tables" 2>/dev/null || echo 0)"
+  rows="$(docker exec "$c" psql -qtAX -U "$pguser" -d "$db" -c "SELECT coalesce(sum(n_live_tup),0)::bigint FROM pg_stat_user_tables" 2>/dev/null || echo 0)"
+  (( ${tables:-0} < ${PROFILE_MIN_TABLES:-1} )) && prof_fail+=" таблиц=${tables}<${PROFILE_MIN_TABLES}"
+  (( ${rows:-0} < ${PROFILE_MIN_TOTAL_ROWS:-1} )) && prof_fail+=" строк=${rows}<${PROFILE_MIN_TOTAL_ROWS}"
+  for tbl in ${vtables:-} ${PROFILE_REQUIRED_TABLES:-}; do
+    [[ -n "$tbl" ]] || continue
+    cnt="$(docker exec "$c" psql -qtAX -U "$pguser" -d "$db" -c "SELECT count(*) FROM ${tbl}" 2>/dev/null || echo FAIL)"
+    if [[ "$cnt" == "FAIL" ]]; then prof_fail+=" ${tbl}:отсутствует"
+    elif [[ "$cnt" == "0" ]]; then prof_fail+=" ${tbl}:пустая"; fi
+  done
+  local last_ts
+  last_ts="$(docker exec "$c" psql -qtAX -U "$pguser" -d "$db" -c 'SELECT pg_last_committed_xact()' 2>/dev/null || true)"
+
+  docker rm -f "$c" >/dev/null 2>&1 || true
+  rm -rf "$wd"
+  t1="$(date +%s)"
+
+  if [[ -z "$prof_fail" ]]; then
+    echo "OK [${src} × ${bname}] pitr(${inst}): ${BACKUP_NAME} +${staged} WAL — таблиц=${tables}, строк=${rows}, $((t1-t0))s${last_ts:+, последняя транзакция ${last_ts}}" > "$rf"
+  else
+    echo "FAIL [${src} × ${bname}] pitr(${inst}): ${BACKUP_NAME} +${staged} WAL —${prof_fail}" > "$rf"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Постановка задач: source × backend × category (× history)
 # --------------------------------------------------------------------------
 JOBS="${SANDBOX_WORK}/jobs.$$"; : > "$JOBS"
@@ -261,6 +415,20 @@ while IFS= read -r srv; do
     [[ "$(jq -r .enabled <<<"$bj")" == "true" ]] || continue
     [[ "$(jq -r .panel  <<<"$bj")" == "true" ]] && queue_check "$sid" "$src" "$bj" "panel" "panel"
     [[ "$(jq -r .custom <<<"$bj")" == "true" ]] && queue_check "$sid" "$src" "$bj" "custom-bot" "$bot_kind"
+
+    # PITR: по каждому инстансу этого сервера, если бэкенд несёт WAL-категорию.
+    if [[ "$(jq -r .wal <<<"$bj")" == "true" ]]; then
+      while IFS= read -r ij; do
+        [[ -n "$ij" ]] || continue
+        ikind="$(jq -r .kind <<<"$ij")"
+        if [[ "$ikind" != "panel" && -z "${_WARNED_NONPANEL_PITR:-}" ]]; then
+          msg WARN "Fleet-PITR для типа '${ikind}' (боты и др.) пока проверена только на панели — следите за первыми результатами внимательнее, при сомнениях сверьте ручным 'pitr-restore <инстанс> --target latest' на самом сервере"
+          _WARNED_NONPANEL_PITR="true"
+        fi
+        printf '%s\tpitr\t%s\t%s\t%s\t%s\n' \
+          "$src" "$ikind" "$ij" "${RESULTS_DIR}/r$((job_id++))" "$bj" >> "$JOBS"
+      done < <(jq -c '.instances[]?' <<<"$srv")
+    fi
   done < <(jq -c '.backends[]?' <<<"$srv")
 done <<<"$servers_json"
 
@@ -277,9 +445,19 @@ export SANDBOX_WORK RESULTS_DIR PROFILES_DIR DEPTH SANDBOX_PG_VERSION="${SANDBOX
 run_one_job() {
   local line="$1" src category kind key rf bj
   IFS=$'\t' read -r src category kind key rf bj <<<"$line"
-  check_logical_archive "$src" "$bj" "$category" "$kind" "$key" "$rf"
+  if [[ "$category" == "pitr" ]]; then
+    # для pitr в поле key лежит JSON инстанса: {"name","kind","verify_tables","pguser","pgdatabase"}
+    local ij="$key" iname ivtables ipguser ipgdb
+    iname="$(jq -r .name <<<"$ij")"
+    ivtables="$(jq -r '.verify_tables // ""' <<<"$ij")"
+    ipguser="$(jq -r '.pguser // "postgres"' <<<"$ij")"
+    ipgdb="$(jq -r '.pgdatabase // "postgres"' <<<"$ij")"
+    check_pitr_instance "$src" "$bj" "$iname" "$kind" "$ipguser" "$ipgdb" "$ivtables" "$rf"
+  else
+    check_logical_archive "$src" "$bj" "$category" "$kind" "$key" "$rf"
+  fi
 }
-export -f run_one_job
+export -f run_one_job check_pitr_instance
 
 if (( total_jobs > 0 )); then
   # -d '\n': строка задания передаётся аргументом целиком, кавычки JSON не съедаются
@@ -320,7 +498,9 @@ done
       src_l="$(sed -n 's/^[A-Z]* \[\([^ ]*\) ×.*/\1/p' <<<"$line")"
       b_l="$(sed -n 's/^[A-Z]* \[[^×]*× \([^]]*\)\].*/\1/p' <<<"$line")"
       c_l="$(sed -n 's/^[A-Z]* \[[^]]*\] \([a-z-]*\).*/\1/p' <<<"$line")"
-      echo "rw_fleet_verify_ok{source=\"${src_l:-?}\",backend=\"${b_l:-?}\",category=\"${c_l:-?}\"} ${v}"
+      i_l=""
+      [[ "$c_l" == "pitr" ]] && i_l="$(sed -n 's/^[A-Z]* \[[^]]*\] pitr(\([^)]*\)).*/\1/p' <<<"$line")"
+      echo "rw_fleet_verify_ok{source=\"${src_l:-?}\",backend=\"${b_l:-?}\",category=\"${c_l:-?}\",instance=\"${i_l}\"} ${v}"
     else
       srv_l="$(sed -n 's/^[A-Z]* \[\([^]]*\)\].*/\1/p' <<<"$line")"
       echo "rw_fleet_server_reachable{server=\"${srv_l:-?}\"} ${v}"

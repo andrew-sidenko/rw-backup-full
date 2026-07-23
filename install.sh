@@ -94,6 +94,8 @@ if (( ${#miss[@]} )); then
 fi
 command -v aws  >/dev/null || warn "awscli не найден — S3 работать не будет (apt install awscli)"
 command -v zstd >/dev/null || warn "zstd не найден — сжатие через gzip (рекомендуется: apt install zstd)"
+command -v git  >/dev/null || warn "git не найден — трекер каталогов (config-track) работать не будет (apt install git)"
+command -v rsync >/dev/null || say "rsync не найден — трекер будет работать без отражения удалений (apt install rsync)"
 command -v jq   >/dev/null || warn "jq не найден — fleet-verify на песочнице требует jq (apt install jq)"
 command -v age  >/dev/null || say  "age не найден — шифрование недоступно (нужно при INST_ENCRYPT=true)"
 ok "Зависимости проверены"
@@ -120,6 +122,8 @@ if ask "Шаг 2: копирование файлов v5" \
   for f in "$SRC_DIR"/scripts/wal/*.sh;     do put 0755 "$f" "${INSTALL_DIR}/scripts/wal/$(basename "$f")"; done
   for f in "$SRC_DIR"/scripts/panel/*.sh;   do put 0755 "$f" "${INSTALL_DIR}/scripts/panel/$(basename "$f")"; done
   for f in "$SRC_DIR"/scripts/metrics/*.sh; do put 0755 "$f" "${INSTALL_DIR}/scripts/metrics/$(basename "$f")"; done
+  mkdir -p "${INSTALL_DIR}/scripts/track"
+  for f in "$SRC_DIR"/scripts/track/*.sh; do put 0755 "$f" "${INSTALL_DIR}/scripts/track/$(basename "$f")"; done
   for f in "$SRC_DIR"/scripts/sandbox/*.sh; do
     put 0755 "$f" "${INSTALL_DIR}/scripts/sandbox/$(basename "$f")"
   done
@@ -211,6 +215,48 @@ EOF_MIG
 fi
 
 # --------------------------------------------------------------------------
+# 4в. Компоненты сервера
+# --------------------------------------------------------------------------
+# Серверы разные: где-то нужен полный набор, где-то только логические бэкапы.
+# Ненужные компоненты не получат таймеров и не будут выполняться.
+CUR_COMPONENTS="$(grep -E '^FULL_COMPONENTS=' "$FULL_CONFIG" 2>/dev/null | head -n1 | cut -d'"' -f2 || true)"
+if [[ -z "$CUR_COMPONENTS" ]]; then
+  if [[ "$ROLE" == "sandbox" ]]; then
+    CUR_COMPONENTS="sandbox metrics web"
+  else
+    CUR_COMPONENTS="panel-backup custom-backup wal config-track metrics"
+  fi
+fi
+
+if [[ "$ASSUME_YES" != "true" ]]; then
+  echo
+  echo -e "${C_Y}${C_B}── Компоненты этого сервера ──${C_R}"
+  echo "Сейчас: ${CUR_COMPONENTS}"
+  echo
+  echo "  panel-backup   логический бэкап панели Remnawave"
+  echo "  custom-backup  логический бэкап проектов из /home (боты)"
+  echo "  wal            WAL-архивация PostgreSQL + PITR"
+  echo "  config-track   трекер каталогов целиком (конфиги, код, ресурсы)"
+  echo "  metrics        выгрузка метрик для Grafana"
+  echo "  sandbox        проверка бэкапов (сервер-песочница)"
+  echo "  web            веб-сервис управления парком (песочница)"
+  echo
+  echo "Впишите нужные через пробел или Enter, чтобы оставить как есть."
+  read -r -p "> " NEW_COMPONENTS
+  [[ -n "$NEW_COMPONENTS" ]] && CUR_COMPONENTS="$NEW_COMPONENTS"
+fi
+
+if grep -qE '^FULL_COMPONENTS=' "$FULL_CONFIG" 2>/dev/null; then
+  sed -i "s|^FULL_COMPONENTS=.*|FULL_COMPONENTS=\"${CUR_COMPONENTS}\"|" "$FULL_CONFIG"
+else
+  printf '\n# Компоненты этого сервера (rw-backup-full components)\nFULL_COMPONENTS="%s"\n' \
+    "$CUR_COMPONENTS" >> "$FULL_CONFIG"
+fi
+ok "Компоненты: ${CUR_COMPONENTS}"
+
+comp_on() { [[ " ${CUR_COMPONENTS} " == *" $1 "* ]]; }
+
+# --------------------------------------------------------------------------
 # 5. systemd
 # --------------------------------------------------------------------------
 UNITS_PROD=(rw-wal-ship@.service rw-wal-ship@.timer rw-basebackup@.service rw-basebackup@.timer \
@@ -226,6 +272,9 @@ if ask "Шаг 5: systemd-юниты" \
 Никакие таймеры на этом шаге не включаются и не перезапускаются."; then
   if [[ "$ROLE" == "prod" ]]; then
     for u in "${UNITS_PROD[@]}"; do put 0644 "$SRC_DIR/systemd/$u" "/etc/systemd/system/$u"; done
+    comp_on config-track && for u in rw-config-track.service rw-config-track.timer; do
+      put 0644 "$SRC_DIR/systemd/$u" "/etc/systemd/system/$u"
+    done
     if [[ ! -f /etc/systemd/system/rw-backup-full.timer ]]; then
       put 0644 "$SRC_DIR/systemd/rw-backup-full.service" /etc/systemd/system/rw-backup-full.service
       put 0644 "$SRC_DIR/systemd/rw-backup-full.timer"   /etc/systemd/system/rw-backup-full.timer
@@ -239,12 +288,23 @@ if ask "Шаг 5: systemd-юниты" \
   ok "Юниты установлены, daemon-reload выполнен"
 
   if [[ "$ROLE" == "prod" ]]; then
-    if ask "Шаг 5б: таймер экспорта метрик" \
+    if comp_on metrics && ask "Шаг 5б: таймер экспорта метрик" \
 "Будет сделано: systemctl enable --now rw-metrics-export.timer (каждые 15 мин).
 Последствия: раз в 15 минут собираются метрики о бэкапах/дисках/S3 для Grafana.
 Нагрузка минимальна; листинг S3 отключается FULL_METRICS_S3_SIZES=false."; then
       systemctl enable --now rw-metrics-export.timer
       ok "rw-metrics-export.timer включён"
+    fi
+    if comp_on config-track && ask "Шаг 5в: таймер трекера каталогов" \
+"Будет сделано: systemctl enable --now rw-config-track.timer (каждые ${TRACK_INTERVAL_MIN:-5} мин).
+Последствия: каталоги панели (/opt/remnawave) и проектов из /home начнут
+отслеживаться целиком в локальный git-репозиторий /var/lib/rw-config-track,
+с выгрузкой полных и инкрементальных bundle в S3. Каталоги данных СУБД
+исключены. При отсутствии изменений прогон занимает доли секунды.
+Нужен git (проверьте: command -v git)."; then
+      command -v git >/dev/null 2>&1 || warn "git не установлен — трекер будет падать (apt install git)"
+      systemctl enable --now rw-config-track.timer
+      ok "rw-config-track.timer включён"
     fi
   fi
 fi

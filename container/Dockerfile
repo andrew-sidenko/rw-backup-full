@@ -18,7 +18,7 @@ ARG TARGETARCH=amd64
 # Базовые утилиты
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash curl ca-certificates gnupg tzdata \
-      gzip zstd age openssl openssh-client jq \
+      gzip zstd age openssl openssh-client jq git rsync \
       util-linux coreutils findutils procps \
       python3 python3-venv \
       awscli \

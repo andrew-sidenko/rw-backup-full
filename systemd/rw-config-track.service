@@ -1,0 +1,11 @@
+[Unit]
+Description=rw-backup-full: config/code directory tracker
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rw-backup-restore/scripts/track/config-track.sh
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=1h

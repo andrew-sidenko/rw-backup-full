@@ -3,15 +3,13 @@ set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/rw-backup-restore}"
 BACKUP_DIR="${BACKUP_DIR:-${INSTALL_DIR}/backup}"
-ORIGINAL_CONFIG_FILE="${ORIGINAL_CONFIG_FILE:-${INSTALL_DIR}/config.env}"
 FULL_CONFIG_FILE="${FULL_CONFIG_FILE:-${INSTALL_DIR}/rw-backup-full.env}"
-ORIGINAL_RW_BACKUP_BIN="${ORIGINAL_RW_BACKUP_BIN:-rw-backup}"
-ORIGINAL_RW_BACKUP_SCRIPT="${ORIGINAL_RW_BACKUP_SCRIPT:-${INSTALL_DIR}/backup-restore.sh}"
 WAL_SCRIPTS_DIR="${WAL_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/wal}"
 SANDBOX_SCRIPTS_DIR="${SANDBOX_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/sandbox}"
 INSTANCES_DIR="${INSTANCES_DIR:-${INSTALL_DIR}/instances.d}"
 PANEL_SCRIPTS_DIR="${PANEL_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/panel}"
 METRICS_SCRIPTS_DIR="${METRICS_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/metrics}"
+TRACK_SCRIPTS_DIR="${TRACK_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/track}"
 if [[ -f "${INSTALL_DIR}/scripts/lib/s3-multi.sh" ]]; then
   # shellcheck disable=SC1091
   source "${INSTALL_DIR}/scripts/lib/s3-multi.sh"
@@ -27,24 +25,11 @@ CYAN=$'\e[36m'
 RESET=$'\e[0m'
 BOLD=$'\e[1m'
 
-ORIG_TG_BOT_TOKEN=""
-ORIG_TG_CHAT_ID=""
-ORIG_TG_MESSAGE_THREAD_ID=""
-ORIG_TG_PROXY=""
-ORIG_S3_BUCKET=""
-ORIG_S3_ACCESS_KEY=""
-ORIG_S3_SECRET_KEY=""
-ORIG_S3_REGION=""
-ORIG_S3_ENDPOINT=""
-ORIG_S3_PREFIX=""
-ORIG_UPLOAD_METHOD=""
 
 FULL_LOCAL_RETENTION_DAYS="3"
 FULL_EXTERNAL_S3_RETENTION_DAYS="10"
 FULL_TIMER_INTERVAL_HOURS="3"
 FULL_TIMER_MODE="backup-all"
-FULL_AUTO_INSTALL_ORIGINAL_RW_BACKUP="false"
-FULL_REQUIRE_ORIGINAL_RW_BACKUP="false"
 FULL_INCLUDE_EXTRA_CONFIGS="true"
 FULL_PANEL_EXTERNAL_S3_ENABLED="true"
 FULL_CUSTOM_EXTERNAL_S3_ENABLED="true"
@@ -100,31 +85,9 @@ parse_times_list() {
   printf '%s\n' "${out% }"
 }
 
-capture_original_vars() {
-  ORIG_TG_BOT_TOKEN="${TG_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}}"
-  ORIG_TG_CHAT_ID="${TG_CHAT_ID:-${TELEGRAM_CHAT_ID:-${CHAT_ID:-}}}"
-  ORIG_TG_MESSAGE_THREAD_ID="${TG_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID:-${MESSAGE_THREAD_ID:-}}}"
-  ORIG_TG_PROXY="${TG_PROXY:-${TELEGRAM_PROXY:-}}"
-
-  ORIG_S3_BUCKET="${S3_BUCKET:-${AWS_S3_BUCKET:-}}"
-  ORIG_S3_ACCESS_KEY="${S3_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-}}"
-  ORIG_S3_SECRET_KEY="${S3_SECRET_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
-  ORIG_S3_REGION="${S3_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
-  ORIG_S3_ENDPOINT="${S3_ENDPOINT:-${AWS_ENDPOINT_URL:-}}"
-  ORIG_S3_PREFIX="${S3_PREFIX:-${AWS_S3_PREFIX:-}}"
-  ORIG_UPLOAD_METHOD="${UPLOAD_METHOD:-${BACKUP_UPLOAD_METHOD:-}}"
-}
 
 load_config() {
   mkdir -p "$BACKUP_DIR"
-
-  if [[ -f "$ORIGINAL_CONFIG_FILE" ]]; then
-    set +u
-    # shellcheck disable=SC1090
-    source "$ORIGINAL_CONFIG_FILE"
-    set -u
-    capture_original_vars
-  fi
 
   if [[ -f "$FULL_CONFIG_FILE" ]]; then
     set +u
@@ -139,31 +102,10 @@ load_config() {
   FULL_TIMER_TIMES="${FULL_TIMER_TIMES:-}"
   FULL_SCHEDULE_TZ="${FULL_SCHEDULE_TZ:-}"
   FULL_TIMER_MODE="${FULL_TIMER_MODE:-backup-all}"
-  FULL_AUTO_INSTALL_ORIGINAL_RW_BACKUP="${FULL_AUTO_INSTALL_ORIGINAL_RW_BACKUP:-false}"
-  FULL_REQUIRE_ORIGINAL_RW_BACKUP="${FULL_REQUIRE_ORIGINAL_RW_BACKUP:-false}"
   FULL_INCLUDE_EXTRA_CONFIGS="${FULL_INCLUDE_EXTRA_CONFIGS:-true}"
   FULL_PANEL_EXTERNAL_S3_ENABLED="${FULL_PANEL_EXTERNAL_S3_ENABLED:-true}"
   FULL_CUSTOM_EXTERNAL_S3_ENABLED="${FULL_CUSTOM_EXTERNAL_S3_ENABLED:-true}"
   FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD="${FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD:-true}"
-  FULL_TELEGRAM_IMPORT_FROM_ORIGINAL="${FULL_TELEGRAM_IMPORT_FROM_ORIGINAL:-true}"
-  FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL="${FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL:-false}"
-
-  if [[ "$FULL_TELEGRAM_IMPORT_FROM_ORIGINAL" == "true" ]]; then
-    FULL_TG_BOT_TOKEN="${FULL_TG_BOT_TOKEN:-$ORIG_TG_BOT_TOKEN}"
-    FULL_TG_CHAT_ID="${FULL_TG_CHAT_ID:-$ORIG_TG_CHAT_ID}"
-    FULL_TG_MESSAGE_THREAD_ID="${FULL_TG_MESSAGE_THREAD_ID:-$ORIG_TG_MESSAGE_THREAD_ID}"
-    FULL_TG_PROXY="${FULL_TG_PROXY:-$ORIG_TG_PROXY}"
-  fi
-
-  if [[ "$FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL" == "true" ]]; then
-    FULL_EXTERNAL_S3_BUCKET="${FULL_EXTERNAL_S3_BUCKET:-$ORIG_S3_BUCKET}"
-    FULL_EXTERNAL_S3_ACCESS_KEY="${FULL_EXTERNAL_S3_ACCESS_KEY:-$ORIG_S3_ACCESS_KEY}"
-    FULL_EXTERNAL_S3_SECRET_KEY="${FULL_EXTERNAL_S3_SECRET_KEY:-$ORIG_S3_SECRET_KEY}"
-    FULL_EXTERNAL_S3_REGION="${FULL_EXTERNAL_S3_REGION:-$ORIG_S3_REGION}"
-    FULL_EXTERNAL_S3_ENDPOINT="${FULL_EXTERNAL_S3_ENDPOINT:-$ORIG_S3_ENDPOINT}"
-    FULL_EXTERNAL_S3_PREFIX="${FULL_EXTERNAL_S3_PREFIX:-$ORIG_S3_PREFIX}"
-  fi
-
   FULL_EXTERNAL_S3_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}"
   FULL_EXTERNAL_S3_PREFIX="${FULL_EXTERNAL_S3_PREFIX:-rw-backup-full}"
 }
@@ -412,62 +354,8 @@ cleanup_local_custom_backups() {
     -delete 2>/dev/null || true
 }
 
-original_rw_backup_available() {
-  if command -v "$ORIGINAL_RW_BACKUP_BIN" >/dev/null 2>&1; then
-    return 0
-  fi
 
-  if [[ -x "$ORIGINAL_RW_BACKUP_SCRIPT" ]]; then
-    return 0
-  fi
 
-  return 1
-}
-
-install_original_rw_backup() {
-  if original_rw_backup_available; then
-    msg OK "Оригинальный rw-backup уже установлен"
-    return 0
-  fi
-
-  msg INFO "Устанавливаю оригинальный remnawave-backup-restore в ${INSTALL_DIR}"
-  mkdir -p "$INSTALL_DIR" "$BACKUP_DIR"
-
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh \
-      -o "$ORIGINAL_RW_BACKUP_SCRIPT"
-    chmod +x "$ORIGINAL_RW_BACKUP_SCRIPT"
-    ln -sf "$ORIGINAL_RW_BACKUP_SCRIPT" /usr/local/bin/rw-backup
-    msg OK "Оригинальный rw-backup установлен"
-    return 0
-  fi
-
-  msg ERR "curl не найден, автоустановка невозможна"
-  return 1
-}
-
-run_original_rw_backup_cmd() {
-  local action="$1"
-
-  if command -v "$ORIGINAL_RW_BACKUP_BIN" >/dev/null 2>&1; then
-    "$ORIGINAL_RW_BACKUP_BIN" "$action"
-    return $?
-  fi
-
-  if [[ -x "$ORIGINAL_RW_BACKUP_SCRIPT" ]]; then
-    bash "$ORIGINAL_RW_BACKUP_SCRIPT" "$action"
-    return $?
-  fi
-
-  if truthy "$FULL_AUTO_INSTALL_ORIGINAL_RW_BACKUP"; then
-    install_original_rw_backup || return 1
-    run_original_rw_backup_cmd "$action"
-    return $?
-  fi
-
-  msg ERR "Оригинальный rw-backup не найден"
-  return 1
-}
 
 local_panel_detected() {
   if docker ps -a --format '{{.Names}}' | grep -Fxq "remnawave-db"; then
@@ -491,23 +379,13 @@ run_panel_backup() {
     return 0
   fi
 
-  if truthy "$FULL_REQUIRE_ORIGINAL_RW_BACKUP" && ! original_rw_backup_available; then
-    msg ERR "FULL_REQUIRE_ORIGINAL_RW_BACKUP=true, но оригинальный rw-backup не установлен"
-    return 1
-  fi
-
   local before_latest
   local after_latest
 
   before_latest="$(latest_panel_backup || true)"
 
-  if [[ "${FULL_PANEL_ENGINE:-internal}" == "original" ]]; then
-    msg INFO "Panel backup: оригинальный rw-backup (FULL_PANEL_ENGINE=original)"
-    run_original_rw_backup_cmd "backup"
-  else
-    msg INFO "Panel backup: встроенный движок v5"
-    "${PANEL_SCRIPTS_DIR}/panel-backup.sh"
-  fi
+  msg INFO "Panel backup: встроенный движок"
+  "${PANEL_SCRIPTS_DIR}/panel-backup.sh"
 
   after_latest="$(latest_panel_backup || true)"
 
@@ -518,13 +396,7 @@ run_panel_backup() {
 
   msg OK "Panel backup найден: ${after_latest}"
 
-  if [[ "${FULL_PANEL_ENGINE:-internal}" == "original" ]] && truthy "$FULL_PANEL_EXTERNAL_S3_ENABLED"; then
-    # Оригинальный движок в S3-бэкенды v5 не выгружает — дублируем здесь.
-    if [[ "$after_latest" == "$before_latest" ]]; then
-      msg WARN "Latest panel backup не изменился, но будет продублирован во внешний S3"
-    fi
-    full_s3_upload "$after_latest" "panel" "remnawave-panel" || msg WARN "Не удалось загрузить panel backup во внешний S3"
-  fi
+  # Встроенный движок сам выгружает во все S3-бэкенды; здесь только ретенция.
   full_s3_retention_cleanup
 }
 
@@ -1374,7 +1246,6 @@ show_config_summary() {
   echo
   echo -e "${GREEN}${BOLD}rw-backup-full config summary${RESET}"
   echo
-  echo "ORIGINAL_CONFIG_FILE:               ${ORIGINAL_CONFIG_FILE}"
   echo "FULL_CONFIG_FILE:                   ${FULL_CONFIG_FILE}"
   echo "BACKUP_DIR:                         ${BACKUP_DIR}"
   echo
@@ -1397,9 +1268,6 @@ show_config_summary() {
   echo "FULL_TG_CHAT_ID:                    ${FULL_TG_CHAT_ID:-not set}"
   echo "FULL_TG_THREAD_ID:                  ${FULL_TG_MESSAGE_THREAD_ID:-not set}"
   echo
-  echo "ORIG_UPLOAD_METHOD:                 ${ORIG_UPLOAD_METHOD:-not set}"
-  echo "ORIG_S3_BUCKET:                     ${ORIG_S3_BUCKET:-not set}"
-  echo "ORIG_TG_CHAT_ID:                    ${ORIG_TG_CHAT_ID:-not set}"
   echo
 }
 
@@ -1570,6 +1438,44 @@ fleet_manifest() {
   printf '\n'
 }
 
+# Приводит systemd-таймеры в соответствие с FULL_COMPONENTS: лишние
+# останавливаются, нужные включаются. Юниты не удаляются — возврат
+# компонента не требует переустановки.
+apply_components() {
+  local changed=0
+  _tm() { # <компонент> <юнит>
+    if component_enabled "$1"; then
+      systemctl is-enabled "$2" >/dev/null 2>&1 || {
+        systemctl enable --now "$2" >/dev/null 2>&1 && { msg OK "включён ${2} (${1})"; changed=1; }
+      }
+    else
+      systemctl is-enabled "$2" >/dev/null 2>&1 && {
+        systemctl disable --now "$2" >/dev/null 2>&1 && { msg OK "выключен ${2} (компонент ${1} не используется)"; changed=1; }
+      }
+    fi
+  }
+
+  _tm panel-backup rw-backup-full.timer
+  component_enabled custom-backup && _tm custom-backup rw-backup-full.timer
+  _tm metrics      rw-metrics-export.timer
+  _tm config-track rw-config-track.timer
+  _tm sandbox      rw-sandbox-verify.timer
+
+  # WAL — таймеры на каждый инстанс
+  local f inst
+  if [[ -d "$INSTANCES_DIR" ]]; then
+    for f in "$INSTANCES_DIR"/*.env; do
+      [[ -e "$f" ]] || continue
+      inst="$(basename "$f" .env)"
+      _tm wal "rw-wal-ship@${inst}.timer"
+      _tm wal "rw-basebackup@${inst}.timer"
+    done
+  fi
+
+  (( changed )) || msg INFO "Изменений не потребовалось — состояние уже соответствует FULL_COMPONENTS"
+  systemctl daemon-reload 2>/dev/null || true
+}
+
 sandbox_timer_install() {
   local times="${SANDBOX_VERIFY_TIMES:-}" ih="${SANDBOX_VERIFY_INTERVAL_HOURS:-}" tz="${FULL_SCHEDULE_TZ:-}"
   local d="/etc/systemd/system/rw-sandbox-verify.timer.d"
@@ -1725,7 +1631,6 @@ Usage:
   rw-backup-full configure-telegram
   rw-backup-full install-timer
   rw-backup-full run-timer
-  rw-backup-full install-original
   rw-backup-full s3-cleanup
 
 WAL / PITR (v4):
@@ -1748,6 +1653,16 @@ WAL / PITR (v4):
   rw-backup-full status [--json]                статус сервера (JSON для веб-сервиса)
   rw-backup-full metrics-export                 выгрузка метрик сейчас
   rw-backup-full fleet-manifest                 JSON-манифест сервера для песочницы
+
+Трекер каталогов (конфиги, код, ресурсы):
+  rw-backup-full config-track [проект] [--full]  снимок сейчас
+  rw-backup-full config-track --list             что отслеживается
+  rw-backup-full config-restore <проект> --dest DIR [--at "дата"]
+  rw-backup-full verify-stack <проект>           проверка полного стека в изоляции
+
+Компоненты:
+  rw-backup-full components                      что включено на сервере
+  rw-backup-full apply-components                применить FULL_COMPONENTS к таймерам
   rw-backup-full verify-fleet [--server ID] [--backend N] [--depth D]
                                                 проверка парка: сервер × хранилище
   rw-backup-full fleet-pack pack|unpack         перенос настроек песочницы одним файлом
@@ -1782,7 +1697,6 @@ case "$cmd" in
   configure-telegram) configure_telegram ;;
   install-timer) configure_timer ;;
   run-timer) run_timer_mode ;;
-  install-original) install_original_rw_backup ;;
   s3-cleanup) full_s3_retention_cleanup ;;
   wal-enable)
     shift; exec "${WAL_SCRIPTS_DIR}/enable-archiving.sh" "$@" ;;
@@ -1819,6 +1733,19 @@ case "$cmd" in
     exec "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" ;;
   fleet-manifest)
     fleet_manifest ;;
+  config-track)
+    shift; exec "${TRACK_SCRIPTS_DIR}/config-track.sh" "$@" ;;
+  config-restore)
+    shift; exec "${TRACK_SCRIPTS_DIR}/config-restore.sh" "$@" ;;
+  verify-stack)
+    shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "$@" ;;
+  components)
+    echo "Включено на этом сервере: ${FULL_COMPONENTS:-(по умолчанию)}"
+    for c in panel-backup custom-backup wal config-track metrics sandbox web; do
+      component_enabled "$c" && echo "  ✅ $c" || echo "  ⬜ $c"
+    done ;;
+  apply-components)
+    apply_components ;;
   verify)
     shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-entry.sh" "$@" ;;
   verify-fleet)
