@@ -96,7 +96,10 @@ def get_server(sid: str) -> dict:
 
 def ssh_run(server: dict, argv: list[str], timeout: int = SSH_TIMEOUT,
             stdin_data: str | None = None) -> tuple[int, str, str]:
-    """SSH-вызов с白 списком команд. argv собирается нами, не пользователем."""
+    """SSH-вызов с белым списком команд. argv собирается нами, не пользователем."""
+    if server.get("type", "ssh") != "ssh":
+        raise HTTPException(501, "транспорт k8s зарезервирован под будущий переезд; "
+                                 "k8s-источники мониторятся через S3/песочницу/Grafana")
     dest = f"{server.get('user', 'root')}@{server['host']}"
     cmd = [
         "ssh", "-i", SSH_KEY,
@@ -128,6 +131,11 @@ class ServerIn(BaseModel):
     user: str = "root"
     port: int = 22
     note: str = ""
+    # Транспорт: "ssh" — текущие хосты; "k8s" зарезервирован под облачную
+    # инфраструктуру (kubeconfig-транспорт появится вместе с переездом;
+    # мониторинг k8s-источников уже сейчас идёт через общую S3-схему,
+    # песочницу и Grafana).
+    type: str = "ssh"
 
 
 class ConfigIn(BaseModel):
@@ -299,7 +307,8 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 <dialog id="addDlg"><h3>Добавить сервер</h3>
 <p class="mut">Перед добавлением установите на сервер публичный SSH-ключ сервиса
 (кнопка «SSH-ключ сервиса») в ~/.ssh/authorized_keys пользователя.</p>
-<div class="row"><input id="a_id" placeholder="id (например prod-panel-1)">
+<div class="row"><select id="a_type" style="max-width:120px"><option value="ssh">ssh-хост</option><option value="k8s">k8s (скоро)</option></select>
+<input id="a_id" placeholder="id (например prod-panel-1)">
 <input id="a_host" placeholder="host / IP"><input id="a_user" placeholder="user" value="root">
 <input id="a_port" placeholder="порт" value="22"><input id="a_note" placeholder="заметка"></div>
 <div class="row"><button class="pri" onclick="addServer()">Добавить</button>
@@ -331,7 +340,7 @@ async function refreshAll(){
   const box = $('servers'); box.innerHTML='';
   d.servers.forEach(s=>{
     const el = document.createElement('div'); el.className='card'; el.id='srv-'+s.id;
-    el.innerHTML = `<b>${s.id}</b> <span class="mut">${s.user}@${s.host}:${s.port}</span>
+    el.innerHTML = `<b>${s.id}</b> <span class="badge">${s.type||'ssh'}</span> <span class="mut">${s.user}@${s.host}:${s.port}</span>
       <span class="badge" id="st-${s.id}">…</span>
       <div class="mut">${s.note||''}</div><div id="info-${s.id}" class="mut">загрузка статуса…</div>
       <div class="row">
@@ -368,7 +377,8 @@ async function act(sid,a){
 }
 async function addServer(){
   const s = {id:$('a_id').value, host:$('a_host').value, user:$('a_user').value,
-    port:+$('a_port').value||22, note:$('a_note').value};
+    port:+$('a_port').value||22, note:$('a_note').value, type:$('a_type').value};
+  if(s.type==='k8s'){ log('ℹ k8s-транспорт появится вместе с переездом; пока добавляйте ssh-хосты'); return; }
   const r = await api('POST','/api/servers', s);
   if(r.ok){ addDlg.close(); refreshAll(); log('✅ Сервер добавлен: '+s.id); }
 }

@@ -49,7 +49,11 @@ if ! declare -F truthy >/dev/null 2>&1; then
   }
 fi
 
-wal_hostname() { hostname -s 2>/dev/null || hostname; }
+# Совпадает с rw_source_id из s3-multi: в контейнере/k8s задаётся RW_SOURCE_ID.
+wal_hostname() {
+  if [[ -n "${RW_SOURCE_ID:-}" ]]; then printf '%s' "$RW_SOURCE_ID"
+  else hostname -s 2>/dev/null || hostname; fi
+}
 
 wal_ts() { date -u +%Y-%m-%d_%H_%M_%S; }
 

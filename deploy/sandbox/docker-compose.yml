@@ -1,0 +1,32 @@
+# Песочница + веб-сервис управления парком — тот же образ, две роли.
+services:
+  rw-sandbox:
+    image: rw-backup-full:5.1.0
+    container_name: rw-sandbox
+    restart: unless-stopped
+    environment:
+      RW_ROLE: sandbox
+      RW_SOURCE_ID: ${RW_SOURCE_ID:-sandbox}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock          # временные postgres для verify
+      - /opt/rw-backup-restore:/opt/rw-backup-restore
+      - /var/lib/rw-wal:/var/lib/rw-wal                    # рабочая зона PITR-проверок
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector
+    cpus: "2"
+    mem_limit: 2g
+
+  rw-web:
+    image: rw-backup-full:5.1.0
+    container_name: rw-web
+    restart: unless-stopped
+    command: ["web"]
+    environment:
+      WEB_TOKEN: ${WEB_TOKEN:?задайте в .env}
+      RW_WEB_HOST: 0.0.0.0        # наружу порт всё равно только на 127.0.0.1 (ports ниже)
+      RW_WEB_PORT: "8787"
+    ports:
+      - "127.0.0.1:8787:8787"     # доступ только с localhost; наружу — VPN/reverse-proxy
+    volumes:
+      - /opt/rw-backup-restore/web-data:/opt/rw-backup-restore/web-data   # servers.json + SSH-ключ
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro

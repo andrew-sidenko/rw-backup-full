@@ -199,8 +199,6 @@ EOF_M
 # --------------------------------------------------------------------------
 verify_logical_archive() {
   local category="$1"   # panel | custom-bot
-  local t0 t1
-  t0="$(date +%s)"
 
   # Первый включённый бэкенд с этой категорией.
   local backend="" n
@@ -214,24 +212,45 @@ verify_logical_archive() {
     return
   fi
 
-  # Свежий архив категории по всем хостам.
-  local latest_key
-  latest_key="$(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/${category}/" --recursive 2>/dev/null \
-    | awk '{print $1" "$2" "$4}' | sort | tail -n1 | awk '{print $3}')"
-
-  if [[ -z "$latest_key" ]]; then
-    add_result fail "Логический ${category}: в S3 нет архивов"
+  # Источники в схеме <prefix>/<category>/<source>/ — текущие хосты и,
+  # в будущем, k8s-CronJob'ы, пишущие тем же образом в ту же схему.
+  local sources
+  sources="$(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/${category}/" 2>/dev/null \
+    | awk '/PRE/{print $2}' | tr -d '/')"
+  if [[ -z "$sources" ]]; then
+    add_result fail "Логический ${category}: в S3 нет источников"
     return
   fi
 
-  local wd="${SANDBOX_WORK}/run_$$/logical_${category}"
+  local src
+  for src in $sources; do
+    verify_logical_one "$category" "$src"
+  done
+}
+
+verify_logical_one() {
+  local category="$1" src="$2"
+  local t0 t1
+  t0="$(date +%s)"
+
+  # Свежайший архив этого источника.
+  local latest_key
+  latest_key="$(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/${category}/${src}/" --recursive 2>/dev/null \
+    | awk '{print $1" "$2" "$4}' | sort | tail -n1 | awk '{print $3}')"
+
+  if [[ -z "$latest_key" ]]; then
+    add_result fail "Логический ${category}/${src}: нет архивов"
+    return
+  fi
+
+  local wd="${SANDBOX_WORK}/run_$$/logical_${category}_${src}"
   mkdir -p "$wd"
   local fname; fname="$(basename "$latest_key")"
 
   msg INFO "=== Логическая проверка: ${fname} ==="
 
   if ! s3m_aws s3 cp "s3://${B_BUCKET}/${latest_key}" "${wd}/${fname}" --only-show-errors; then
-    add_result fail "Логический ${category}: не скачался ${fname}"
+    add_result fail "Логический ${category}/${src}: не скачался ${fname}"
     return
   fi
 
@@ -241,26 +260,26 @@ verify_logical_archive() {
   if [[ "$fname" == *.age ]]; then
     if [[ -n "${SANDBOX_AGE_IDENTITY:-}" && -f "${SANDBOX_AGE_IDENTITY:-}" ]]; then
       age -d -i "$SANDBOX_AGE_IDENTITY" < "${wd}/${fname}" > "${wd}/${fname%.age}" || {
-        add_result fail "Логический ${category}: ошибка расшифровки ${fname}"; return; }
+        add_result fail "Логический ${category}/${src}: ошибка расшифровки ${fname}"; return; }
       fname="${fname%.age}"
     else
-      add_result fail "Логический ${category}: ${fname} зашифрован, SANDBOX_AGE_IDENTITY не задан"
+      add_result fail "Логический ${category}/${src}: ${fname} зашифрован, SANDBOX_AGE_IDENTITY не задан"
       return
     fi
   fi
 
   tar -xzf "${wd}/${fname}" -C "$work" 2>/dev/null || {
-    add_result fail "Логический ${category}: ${fname} не распаковался"; return; }
+    add_result fail "Логический ${category}/${src}: ${fname} не распаковался"; return; }
 
   # Дамп: у панели dump_*.sql.gz, у бота postgres_dump.sql.gz
   dump="$(find "$work" -maxdepth 1 \( -name 'dump_*.sql.gz' -o -name 'postgres_dump.sql.gz' \) | head -n1)"
-  [[ -n "$dump" ]] || { add_result fail "Логический ${category}: в ${fname} нет SQL-дампа"; return; }
+  [[ -n "$dump" ]] || { add_result fail "Логический ${category}/${src}: в ${fname} нет SQL-дампа"; return; }
 
-  gzip -t "$dump" 2>/dev/null || { add_result fail "Логический ${category}: дамп в ${fname} повреждён (gzip)"; return; }
+  gzip -t "$dump" 2>/dev/null || { add_result fail "Логический ${category}/${src}: дамп повреждён (gzip)"; return; }
 
   # Чистый контейнер под заливку дампа.
   local pgimg="postgres:${SANDBOX_PG_VERSION:-17}-alpine"
-  local c="rw-sandbox-logical-$$"
+  local c="rw-sandbox-logical-$$-${src//[^a-zA-Z0-9]/-}"
   docker run -d --rm --name "$c" --label "rw-sandbox-session=$$" \
     -e POSTGRES_PASSWORD=sandbox -e POSTGRES_HOST_AUTH_METHOD=trust \
     "$pgimg" >/dev/null
@@ -270,7 +289,7 @@ verify_logical_archive() {
     docker exec "$c" pg_isready -U postgres >/dev/null 2>&1 && { up=true; break; }
     sleep 1
   done
-  [[ "$up" == "true" ]] || { add_result fail "Логический ${category}: sandbox-postgres не поднялся"; return; }
+  [[ "$up" == "true" ]] || { add_result fail "Логический ${category}/${src}: sandbox-postgres не поднялся"; return; }
   sleep 2
 
   # Заливка. ON_ERROR_STOP=0: dumpall содержит DROP ROLE postgres и подобное,
@@ -305,19 +324,19 @@ verify_logical_archive() {
 
   local ok=1
   if [[ "${tables:-0}" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
-    add_result ok "Логический ${category}: $(basename "$latest_key") — таблиц=${tables}, строк≈${user_rows}, sql-ошибок=${errs}, $((t1 - t0))s"
+    add_result ok "Логический ${category}/${src}: $(basename "$latest_key") — таблиц=${tables}, строк≈${user_rows}, sql-ошибок=${errs}, $((t1 - t0))s"
   else
     ok=0
-    add_result fail "Логический ${category}: $(basename "$latest_key") — после restore нет пользовательских таблиц"
+    add_result fail "Логический ${category}/${src}: после restore нет пользовательских таблиц"
   fi
 
-  wal_metric_write "rw_sandbox_logical_${category//-/_}" <<EOF_M
+  wal_metric_write "rw_sandbox_logical_${category//-/_}_${src//[^a-zA-Z0-9]/_}" <<EOF_M
 # HELP rw_sandbox_logical_last_ok Результат проверки логического архива (1 — успех).
 # TYPE rw_sandbox_logical_last_ok gauge
-rw_sandbox_logical_last_ok{category="${category}"} ${ok}
+rw_sandbox_logical_last_ok{category="${category}",source="${src}"} ${ok}
 # HELP rw_sandbox_logical_last_timestamp_seconds Время последней проверки.
 # TYPE rw_sandbox_logical_last_timestamp_seconds gauge
-rw_sandbox_logical_last_timestamp_seconds{category="${category}"} $(date +%s)
+rw_sandbox_logical_last_timestamp_seconds{category="${category}",source="${src}"} $(date +%s)
 EOF_M
 }
 

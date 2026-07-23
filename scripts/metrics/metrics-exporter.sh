@@ -25,6 +25,7 @@ wal_lock "metrics-exporter" || exit 0
 
 BACKUP_DIR="${BACKUP_DIR:-${INSTALL_DIR}/backup}"
 HOST="$(wal_hostname)"
+SRC="$(rw_source_id)"
 
 out=""
 emit() { out+="$1"$'\n'; }
@@ -32,6 +33,9 @@ emit() { out+="$1"$'\n'; }
 emit "# HELP rw_exporter_last_run_timestamp_seconds Время последнего прогона экспортера."
 emit "# TYPE rw_exporter_last_run_timestamp_seconds gauge"
 emit "rw_exporter_last_run_timestamp_seconds $(date +%s)"
+emit "# HELP rw_source_info Идентификатор источника бэкапов (host-* или k8s-*)."
+emit "# TYPE rw_source_info gauge"
+emit "rw_source_info{source=\"${SRC}\",kind=\"$([[ "$SRC" == k8s-* ]] && echo k8s || echo host)\"} 1"
 
 # --- Диски ---
 emit "# HELP rw_disk_free_bytes Свободное место на разделе (по пути назначения)."

@@ -19,6 +19,20 @@ __S3M_LOADED=1
 
 S3D_DIR="${S3D_DIR:-${INSTALL_DIR:-/opt/rw-backup-restore}/s3.d}"
 
+# Идентификатор ИСТОЧНИКА бэкапов в схеме бакета:
+#   <prefix>/<category>/<source>/...
+# По умолчанию — hostname (полная совместимость с существующими данными).
+# В контейнере/k8s задаётся явно: RW_SOURCE_ID=host-panel1 | k8s-prod-remnawave.
+# Единая схема позволяет песочнице/дашборду видеть старую и новую
+# инфраструктуру одинаково весь переходный период.
+rw_source_id() {
+  if [[ -n "${RW_SOURCE_ID:-}" ]]; then
+    printf '%s' "$RW_SOURCE_ID"
+  else
+    hostname -s 2>/dev/null || hostname
+  fi
+}
+
 s3m_backends() {
   local f any=0
   if [[ -d "$S3D_DIR" ]]; then
@@ -88,9 +102,9 @@ s3m_category_enabled() {  # <category: panel|custom-bot|wal>
 }
 
 # Ключ логических архивов: <prefix>/<category>/<host>/<file>
-s3m_logical_key() { printf '%s/%s/%s/%s' "$B_PREFIX" "$1" "$(hostname -s 2>/dev/null || hostname)" "$2"; }
+s3m_logical_key() { printf '%s/%s/%s/%s' "$B_PREFIX" "$1" "$(rw_source_id)" "$2"; }
 # База WAL-слоя: <prefix>/wal/<host>/<instance>
-s3m_wal_base()    { printf '%s/wal/%s/%s' "$B_PREFIX" "$(hostname -s 2>/dev/null || hostname)" "$1"; }
+s3m_wal_base()    { printf '%s/wal/%s/%s' "$B_PREFIX" "$(rw_source_id)" "$1"; }
 
 # Загрузка файла во ВСЕ включённые бэкенды категории.
 # Возврат: 0 если хотя бы один успех ИЛИ нет ни одного включённого; 1 если все упали.
@@ -144,7 +158,7 @@ s3m_retention_one() {  # <backend> <category> <days>
   local name="$1" category="$2" days="$3"
   [[ "$days" =~ ^[0-9]+$ ]] || return 0
   local host prefix cutoff now keep_min
-  host="$(hostname -s 2>/dev/null || hostname)"
+  host="$(rw_source_id)"
   prefix="${B_PREFIX}/${category}/${host}/"
   now="$(date +%s)"; cutoff=$(( now - days*86400 ))
   keep_min="${B_RETENTION_MIN_KEEP:-3}"

@@ -1,0 +1,29 @@
+# Агент rw-backup-full на прод-хосте (контейнерный режим вместо systemd-таймеров).
+#
+# КРИТИЧНО ПРО ПУТИ: агент управляет «соседними» контейнерами через хостовый
+# docker.sock. Временные контейнеры восстановления и монтирования, которые он
+# создаёт, разрешаются ХОСТОВЫМ демоном — поэтому все рабочие каталоги обязаны
+# быть смонтированы в агент ПО ТЕМ ЖЕ ПУТЯМ, что и на хосте (slovo-в-слово).
+# Не переименовывайте левые части двоеточий.
+services:
+  rw-backup-agent:
+    image: rw-backup-full:5.1.0
+    container_name: rw-backup-agent
+    restart: unless-stopped
+    environment:
+      RW_ROLE: host-agent
+      # Идентификатор источника в S3-схеме. По умолчанию hostname контейнера,
+      # поэтому задаём явно ИМЕНЕМ ХОСТА — чтобы пути в бакетах не изменились
+      # относительно скриптовой установки (обратная совместимость).
+      RW_SOURCE_ID: ${RW_SOURCE_ID:?задайте в .env, напр. имя хоста}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock          # управление контейнерами БД
+      - /opt/rw-backup-restore:/opt/rw-backup-restore      # конфиги, бэкапы, s3.d, instances.d
+      - /var/lib/rw-wal:/var/lib/rw-wal                    # спул/архив WAL (те же пути!)
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector
+      - /opt/remnawave:/opt/remnawave                      # каталог панели (panel-backup/restore)
+      - /home:/home                                        # проекты ботов (custom-backup)
+    # Ресурсные рамки, чтобы бэкапы не толкались с продом:
+    cpus: "1.5"
+    mem_limit: 1g
