@@ -218,41 +218,36 @@ wal_enc_ext() {
 }
 
 # --------------------------------------------------------------------------
-# S3
+# S3: мульти-бэкенды (s3.d/*.env) через lib/s3-multi.sh
 # --------------------------------------------------------------------------
+# shellcheck source=./s3-multi.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/s3-multi.sh"
 
+# Бэкенды, в которые включена категория WAL.
+wal_s3_backends() {
+  local n
+  for n in $(s3m_backends); do
+    s3m_load "$n" 2>/dev/null || continue
+    truthy "$B_ENABLED" || continue
+    s3m_category_enabled wal || continue
+    echo "$n"
+  done
+}
+
+# Есть ли хотя бы один WAL-бэкенд.
 wal_s3_ready() {
-  [[ -n "${FULL_EXTERNAL_S3_BUCKET:-}" ]] &&
-  [[ -n "${FULL_EXTERNAL_S3_ACCESS_KEY:-}" ]] &&
-  [[ -n "${FULL_EXTERNAL_S3_SECRET_KEY:-}" ]] &&
-  command -v aws >/dev/null 2>&1
+  command -v aws >/dev/null 2>&1 || return 1
+  [[ -n "$(wal_s3_backends | head -n1)" ]]
 }
 
-wal_s3_endpoint_args() {
-  if [[ -n "${FULL_EXTERNAL_S3_ENDPOINT:-}" ]]; then
-    printf '%s\n%s\n' "--endpoint-url" "$FULL_EXTERNAL_S3_ENDPOINT"
-  fi
-}
+# Совместимый интерфейс для скриптов, работающих с ОДНИМ выбранным бэкендом:
+# wal_s3_select <name> загружает его; wal_aws/wal_s3_uri действуют в его контексте.
+wal_s3_select() { s3m_load "$1"; }
 
-wal_aws() {
-  local -a ep=()
-  mapfile -t ep < <(wal_s3_endpoint_args)
-  AWS_ACCESS_KEY_ID="$FULL_EXTERNAL_S3_ACCESS_KEY" \
-  AWS_SECRET_ACCESS_KEY="$FULL_EXTERNAL_S3_SECRET_KEY" \
-  AWS_DEFAULT_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}" \
-  AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}" \
-  aws "$@" "${ep[@]}"
-}
-
-# Базовый префикс инстанса в S3.
-wal_s3_base() {
-  local prefix="${FULL_EXTERNAL_S3_PREFIX:-rw-backup-full}"
-  prefix="${prefix#/}"; prefix="${prefix%/}"
-  printf '%s/wal/%s/%s' "$prefix" "$(wal_hostname)" "$INST_NAME"
-}
+wal_aws() { s3m_aws "$@"; }
 
 wal_s3_uri() {
-  printf 's3://%s/%s/%s' "$FULL_EXTERNAL_S3_BUCKET" "$(wal_s3_base)" "$1"
+  printf 's3://%s/%s/%s' "$B_BUCKET" "$(s3m_wal_base "$INST_NAME")" "$1"
 }
 
 # --------------------------------------------------------------------------
@@ -305,6 +300,43 @@ wal_load_full_config() {
   fi
   FULL_EXTERNAL_S3_REGION="${FULL_EXTERNAL_S3_REGION:-us-east-1}"
   FULL_EXTERNAL_S3_PREFIX="${FULL_EXTERNAL_S3_PREFIX:-rw-backup-full}"
+}
+
+# --------------------------------------------------------------------------
+# Расписания (интервал ИЛИ список конкретных времён)
+# --------------------------------------------------------------------------
+
+# wal_parse_times "03:00, 15:30 21:45:30" -> "03:00:00 15:30:00 21:45:30"
+# Разделители: пробел и/или запятая. Формат: HH:MM или HH:MM:SS (24ч).
+# Количество значений не ограничено. Код возврата 1 + сообщение при ошибке.
+wal_parse_times() {
+  local raw="$1" out="" t hh mm ss
+  raw="${raw//,/ }"
+  for t in $raw; do
+    if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{2})(:([0-9]{2}))?$ ]]; then
+      hh="${BASH_REMATCH[1]}"; mm="${BASH_REMATCH[2]}"; ss="${BASH_REMATCH[4]:-00}"
+      if (( 10#$hh > 23 || 10#$mm > 59 || 10#$ss > 59 )); then
+        msg ERR "Некорректное время: ${t} (часы 0-23, минуты/секунды 0-59)"
+        return 1
+      fi
+      out+="$(printf '%02d:%s:%s' "$((10#$hh))" "$mm" "$ss") "
+    else
+      msg ERR "Некорректный формат времени: '${t}' (ожидается HH:MM или HH:MM:SS)"
+      return 1
+    fi
+  done
+  [[ -n "$out" ]] || { msg ERR "Пустой список времён"; return 1; }
+  printf '%s\n' "${out% }"
+}
+
+# wal_render_calendar_lines "03:00:00 15:30:00" ["UTC"|"Europe/Amsterdam"]
+# -> строки OnCalendar= для drop-in (по одной на каждое время).
+wal_render_calendar_lines() {
+  local times="$1" tz="${2:-}" t suffix=""
+  [[ -n "$tz" ]] && suffix=" ${tz}"
+  for t in $times; do
+    printf 'OnCalendar=*-*-* %s%s\n' "$t" "$suffix"
+  done
 }
 
 # --------------------------------------------------------------------------

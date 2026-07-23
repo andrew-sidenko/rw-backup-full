@@ -202,12 +202,21 @@ verify_logical_archive() {
   local t0 t1
   t0="$(date +%s)"
 
-  local prefix="${FULL_EXTERNAL_S3_PREFIX:-rw-backup-full}"
-  prefix="${prefix#/}"; prefix="${prefix%/}"
+  # Первый включённый бэкенд с этой категорией.
+  local backend="" n
+  for n in $(s3m_backends); do
+    s3m_load "$n" 2>/dev/null || continue
+    truthy "$B_ENABLED" || continue
+    s3m_category_enabled "$category" && { backend="$n"; break; }
+  done
+  if [[ -z "$backend" ]]; then
+    add_result fail "Логический ${category}: нет S3-бэкенда с этой категорией"
+    return
+  fi
 
   # Свежий архив категории по всем хостам.
   local latest_key
-  latest_key="$(wal_aws s3 ls "s3://${FULL_EXTERNAL_S3_BUCKET}/${prefix}/${category}/" --recursive 2>/dev/null \
+  latest_key="$(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/${category}/" --recursive 2>/dev/null \
     | awk '{print $1" "$2" "$4}' | sort | tail -n1 | awk '{print $3}')"
 
   if [[ -z "$latest_key" ]]; then
@@ -221,7 +230,7 @@ verify_logical_archive() {
 
   msg INFO "=== Логическая проверка: ${fname} ==="
 
-  if ! wal_aws s3 cp "s3://${FULL_EXTERNAL_S3_BUCKET}/${latest_key}" "${wd}/${fname}" --only-show-errors; then
+  if ! s3m_aws s3 cp "s3://${B_BUCKET}/${latest_key}" "${wd}/${fname}" --only-show-errors; then
     add_result fail "Логический ${category}: не скачался ${fname}"
     return
   fi
@@ -315,8 +324,8 @@ EOF_M
 # --------------------------------------------------------------------------
 # Основной цикл
 # --------------------------------------------------------------------------
-if [[ "$FROM" == "s3" ]] && ! wal_s3_ready; then
-  msg ERR "S3 не настроен (FULL_EXTERNAL_S3_* в ${FULL_CONFIG_FILE}) — песочнице нечего проверять"
+if [[ "$FROM" == "s3" ]] && [[ -z "$(s3m_backends | head -n1)" ]]; then
+  msg ERR "Ни одного S3-бэкенда (s3.d/*.env или FULL_EXTERNAL_S3_*) — песочнице нечего проверять"
   exit 1
 fi
 

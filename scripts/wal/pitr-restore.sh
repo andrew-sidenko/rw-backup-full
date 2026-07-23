@@ -9,7 +9,7 @@
 #   pitr-restore.sh panel --target-time "2026-07-22 09:30:00+00"
 #
 #   # взять данные из S3, конкретный базовый бэкап, зашифрованные архивы
-#   pitr-restore.sh bot_oneok --from s3 --backup base_2026-07-21_03_00_00_0000000100000000000000A7 \
+#   pitr-restore.sh bot_oneok --from s3 [--backend NAME] --backup base_2026-07-21_03_00_00_0000000100000000000000A7 \
 #       --age-identity /root/age-restore.key
 #
 #   # заменить рабочую БД (деструктивно, с подтверждением)
@@ -27,6 +27,7 @@ source "${SCRIPT_DIR}/../lib/wal-lib.sh"
 
 INSTANCE=""
 SOURCE="local"
+S3_BACKEND=""
 BACKUP_NAME=""
 TARGET_MODE="latest"
 TARGET_TIME=""
@@ -51,6 +52,7 @@ shift
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from)          SOURCE="$2"; shift 2 ;;
+    --backend)       S3_BACKEND="$2"; shift 2 ;;
     --backup)        BACKUP_NAME="$2"; shift 2 ;;
     --target)        TARGET_MODE="$2"; shift 2 ;;
     --target-time)   TARGET_MODE="time"; TARGET_TIME="$2"; shift 2 ;;
@@ -113,7 +115,12 @@ if [[ "$SOURCE" == "local" ]]; then
   cp "${INST_BASEBACKUP_DIR}/${BACKUP_NAME}.meta" "$META_FILE"
   BACKUP_SRC="local"
 else
-  wal_s3_ready || { msg ERR "S3 не настроен"; exit 1; }
+  wal_s3_ready || { msg ERR "S3-бэкенды с WAL не настроены (s3.d/)"; exit 1; }
+  if [[ -z "$S3_BACKEND" ]]; then
+    S3_BACKEND="$(wal_s3_backends | head -n1)"
+    msg INFO "Бэкенд S3 не указан (--backend), использую: ${S3_BACKEND}"
+  fi
+  wal_s3_select "$S3_BACKEND" || { msg ERR "Бэкенд ${S3_BACKEND} недоступен"; exit 1; }
   if [[ -z "$BACKUP_NAME" ]]; then
     BACKUP_NAME="$(wal_aws s3 ls "$(wal_s3_uri 'basebackup/')" 2>/dev/null \
       | awk '{print $4}' | grep -E '^base_.*\.meta$' | sort -r | head -n1 | sed 's/\.meta$//')"

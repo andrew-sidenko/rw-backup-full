@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# install-web.sh — установка веб-сервиса управления парком (на песочнице).
+# Идемпотентен; каждое системное действие — с подтверждением.
+set -euo pipefail
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="/opt/rw-backup-restore"
+WEB_DIR="${INSTALL_DIR}/web"
+DATA_DIR="${INSTALL_DIR}/web-data"
+ENV_FILE="/etc/rw-backup-web.env"
+
+ask() { local a; echo; echo -e "\e[33m$1\e[0m"; read -r -p "Продолжить? [y/N]: " a; [[ "$a" == y || "$a" == Y ]]; }
+[[ "$(id -u)" == 0 ]] || { echo "Нужен root"; exit 1; }
+command -v python3 >/dev/null || { echo "Нужен python3"; exit 1; }
+
+echo "Будет установлено:"
+echo "  - ${WEB_DIR}/app.py + venv (${WEB_DIR}/venv, pip: fastapi uvicorn pydantic)"
+echo "  - SSH-ключ сервиса: ${DATA_DIR}/id_ed25519 (если нет)"
+echo "  - юнит rw-backup-web.service (слушает 127.0.0.1:8787)"
+echo "  - файл окружения ${ENV_FILE} (токен доступа)"
+ask "Установить веб-сервис?" || exit 0
+
+mkdir -p "$WEB_DIR" "$DATA_DIR"
+install -m 0644 "${SRC_DIR}/app.py" "${WEB_DIR}/app.py"
+
+if [[ ! -d "${WEB_DIR}/venv" ]]; then
+  ask "Создать venv и установить зависимости из PyPI (fastapi, uvicorn, pydantic)?" || exit 1
+  python3 -m venv "${WEB_DIR}/venv"
+fi
+"${WEB_DIR}/venv/bin/pip" install -q --upgrade fastapi uvicorn pydantic
+
+if [[ ! -f "${DATA_DIR}/id_ed25519" ]]; then
+  ssh-keygen -t ed25519 -N "" -C "rw-backup-web" -f "${DATA_DIR}/id_ed25519" >/dev/null
+  echo "[OK] Создан SSH-ключ сервиса. Публичный ключ:"
+  cat "${DATA_DIR}/id_ed25519.pub"
+  echo "     Добавьте его в ~/.ssh/authorized_keys на каждом управляемом сервере."
+fi
+chmod 600 "${DATA_DIR}/id_ed25519"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  tok="$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)"
+  cat > "$ENV_FILE" <<EOF_ENV
+WEB_TOKEN=${tok}
+RW_WEB_HOST=127.0.0.1
+RW_WEB_PORT=8787
+EOF_ENV
+  chmod 600 "$ENV_FILE"
+  echo "[OK] Токен доступа создан в ${ENV_FILE}:"
+  echo "     WEB_TOKEN=${tok}"
+else
+  echo "[OK] ${ENV_FILE} уже существует — не изменён"
+fi
+
+unit=/etc/systemd/system/rw-backup-web.service
+if [[ -f "$unit" ]]; then
+  echo "[i] Юнит уже существует и будет перезаписан новой версией."
+fi
+ask "Записать юнит ${unit} и выполнить daemon-reload + enable --now (перезапуск сервиса)?" || exit 0
+cat > "$unit" <<EOF_U
+[Unit]
+Description=rw-backup-full fleet web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=${ENV_FILE}
+ExecStart=${WEB_DIR}/venv/bin/python ${WEB_DIR}/app.py
+Restart=on-failure
+User=root
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=${DATA_DIR} /var/lib/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF_U
+systemctl daemon-reload
+systemctl enable --now rw-backup-web.service
+echo
+echo "Готово: http://127.0.0.1:8787 (токен в ${ENV_FILE})."
+echo "ВАЖНО: наружу — только через reverse-proxy с TLS или VPN. Порт наружу не открывать."

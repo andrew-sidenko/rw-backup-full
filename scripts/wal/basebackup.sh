@@ -157,21 +157,31 @@ msg OK "[${INSTANCE}] базовый бэкап готов: $(basename "$out_fil
 # Выгрузка в S3
 # --------------------------------------------------------------------------
 s3_ok="skipped"
-if [[ "$NO_S3" != "--no-s3" ]] && wal_s3_ready && truthy "${FULL_WAL_S3_ENABLED:-true}"; then
-  s3_ok="failed"
-  for attempt in 1 2 3; do
-    if wal_aws s3 cp "$out_file" "$(wal_s3_uri "basebackup/$(basename "$out_file")")" --only-show-errors 2>/dev/null &&
-       wal_aws s3 cp "$meta_file" "$(wal_s3_uri "basebackup/$(basename "$meta_file")")" --only-show-errors 2>/dev/null; then
-      s3_ok="ok"
-      break
+s3_ok_count=0
+s3_total=0
+if [[ "$NO_S3" != "--no-s3" ]] && wal_s3_ready; then
+  while IFS= read -r backend; do
+    [[ -n "$backend" ]] || continue
+    s3_total=$((s3_total + 1))
+    wal_s3_select "$backend" || continue
+    b_ok=false
+    for attempt in 1 2 3; do
+      if wal_aws s3 cp "$out_file" "$(wal_s3_uri "basebackup/$(basename "$out_file")")" --only-show-errors 2>/dev/null &&
+         wal_aws s3 cp "$meta_file" "$(wal_s3_uri "basebackup/$(basename "$meta_file")")" --only-show-errors 2>/dev/null; then
+        b_ok=true
+        break
+      fi
+      sleep $((attempt * 5))
+    done
+    if [[ "$b_ok" == "true" ]]; then
+      s3_ok_count=$((s3_ok_count + 1))
+      msg OK "[${INSTANCE}] S3[${backend}]: $(wal_s3_uri "basebackup/$(basename "$out_file")")"
+    else
+      msg WARN "[${INSTANCE}] S3[${backend}]: выгрузка базового бэкапа не удалась"
     fi
-    sleep $((attempt * 5))
-  done
-
-  if [[ "$s3_ok" == "ok" ]]; then
-    msg OK "[${INSTANCE}] выгружено в S3: $(wal_s3_uri "basebackup/$(basename "$out_file")")"
-  else
-    msg WARN "[${INSTANCE}] выгрузка базового бэкапа в S3 не удалась"
+  done < <(wal_s3_backends)
+  if (( s3_total > 0 )); then
+    s3_ok="${s3_ok_count}/${s3_total}"
   fi
 fi
 
@@ -190,7 +200,7 @@ rw_basebackup_size_bytes{instance="${INSTANCE}"} ${size_bytes}
 rw_basebackup_duration_seconds{instance="${INSTANCE}"} ${duration}
 # HELP rw_basebackup_s3_ok Успешность выгрузки в S3 (1 — да).
 # TYPE rw_basebackup_s3_ok gauge
-rw_basebackup_s3_ok{instance="${INSTANCE}"} $([[ "$s3_ok" == "ok" ]] && echo 1 || echo 0)
+rw_basebackup_s3_ok{instance="${INSTANCE}"} $(( s3_total > 0 && s3_ok_count == s3_total ? 1 : ( s3_total == 0 ? 1 : 0 ) ))
 EOF_M
 
 wal_notify "✅ Базовый бэкап PostgreSQL

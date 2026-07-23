@@ -10,6 +10,15 @@ ORIGINAL_RW_BACKUP_SCRIPT="${ORIGINAL_RW_BACKUP_SCRIPT:-${INSTALL_DIR}/backup-re
 WAL_SCRIPTS_DIR="${WAL_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/wal}"
 SANDBOX_SCRIPTS_DIR="${SANDBOX_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/sandbox}"
 INSTANCES_DIR="${INSTANCES_DIR:-${INSTALL_DIR}/instances.d}"
+PANEL_SCRIPTS_DIR="${PANEL_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/panel}"
+METRICS_SCRIPTS_DIR="${METRICS_SCRIPTS_DIR:-${INSTALL_DIR}/scripts/metrics}"
+if [[ -f "${INSTALL_DIR}/scripts/lib/s3-multi.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${INSTALL_DIR}/scripts/lib/s3-multi.sh"
+elif [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib/s3-multi.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/s3-multi.sh"
+fi
 
 RED=$'\e[31m'
 GREEN=$'\e[32m'
@@ -73,6 +82,24 @@ pause() {
   read -r -p "Enter..." _ || true
 }
 
+# parse_times_list "03:00, 15:30" -> "03:00:00 15:30:00"; код 1 при ошибке.
+parse_times_list() {
+  local raw="$1" out="" t hh mm ss
+  raw="${raw//,/ }"
+  for t in $raw; do
+    if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{2})(:([0-9]{2}))?$ ]]; then
+      hh="${BASH_REMATCH[1]}"; mm="${BASH_REMATCH[2]}"; ss="${BASH_REMATCH[4]:-00}"
+      (( 10#$hh > 23 || 10#$mm > 59 || 10#$ss > 59 )) && { msg ERR "Некорректное время: ${t}"; return 1; }
+      out+="$(printf '%02d:%s:%s' "$((10#$hh))" "$mm" "$ss") "
+    else
+      msg ERR "Некорректный формат времени: '${t}' (HH:MM или HH:MM:SS)"
+      return 1
+    fi
+  done
+  [[ -n "$out" ]] || { msg ERR "Пустой список времён"; return 1; }
+  printf '%s\n' "${out% }"
+}
+
 capture_original_vars() {
   ORIG_TG_BOT_TOKEN="${TG_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN:-${BOT_TOKEN:-}}}"
   ORIG_TG_CHAT_ID="${TG_CHAT_ID:-${TELEGRAM_CHAT_ID:-${CHAT_ID:-}}}"
@@ -109,6 +136,8 @@ load_config() {
   FULL_LOCAL_RETENTION_DAYS="${FULL_LOCAL_RETENTION_DAYS:-3}"
   FULL_EXTERNAL_S3_RETENTION_DAYS="${FULL_EXTERNAL_S3_RETENTION_DAYS:-10}"
   FULL_TIMER_INTERVAL_HOURS="${FULL_TIMER_INTERVAL_HOURS:-3}"
+  FULL_TIMER_TIMES="${FULL_TIMER_TIMES:-}"
+  FULL_SCHEDULE_TZ="${FULL_SCHEDULE_TZ:-}"
   FULL_TIMER_MODE="${FULL_TIMER_MODE:-backup-all}"
   FULL_AUTO_INSTALL_ORIGINAL_RW_BACKUP="${FULL_AUTO_INSTALL_ORIGINAL_RW_BACKUP:-false}"
   FULL_REQUIRE_ORIGINAL_RW_BACKUP="${FULL_REQUIRE_ORIGINAL_RW_BACKUP:-false}"
@@ -140,6 +169,11 @@ load_config() {
 }
 
 ensure_tools() {
+  # Машинный статус не требует docker: веб-сервис должен получать JSON
+  # даже с сервера, где docker временно недоступен.
+  if [[ "${1:-}" == "status" && "${2:-}" == "--json" ]]; then
+    return 0
+  fi
   command -v docker >/dev/null 2>&1 || {
     msg ERR "docker не найден"
     exit 1
@@ -222,9 +256,14 @@ send_full_telegram_message() {
 }
 
 full_s3_upload() {
+  # v5: выгрузка во ВСЕ настроенные S3-бэкенды категории (s3.d/*.env).
   local file_path="$1"
   local category="$2"
   local label="$3"
+  if declare -F s3m_upload_all >/dev/null; then
+    s3m_upload_all "$category" "$file_path" "$label"
+    return $?
+  fi
 
   if ! command -v aws >/dev/null 2>&1; then
     msg ERR "awscli не найден. Установи: apt-get update && apt-get install -y awscli"
@@ -271,6 +310,11 @@ S3: s3://${FULL_EXTERNAL_S3_BUCKET}/${s3_key}" || true
 }
 
 full_s3_retention_cleanup() {
+  # v5: ретенция по всем бэкендам, у каждого свои сроки.
+  if declare -F s3m_retention_logical_all >/dev/null; then
+    s3m_retention_logical_all
+    return 0
+  fi
   if ! command -v aws >/dev/null 2>&1; then
     msg WARN "awscli не найден, external S3 retention cleanup пропущен"
     return 0
@@ -457,8 +501,13 @@ run_panel_backup() {
 
   before_latest="$(latest_panel_backup || true)"
 
-  msg INFO "Запускаю оригинальный panel backup"
-  run_original_rw_backup_cmd "backup"
+  if [[ "${FULL_PANEL_ENGINE:-internal}" == "original" ]]; then
+    msg INFO "Panel backup: оригинальный rw-backup (FULL_PANEL_ENGINE=original)"
+    run_original_rw_backup_cmd "backup"
+  else
+    msg INFO "Panel backup: встроенный движок v5"
+    "${PANEL_SCRIPTS_DIR}/panel-backup.sh"
+  fi
 
   after_latest="$(latest_panel_backup || true)"
 
@@ -469,14 +518,14 @@ run_panel_backup() {
 
   msg OK "Panel backup найден: ${after_latest}"
 
-  if truthy "$FULL_PANEL_EXTERNAL_S3_ENABLED"; then
+  if [[ "${FULL_PANEL_ENGINE:-internal}" == "original" ]] && truthy "$FULL_PANEL_EXTERNAL_S3_ENABLED"; then
+    # Оригинальный движок в S3-бэкенды v5 не выгружает — дублируем здесь.
     if [[ "$after_latest" == "$before_latest" ]]; then
       msg WARN "Latest panel backup не изменился, но будет продублирован во внешний S3"
     fi
-
     full_s3_upload "$after_latest" "panel" "remnawave-panel" || msg WARN "Не удалось загрузить panel backup во внешний S3"
-    full_s3_retention_cleanup
   fi
+  full_s3_retention_cleanup
 }
 
 docker_label() {
@@ -1209,19 +1258,40 @@ configure_timer() {
     *) msg ERR "Некорректный режим"; return 1 ;;
   esac
 
-  read -r -p "Интервал, часов [${FULL_TIMER_INTERVAL_HOURS}]: " hours
-  hours="${hours:-$FULL_TIMER_INTERVAL_HOURS}"
+  echo
+  echo "Расписание запуска:"
+  echo "  1) интервал (каждые N часов)"
+  echo "  2) конкретные времена (список любой длины, напр.: 03:00 12:30 21:00)"
+  local cur_mode="1"; [[ -n "${FULL_TIMER_TIMES:-}" ]] && cur_mode="2"
+  read -r -p "Вариант [${cur_mode}]: " sched
+  sched="${sched:-$cur_mode}"
 
-  if ! [[ "$hours" =~ ^[0-9]+$ ]] || (( hours < 1 )); then
-    msg ERR "Интервал должен быть числом >= 1"
-    return 1
+  local hours="${FULL_TIMER_INTERVAL_HOURS}" times="${FULL_TIMER_TIMES:-}" norm=""
+  if [[ "$sched" == "2" ]]; then
+    read -r -p "Времена (HH:MM через пробел/запятую) [${times:-нет}]: " tin
+    times="${tin:-$times}"
+    norm="$(parse_times_list "$times")" || return 1
+    times="$norm"
+    read -r -p "Часовой пояс (пусто = локальный сервера; UTC; Europe/Amsterdam) [${FULL_SCHEDULE_TZ:-локальный}]: " tzin
+    FULL_SCHEDULE_TZ="${tzin:-${FULL_SCHEDULE_TZ:-}}"
+  else
+    times=""
+    read -r -p "Интервал, часов [${hours}]: " hin
+    hours="${hin:-$hours}"
+    if ! [[ "$hours" =~ ^[0-9]+$ ]] || (( hours < 1 )); then
+      msg ERR "Интервал должен быть числом >= 1"
+      return 1
+    fi
   fi
 
   set_full_var FULL_TIMER_MODE "$mode"
   set_full_var FULL_TIMER_INTERVAL_HOURS "$hours"
+  set_full_var FULL_TIMER_TIMES "$times"
+  set_full_var FULL_SCHEDULE_TZ "${FULL_SCHEDULE_TZ:-}"
 
   FULL_TIMER_MODE="$mode"
   FULL_TIMER_INTERVAL_HOURS="$hours"
+  FULL_TIMER_TIMES="$times"
 
   install_timer
 }
@@ -1249,7 +1319,27 @@ IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 EOF_SERVICE
 
-  cat > /etc/systemd/system/rw-backup-full.timer <<EOF_TIMER
+  local times="${FULL_TIMER_TIMES:-}" tz="${FULL_SCHEDULE_TZ:-}" cal="" t desc
+  if [[ -n "$times" ]]; then
+    times="$(parse_times_list "$times")" || { msg ERR "FULL_TIMER_TIMES некорректен"; return 1; }
+    for t in $times; do
+      cal+="OnCalendar=*-*-* ${t}${tz:+ ${tz}}"$'\n'
+    done
+    desc="Run rw-backup-full at: ${times}${tz:+ (${tz})}"
+    msg INFO "Расписание: ${times}${tz:+ (${tz})}"
+    cat > /etc/systemd/system/rw-backup-full.timer <<EOF_TIMER
+[Unit]
+Description=${desc}
+
+[Timer]
+${cal}Persistent=true
+Unit=rw-backup-full.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  else
+    cat > /etc/systemd/system/rw-backup-full.timer <<EOF_TIMER
 [Unit]
 Description=Run rw-backup-full every ${hours} hours
 
@@ -1262,6 +1352,7 @@ Unit=rw-backup-full.service
 [Install]
 WantedBy=timers.target
 EOF_TIMER
+  fi
 
   systemctl daemon-reload
   systemctl enable --now rw-backup-full.timer
@@ -1310,6 +1401,158 @@ show_config_summary() {
   echo "ORIG_S3_BUCKET:                     ${ORIG_S3_BUCKET:-not set}"
   echo "ORIG_TG_CHAT_ID:                    ${ORIG_TG_CHAT_ID:-not set}"
   echo
+}
+
+s3_backends_list() {
+  echo -e "${BOLD}S3-бэкенды (${S3D_DIR}):${RESET}"
+  local n found=0
+  for n in $(s3m_backends); do
+    found=1
+    if s3m_load "$n" 2>/dev/null; then
+      local st="выключен"; truthy "$B_ENABLED" && st="включён"
+      echo "  ● ${n} [${st}]  bucket=${B_BUCKET}  endpoint=${B_ENDPOINT:-AWS}"
+      echo "      panel=${B_UPLOAD_PANEL}(${B_RETENTION_PANEL_DAYS}д)  custom=${B_UPLOAD_CUSTOM}(${B_RETENTION_CUSTOM_DAYS}д)  wal=${B_UPLOAD_WAL}(keep=${B_BASEBACKUP_KEEP})"
+    else
+      echo "  ● ${n} [ОШИБКА КОНФИГА]"
+    fi
+  done
+  (( found )) || echo "  (нет; добавить: rw-backup-full s3-add)"
+}
+
+s3_backend_add() {
+  mkdir -p "$S3D_DIR"
+  local name
+  read -r -p "[?] Имя бэкенда (латиница/цифры/дефис): " name
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || { msg ERR "Недопустимое имя"; return 1; }
+  local f="${S3D_DIR}/${name}.env"
+  [[ -f "$f" ]] && { msg ERR "Бэкенд ${name} уже существует. Редактируйте: nano ${f}"; return 1; }
+
+  local endpoint bucket ak sk region prefix pd cd bk
+  read -r -p "  Endpoint (пусто для AWS): " endpoint
+  read -r -p "  Bucket: " bucket
+  read -r -p "  Access key: " ak
+  read -r -s -p "  Secret key: " sk; echo
+  read -r -p "  Region [us-east-1]: " region; region="${region:-us-east-1}"
+  read -r -p "  Prefix [rw-backup-full]: " prefix; prefix="${prefix:-rw-backup-full}"
+  read -r -p "  Заливать panel-архивы? [Y/n]: " a1
+  read -r -p "  Заливать бэкапы ботов? [Y/n]: " a2
+  read -r -p "  Заливать WAL/базовые бэкапы (PITR)? [Y/n]: " a3
+  read -r -p "  Хранение panel-архивов, дней [10]: " pd; pd="${pd:-10}"
+  read -r -p "  Хранение бот-архивов, дней [10]: " cd; cd="${cd:-10}"
+  read -r -p "  Хранить базовых бэкапов, шт [7]: " bk; bk="${bk:-7}"
+
+  cat > "$f" <<EOF_B
+B_ENABLED="true"
+B_ENDPOINT="${endpoint}"
+B_BUCKET="${bucket}"
+B_ACCESS_KEY="${ak}"
+B_SECRET_KEY="${sk}"
+B_REGION="${region}"
+B_PREFIX="${prefix}"
+B_UPLOAD_PANEL="$([[ "${a1,,}" == "n" ]] && echo false || echo true)"
+B_UPLOAD_CUSTOM="$([[ "${a2,,}" == "n" ]] && echo false || echo true)"
+B_UPLOAD_WAL="$([[ "${a3,,}" == "n" ]] && echo false || echo true)"
+B_RETENTION_PANEL_DAYS="${pd}"
+B_RETENTION_CUSTOM_DAYS="${cd}"
+B_BASEBACKUP_KEEP="${bk}"
+B_RETENTION_MIN_KEEP="3"
+EOF_B
+  chmod 600 "$f"
+  msg OK "Бэкенд ${name} создан: ${f}"
+
+  if s3m_load "$name" && s3m_aws s3 ls "s3://${B_BUCKET}/" >/dev/null 2>&1; then
+    msg OK "Проверка доступа к бакету: успешно"
+  else
+    msg WARN "Проверка доступа не прошла — проверьте реквизиты в ${f}"
+  fi
+}
+
+s3_backend_remove() {
+  s3_backends_list
+  local name
+  read -r -p "[?] Имя бэкенда для удаления: " name
+  local f="${S3D_DIR}/${name}.env"
+  [[ -f "$f" ]] || { msg ERR "Нет такого бэкенда"; return 1; }
+  echo -e "${YELLOW}Будет удалён файл настроек ${f}."
+  echo -e "Данные в самом бакете НЕ удаляются — только конфигурация подключения.${RESET}"
+  local a; read -r -p "Удалить конфигурацию бэкенда ${name}? [y/N]: " a
+  [[ "$a" == "y" ]] || { msg INFO "Отменено"; return 0; }
+  rm -f "$f"
+  msg OK "Бэкенд ${name} удалён из конфигурации"
+}
+
+status_json() {
+  # Машинно-читаемый статус для веб-сервиса. Только stdout, без цветов.
+  local host ts panel_last panel_ts custom_cnt
+  host="$(hostname -s 2>/dev/null || hostname)"
+  ts="$(date +%s)"
+  panel_last="$(latest_panel_backup 2>/dev/null || true)"
+  panel_ts=0
+  [[ -n "$panel_last" ]] && panel_ts="$(stat -c %Y "$panel_last" 2>/dev/null || echo 0)"
+  custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ')"
+
+  printf '{'
+  printf '"host":"%s","version":"5.0.0","time":%s,' "$host" "$ts"
+  printf '"panel":{"detected":%s,"last_backup":"%s","last_backup_ts":%s},'     "$( (command -v docker >/dev/null 2>&1 && local_panel_detected) && echo true || echo false)"     "$(basename "${panel_last:-}" 2>/dev/null)" "$panel_ts"
+  printf '"custom_archives":%s,' "$custom_cnt"
+  printf '"disk_free_bytes":%s,' "$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ')"
+  # S3-бэкенды
+  printf '"s3_backends":['
+  local n first=1
+  for n in $(s3m_backends 2>/dev/null); do
+    (( first )) || printf ','
+    first=0
+    if s3m_load "$n" 2>/dev/null; then
+      printf '{"name":"%s","enabled":%s,"bucket":"%s"}' "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET"
+    else
+      printf '{"name":"%s","enabled":false,"bucket":""}' "$n"
+    fi
+  done
+  printf '],'
+  # WAL-инстансы
+  printf '"wal_instances":['
+  first=1
+  local f name c spool bb bbts wr="/var/lib/rw-wal"
+  if [[ -d "$INSTANCES_DIR" ]]; then
+    for f in "$INSTANCES_DIR"/*.env; do
+      [[ -e "$f" ]] || continue
+      name="$(basename "$f" .env)"
+      c="$(grep -E '^INST_CONTAINER=' "$f" | head -n1 | cut -d'"' -f2)"
+      spool="$(find "${wr}/${name}/spool/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ')"
+      bb="$(find "${wr}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l | tr -d ' ')"
+      bbts="$(cat "${wr}/${name}/state/last_success" 2>/dev/null || echo 0)"
+      (( first )) || printf ','
+      first=0
+      printf '{"name":"%s","container":"%s","running":%s,"spool":%s,"basebackups":%s,"last_basebackup_ts":%s,"timer_active":%s}'         "$name" "$c"         "$( (command -v docker >/dev/null 2>&1 && docker ps -q -f "name=^${c}$" 2>/dev/null | grep -q .) && echo true || echo false)"         "$spool" "$bb" "$bbts"         "$(systemctl is-active "rw-wal-ship@${name}.timer" >/dev/null 2>&1 && echo true || echo false)"
+    done
+  fi
+  printf ']}'
+  printf '\n'
+}
+
+sandbox_timer_install() {
+  local times="${SANDBOX_VERIFY_TIMES:-}" ih="${SANDBOX_VERIFY_INTERVAL_HOURS:-}" tz="${FULL_SCHEDULE_TZ:-}"
+  local d="/etc/systemd/system/rw-sandbox-verify.timer.d"
+  mkdir -p "$d"
+  {
+    echo "# managed-by: rw-backup-full (расписание из rw-backup-full.env)"
+    echo "[Timer]"
+    echo "OnCalendar="
+    if [[ -n "$times" ]]; then
+      local norm t
+      norm="$(parse_times_list "$times")" || return 1
+      for t in $norm; do echo "OnCalendar=*-*-* ${t}${tz:+ ${tz}}"; done
+    elif [[ -n "$ih" ]] && [[ "$ih" =~ ^[0-9]+$ ]] && (( ih >= 1 )); then
+      echo "OnBootSec=30min"
+      echo "OnUnitActiveSec=${ih}h"
+    else
+      echo "OnCalendar=*-*-* 05:30:00${tz:+ ${tz}}"
+    fi
+  } > "${d}/override.conf"
+  systemctl daemon-reload
+  systemctl enable --now rw-sandbox-verify.timer
+  msg OK "Расписание песочницы применено:"
+  systemctl list-timers rw-sandbox-verify.timer --no-pager 2>/dev/null | head -n 3 || true
 }
 
 wal_status_all() {
@@ -1381,6 +1624,11 @@ main_menu() {
     echo "14. Базовый бэкап инстанса сейчас"
     echo "15. Проверка бэкапов в песочнице сейчас"
     echo
+    echo -e " ${BOLD}--- Мульти-S3 / панель (v5) ---${RESET}"
+    echo "16. S3-бэкенды: список / добавить / удалить"
+    echo "17. Восстановление панели из архива"
+    echo "18. Выгрузить метрики сейчас"
+    echo
     echo " 0. Выход"
     echo
 
@@ -1406,6 +1654,14 @@ main_menu() {
         [[ -n "$winst" ]] && "${WAL_SCRIPTS_DIR}/basebackup.sh" "$winst"
         pause ;;
       15) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
+      16)
+        s3_backends_list
+        echo; echo "  a) добавить   r) удалить   Enter) назад"
+        read -r -p "  > " s3act
+        case "$s3act" in a) s3_backend_add ;; r) s3_backend_remove ;; esac
+        pause ;;
+      17) "${PANEL_SCRIPTS_DIR}/panel-restore.sh" || true; pause ;;
+      18) "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" || true; pause ;;
       0) exit 0 ;;
       *) msg ERR "Некорректный выбор"; sleep 1 ;;
     esac
@@ -1442,11 +1698,19 @@ WAL / PITR (v4):
   rw-backup-full wal-status                     статус всех инстансов
   rw-backup-full pitr-restore <instance> [опции]  восстановление (см. --help)
   rw-backup-full verify [--instance X|--local]  проверка бэкапов в песочнице
+  rw-backup-full sandbox-timer                  применить расписание песочницы из конфига
+
+Мульти-S3 и панель (v5):
+  rw-backup-full s3-backends                    список S3-бэкендов
+  rw-backup-full s3-add | s3-remove             добавить / удалить бэкенд
+  rw-backup-full panel-restore [файл|--from-s3] восстановление панели (встроенное)
+  rw-backup-full status [--json]                статус сервера (JSON для веб-сервиса)
+  rw-backup-full metrics-export                 выгрузка метрик сейчас
 EOF_USAGE
 }
 
 load_config
-ensure_tools
+ensure_tools "$@"
 
 cmd="${1:-menu}"
 
@@ -1492,6 +1756,20 @@ case "$cmd" in
     shift; exec "${WAL_SCRIPTS_DIR}/pitr-restore.sh" "$@" ;;
   wal-status)
     wal_status_all ;;
+  sandbox-timer)
+    sandbox_timer_install ;;
+  s3-backends|s3-list-backends)
+    s3_backends_list ;;
+  s3-add)
+    s3_backend_add ;;
+  s3-remove)
+    s3_backend_remove ;;
+  panel-restore)
+    shift; exec "${PANEL_SCRIPTS_DIR}/panel-restore.sh" "$@" ;;
+  status)
+    if [[ "${2:-}" == "--json" ]]; then status_json; else wal_status_all; fi ;;
+  metrics-export)
+    exec "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" ;;
   verify)
     shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" "$@" ;;
   help|-h|--help) usage ;;

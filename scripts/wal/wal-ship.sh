@@ -44,10 +44,9 @@ shipped=0
 failed=0
 s3_failed=0
 
+mapfile -t WAL_BACKENDS < <(wal_s3_backends)
 s3_enabled=false
-if wal_s3_ready && truthy "${FULL_WAL_S3_ENABLED:-true}"; then
-  s3_enabled=true
-fi
+(( ${#WAL_BACKENDS[@]} > 0 )) && s3_enabled=true
 
 # --------------------------------------------------------------------------
 # 1. Сегменты из спула -> локальный архив
@@ -102,31 +101,34 @@ done < <(find "$SPOOL_IN" -maxdepth 1 -type f -name '0*' 2>/dev/null | sort)
 # 2. Локальный архив -> S3 (всё, что ещё не отмечено как выгруженное)
 # --------------------------------------------------------------------------
 if [[ "$s3_enabled" == "true" ]]; then
-  while IFS= read -r arc_path; do
-    [[ -n "$arc_path" ]] || continue
-    arc="$(basename "$arc_path")"
-    [[ "$arc" == .* ]] && continue
+  for backend in "${WAL_BACKENDS[@]}"; do
+    wal_s3_select "$backend" || continue
+    mkdir -p "${INST_STATE_DIR}/uploaded/${backend}"
+    while IFS= read -r arc_path; do
+      [[ -n "$arc_path" ]] || continue
+      arc="$(basename "$arc_path")"
+      [[ "$arc" == .* ]] && continue
 
-    marker="${INST_STATE_DIR}/uploaded/${arc}"
-    [[ -f "$marker" ]] && continue
+      marker="${INST_STATE_DIR}/uploaded/${backend}/${arc}"
+      [[ -f "$marker" ]] && continue
 
-    ok=false
-    for attempt in 1 2 3; do
-      if wal_aws s3 cp "$arc_path" "$(wal_s3_uri "wal/${arc}")" --only-show-errors 2>/dev/null; then
-        ok=true
-        break
+      ok=false
+      for attempt in 1 2 3; do
+        if wal_aws s3 cp "$arc_path" "$(wal_s3_uri "wal/${arc}")" --only-show-errors 2>/dev/null; then
+          ok=true
+          break
+        fi
+        sleep $((attempt * 3))
+      done
+
+      if [[ "$ok" == "true" ]]; then
+        : > "$marker"
+      else
+        msg WARN "[${INSTANCE}] S3[${backend}]: не выгружен ${arc}, повтор на следующем запуске"
+        s3_failed=$((s3_failed + 1))
       fi
-      sleep $((attempt * 3))
-    done
-
-    if [[ "$ok" == "true" ]]; then
-      mkdir -p "${INST_STATE_DIR}/uploaded"
-      : > "$marker"
-    else
-      msg WARN "[${INSTANCE}] не удалось выгрузить ${arc} в S3, повтор на следующем запуске"
-      s3_failed=$((s3_failed + 1))
-    fi
-  done < <(find "$INST_ARCHIVE_DIR" -maxdepth 1 -type f -name '0*' 2>/dev/null | sort)
+    done < <(find "$INST_ARCHIVE_DIR" -maxdepth 1 -type f -name '0*' 2>/dev/null | sort)
+  done
 fi
 
 # --------------------------------------------------------------------------

@@ -26,7 +26,10 @@ source "${SCRIPT_DIR}/../lib/wal-lib.sh"
 
 INSTANCE="${1:-}"
 MODE="${2:-enable}"
-[[ -n "$INSTANCE" ]] || { echo "Usage: enable-archiving.sh <instance> [--disable]" >&2; exit 1; }
+ASSUME_YES="false"
+[[ "${3:-}" == "--yes" || "$MODE" == "--yes" ]] && ASSUME_YES="true"
+[[ "$MODE" == "--yes" ]] && MODE="enable"
+[[ -n "$INSTANCE" ]] || { echo "Usage: enable-archiving.sh <instance> [--disable] [--yes]" >&2; exit 1; }
 
 wal_load_full_config
 wal_load_instance "$INSTANCE"
@@ -146,6 +149,22 @@ msg OK "[${INSTANCE}] параметры записаны в postgresql.auto.con
 # --------------------------------------------------------------------------
 # 4. Пересоздание контейнера (archive_mode требует рестарта)
 # --------------------------------------------------------------------------
+if ! truthy "$ASSUME_YES"; then
+  echo
+  echo -e "${YELLOW}${BOLD}ТРЕБУЕТСЯ ПОДТВЕРЖДЕНИЕ${RESET}"
+  echo "Для применения archive_mode PostgreSQL требует рестарта."
+  echo "Будет выполнено: docker compose up -d ${COMPOSE_SERVICE}"
+  echo "  (контейнер ${INST_CONTAINER} будет пересоздан с монтированием спула)"
+  echo "Последствия: БД инстанса '${INSTANCE}' будет недоступна несколько секунд;"
+  echo "зависящие от неё сервисы (панель/бот) на это время потеряют соединение"
+  echo "и переподключатся автоматически. Данные не изменяются."
+  read -r -p "Перезапустить контейнер БД сейчас? [y/N]: " __a
+  if [[ "$__a" != "y" && "$__a" != "Y" ]]; then
+    msg WARN "[${INSTANCE}] отменено пользователем. Параметры записаны в postgresql.auto.conf,"
+    msg WARN "архивация включится после ручного рестарта БД и повторного запуска: rw-backup-full wal-enable ${INSTANCE}"
+    exit 1
+  fi
+fi
 msg INFO "[${INSTANCE}] пересоздаю ${COMPOSE_SERVICE}..."
 ( cd "$COMPOSE_DIR" && dc up -d "$COMPOSE_SERVICE" )
 

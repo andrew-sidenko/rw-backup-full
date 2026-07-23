@@ -122,16 +122,24 @@ fi
 # --------------------------------------------------------------------------
 # S3: базовые бэкапы и WAL
 # --------------------------------------------------------------------------
-if ! wal_s3_ready || ! truthy "${FULL_WAL_S3_ENABLED:-true}"; then
-  msg INFO "[${INSTANCE}] S3 не настроен, S3-retention пропущен"
+if ! wal_s3_ready; then
+  msg INFO "[${INSTANCE}] S3-бэкенды с WAL не настроены, S3-retention пропущен"
   exit 0
 fi
 
-keep_s3="${INST_S3_BASEBACKUP_KEEP:-10}"
-[[ "$keep_s3" =~ ^[0-9]+$ ]] || keep_s3=10
-(( keep_s3 >= 1 )) || keep_s3=1
+s3_backends_total=0
+while IFS= read -r __backend; do
+  [[ -n "$__backend" ]] || continue
+  s3_backends_total=$((s3_backends_total + 1))
+  wal_s3_select "$__backend" || continue
+  msg INFO "[${INSTANCE}] S3-retention: бэкенд ${__backend}"
 
-s3_base_prefix="$(wal_s3_uri "basebackup/")"
+  # keep берётся из настроек БЭКЕНДА; INST_S3_BASEBACKUP_KEEP — общий fallback.
+  keep_s3="${B_BASEBACKUP_KEEP:-${INST_S3_BASEBACKUP_KEEP:-10}}"
+  [[ "$keep_s3" =~ ^[0-9]+$ ]] || keep_s3=10
+  (( keep_s3 >= 1 )) || keep_s3=1
+
+  s3_base_prefix="$(wal_s3_uri "basebackup/")"
 
 mapfile -t s3_metas < <(
   wal_aws s3 ls "$s3_base_prefix" 2>/dev/null \
@@ -139,8 +147,8 @@ mapfile -t s3_metas < <(
 )
 
 if (( ${#s3_metas[@]} == 0 )); then
-  msg WARN "[${INSTANCE}] в S3 нет базовых бэкапов — WAL в S3 не трогаю"
-  exit 0
+  msg WARN "[${INSTANCE}] S3[${__backend}]: нет базовых бэкапов — WAL не трогаю"
+  continue
 fi
 
 tmpdir="$(mktemp -d)"
@@ -177,8 +185,8 @@ for meta_name in "${s3_metas[@]}"; do
 done
 
 if [[ -z "$s3_horizon" ]]; then
-  msg WARN "[${INSTANCE}] граница WAL в S3 не определена — WAL в S3 не трогаю"
-  exit 0
+  msg WARN "[${INSTANCE}] S3[${__backend}]: граница WAL не определена — WAL не трогаю"
+  continue
 fi
 
 msg INFO "[${INSTANCE}] граница WAL в S3: ${s3_horizon}"
@@ -196,7 +204,8 @@ while IFS= read -r key; do
   fi
 done < <(wal_aws s3 ls "$s3_wal_prefix" 2>/dev/null | awk '{print $4}' | sort)
 
-msg OK "[${INSTANCE}] S3 WAL: удалено ${s3_deleted} сегментов до ${s3_horizon}"
+  msg OK "[${INSTANCE}] S3[${__backend}] WAL: удалено ${s3_deleted} сегментов до ${s3_horizon}"
+done < <(wal_s3_backends)
 
 wal_metric_write "rw_wal_retention_${INSTANCE}" <<EOF_M
 # HELP rw_wal_retention_last_run_timestamp_seconds Время последнего прогона retention.
@@ -205,7 +214,7 @@ rw_wal_retention_last_run_timestamp_seconds{instance="${INSTANCE}"} $(date +%s)
 # HELP rw_basebackup_count Количество хранимых базовых бэкапов.
 # TYPE rw_basebackup_count gauge
 rw_basebackup_count{instance="${INSTANCE}",location="local"} ${#local_metas[@]}
-rw_basebackup_count{instance="${INSTANCE}",location="s3"} ${#s3_metas[@]}
+rw_basebackup_count{instance="${INSTANCE}",location="s3"} ${#s3_metas[@]:-0}
 EOF_M
 
 exit 0
