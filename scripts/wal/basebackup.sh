@@ -33,6 +33,10 @@ truthy "${INST_ENABLED:-true}" || { msg INFO "[${INSTANCE}] отключён"; e
 wal_lock "basebackup-${INSTANCE}" || exit 0
 wal_instance_dirs_init
 
+# Разнос нагрузки на S3 между серверами (в контейнере/cron; под systemd —
+# через RandomizedDelaySec таймера, тогда пауза пропускается).
+wal_jitter_sleep
+
 started_at="$(date +%s)"
 
 fail() {

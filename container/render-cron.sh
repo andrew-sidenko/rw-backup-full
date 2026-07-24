@@ -70,7 +70,8 @@ if [[ "$ROLE" == "host-agent" ]]; then
         "${INSTALL_DIR}/scripts/wal/wal-ship.sh ${inst}"
 
       bh="${INST_BASEBACKUP_INTERVAL_HOURS:-24}"; [[ "$bh" =~ ^[0-9]+$ ]] || bh=24
-      if (( bh >= 24 )); then bfall="30 3 * * *"; else bfall="30 */${bh} * * *"; fi
+      # Ночь по умолчанию (04:30) — отдельно от логического дампа (03:00).
+      if (( bh >= 24 )); then bfall="30 4 * * *"; else bfall="30 */${bh} * * *"; fi
       emit_sched "${INST_BASEBACKUP_TIMES:-}" "$bfall" \
         "${INSTALL_DIR}/scripts/wal/basebackup.sh ${inst}"
     done
