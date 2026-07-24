@@ -1473,6 +1473,49 @@ status_json() {
   printf '\n'
 }
 
+# Список .txt-журналов (пишутся рядом с каждым архивом/бэкапом) во ВСЕХ
+# настроенных S3-бэкендах этого сервера. JSON для веб-вьювера. Только stdout.
+journals_list() {
+  local n first=1 line d t size key name cat
+  printf '['
+  for n in $(s3m_backends 2>/dev/null); do
+    s3m_load "$n" 2>/dev/null || continue
+    truthy "$B_ENABLED" || continue
+    while IFS= read -r line; do
+      d="$(awk '{print $1}' <<<"$line")"
+      t="$(awk '{print $2}' <<<"$line")"
+      size="$(awk '{print $3}' <<<"$line")"
+      key="$(awk '{print $4}' <<<"$line")"
+      [[ "$key" == *.txt ]] || continue
+      [[ "$size" =~ ^[0-9]+$ ]] || size=0
+      name="${key##*/}"
+      case "$key" in
+        */wal/*)        cat="basebackup" ;;
+        */panel/*)      cat="panel" ;;
+        */custom-bot/*) cat="custom-bot" ;;
+        *)              cat="other" ;;
+      esac
+      (( first )) || printf ','
+      first=0
+      printf '{"backend":"%s","key":"%s","name":"%s","category":"%s","size":%s,"date":"%s %s"}' \
+        "$n" "$key" "$name" "$cat" "$size" "$d" "$t"
+    done < <(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/" --recursive 2>/dev/null | grep '\.txt$' | sort -r | head -n 60)
+  done
+  printf ']\n'
+}
+
+# Печать содержимого одного журнала из S3. Аргументы: <backend> <key>.
+# Ключ строго валидируется (только .txt, только внутри префикса бэкенда) —
+# веб-вьювер передаёт key из journals_list, но проверяем и здесь.
+journal_show() {
+  local backend="${1:-}" key="${2:-}"
+  [[ "$backend" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "bad backend" >&2; return 1; }
+  [[ "$key" == *.txt && "$key" != *..* && "$key" == */* ]] || { echo "bad key" >&2; return 1; }
+  s3m_load "$backend" 2>/dev/null || { echo "backend not found: $backend" >&2; return 1; }
+  [[ "$key" == "${B_PREFIX}/"* ]] || { echo "key outside backend prefix" >&2; return 1; }
+  s3m_aws s3 cp "s3://${B_BUCKET}/${key}" - 2>/dev/null
+}
+
 # Манифест сервера для fleet-verify (песочница забирает его через веб-сервис
 # по SSH): источник, S3-бэкенды С РЕКВИЗИТАМИ, инстансы с типами и параметрами
 # проверок, настройки Telegram. Только stdout, чистый JSON.
@@ -2235,6 +2278,10 @@ case "$cmd" in
     exec "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" ;;
   fleet-manifest)
     fleet_manifest ;;
+  journals)
+    journals_list ;;
+  journal-show)
+    shift; journal_show "$@" ;;
   config-track)
     shift; exec "${TRACK_SCRIPTS_DIR}/config-track.sh" "$@" ;;
   config-restore)
