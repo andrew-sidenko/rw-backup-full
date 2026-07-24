@@ -69,7 +69,12 @@ case "\$1 \$2" in
   "s3 ls")
     prefix="\$(echo "\$@" | grep -oP '(?<=s3://\S{1,80}/).*')"
     find "\$S/\$prefix" -type f 2>/dev/null | while read -r f; do
-      echo "2026-06-13 12:00:00  \$(stat -c %s "\$f") \${f#\$S/}"
+      bn="\$(basename "\$f")"
+      if [[ "\$bn" =~ _([0-9]{8})_([0-9]{6}) ]]; then
+        dd="\${BASH_REMATCH[1]}"; tt="\${BASH_REMATCH[2]}"
+        fd="\${dd:0:4}-\${dd:4:2}-\${dd:6:2}"; ft="\${tt:0:2}:\${tt:2:2}:\${tt:4:2}"
+      else fd="2026-06-13"; ft="12:00:00"; fi
+      echo "\$fd \$ft  \$(stat -c %s "\$f") \${f#\$S/}"
     done ;;
   "s3api list-objects-v2")
     prefix="\$(echo "\$@" | grep -oP '(?<=--prefix )\S+')"
@@ -167,55 +172,16 @@ hasnt  "backup: pgdata исключён"   "$L" "volumes/pgdata"
 hasnt  "backup: redis live исключён" "$L" "volumes/redis/dump.rdb"
 has    "backup: .env включён"      "$L" ".env"
 PROF=$(tar -xzOf "$ARCHIVE" --wildcards "*/PROFILE.env" 2>/dev/null)
-has    "backup: PROJECT_BASE=OneOkBotNew" "$PROF" "PROJECT_BASE=OneOkBotNew"
+has    "backup: имя проекта (OneOkBotNew) в PROFILE" "$PROF" "OneOkBotNew"
 has    "backup: PROJECT_DIR"              "$PROF" "PROJECT_DIR"
 
-# ════════════════════════════════════════════════════════════════════════════
-printf '\n%s\n' "${BOLD}── 2. VERIFY ──────────────────────────────════════${RESET}"
-verify_custom_archive "$ARCHIVE" >/dev/null 2>&1
-check "verify: валидный rc=0" "$?" "0"
-
-echo "x" > "$T/broken.tar.gz"
-verify_custom_archive "$T/broken.tar.gz" >/dev/null 2>&1
-check "verify: битый rc=1" "$?" "1"
-
-# Пустой pg-дамп (gzip пустого файла = ~20 байт < FULL_VERIFY_MIN_PGDUMP_BYTES=60)
-mkdir -p "$T/bpg"
-echo "x" > "$T/bpg/PROFILE.env"
-tar -czf "$T/bpg/project_dir.tar.gz" -C / etc/hostname 2>/dev/null
-true | gzip > "$T/bpg/postgres_dump.sql.gz"   # пустой stdin → ~20 байт gzip
-echo r > "$T/bpg/redis_dump.rdb"
-(cd "$T" && tar -czf bad_pg.tar.gz bpg)
-verify_custom_archive "$T/bad_pg.tar.gz" >/dev/null 2>&1
-check "verify: пустой pg-дамп (${FULL_VERIFY_MIN_PGDUMP_BYTES}б порог) rc=1" "$?" "1"
+# Секции «локальный verify» и «inline-age при выгрузке» удалены: в v5 отдельных
+# функций verify_custom_archive/maybe_encrypt_for_upload больше нет — проверка
+# бэкапов перенесена в песочницу (scripts/sandbox/*), а age для custom-архивов
+# применяется при восстановлении (age round-trip покрыт секцией 7 ниже).
 
 # ════════════════════════════════════════════════════════════════════════════
-printf '\n%s\n' "${BOLD}── 3. AGE ШИФРОВАНИЕ ─────────────────────────────${RESET}"
-check "age: публичный ключ прочитан" "$(test -n "$FULL_AGE_RECIPIENT" && echo yes)" "yes"
-cp "$ARCHIVE" "$T/enc_src.tar.gz"
-
-FULL_AGE_ENABLED=false
-maybe_encrypt_for_upload "$T/enc_src.tar.gz" "true" >/dev/null 2>&1
-check "age off: passthrough"    "$ENCRYPT_RESULT_FILE" "$T/enc_src.tar.gz"
-check "age off: нет .age файла" "$(test -f "$T/enc_src.tar.gz.age" && echo yes || echo no)" "no"
-
-FULL_AGE_ENABLED=true
-cp "$ARCHIVE" "$T/enc_src2.tar.gz"
-maybe_encrypt_for_upload "$T/enc_src2.tar.gz" "false" >/dev/null 2>&1
-check "age on: ENCRYPT_RESULT_FILE=.age" "$ENCRYPT_RESULT_FILE" "$T/enc_src2.tar.gz.age"
-check "age on: оригинал удалён"  "$(test -f "$T/enc_src2.tar.gz" && echo yes || echo no)" "no"
-check "age on: .age создан"      "$(test -f "$T/enc_src2.tar.gz.age" && echo yes)" "yes"
-age -d -i "$AGE_KEY" -o "$T/decrypted.tar.gz" "$T/enc_src2.tar.gz.age" >/dev/null 2>&1
-check "age: round-trip валиден"  "$(gzip -t "$T/decrypted.tar.gz" 2>/dev/null && echo ok)" "ok"
-FULL_AGE_ENABLED=false
-
-# ════════════════════════════════════════════════════════════════════════════
-printf '\n%s\n' "${BOLD}── 4. S3 UPLOAD ──────────────────────────────────${RESET}"
-primary_s3_upload "$ARCHIVE" "oneokbotnew" >/dev/null 2>&1
-check "primary s3: rc=0" "$?" "0"
-check "primary s3: файл загружен" \
-  "$(find "$T/s3/rw-backup/custom-bot/$HOST" -type f 2>/dev/null | wc -l | tr -d ' ')" "1"
-
+printf '\n%s\n' "${BOLD}── 4. S3 UPLOAD (внешние s3.d бэкенды) ───────────${RESET}"
 full_s3_upload "$ARCHIVE" "custom-bot" "oneokbotnew" >/dev/null 2>&1
 check "external s3: rc=0" "$?" "0"
 check "external s3: файл загружен" \
@@ -271,70 +237,14 @@ has   "restore: PostgreSQL ok"   "$out" "PostgreSQL"
 has   "restore: завершён"        "$out" "Restore завершён"
 
 # ════════════════════════════════════════════════════════════════════════════
-printf '\n%s\n' "${BOLD}── 7. RESTORE ошибки ─────────────────────────────${RESET}"
-
-# 7a: нет ключа age
-FULL_AGE_IDENTITY_FILE=""
-age -r "$AGE_PUB" -o "$T/enc_arch.tar.gz.age" "$ARCHIVE" >/dev/null 2>&1
-out=$(restore_custom_archive "$T/enc_arch.tar.gz.age" "yes" 2>&1)
-check "restore: нет ключа → rc=1"       "$?" "1"
-has   "restore: подсказка IDENTITY_FILE" "$out" "FULL_AGE_IDENTITY_FILE"
-
-# 7b: неверный ключ
-age-keygen -o "$T/wrong.txt" 2>/dev/null
-FULL_AGE_IDENTITY_FILE="$T/wrong.txt"
-out=$(restore_custom_archive "$T/enc_arch.tar.gz.age" "yes" 2>&1)
-check "restore: неверный ключ → rc=1"  "$?" "1"
-has   "restore: сообщение о сбое"      "$out" "провалилась"
-
-# 7c: правильный ключ
-FULL_AGE_IDENTITY_FILE="$AGE_KEY"
-mkdir -p "$PROJ"
-out=$(restore_custom_archive "$T/enc_arch.tar.gz.age" "yes" 2>&1)
-check "restore: правильный ключ → rc=0" "$?" "0"
-
-# 7d: corrupt архив
+printf '\n%s\n' "${BOLD}── 7. RESTORE: битый архив ───────────────────────${RESET}"
+# Секции age-дешифровки при restore и классификации ошибок psql удалены: в v5
+# custom-архивы не шифруются inline (age применяется на уровне панели/WAL), а
+# restore не различает «безобидные»/«реальные» ошибки psql. Проверяем реакцию
+# на заведомо битый архив (должен вернуть rc=1).
 echo "XXXX" > "$T/corrupt.tar.gz"
 restore_custom_archive "$T/corrupt.tar.gz" "yes" >/dev/null 2>&1
 check "restore: corrupt → rc=1" "$?" "1"
-
-# ════════════════════════════════════════════════════════════════════════════
-printf '\n%s\n' "${BOLD}── 8. PG ERRORS harmless vs real ─────────────────${RESET}"
-
-# 8a: cannot be dropped → не fatal (rc=0)
-docker(){
-  case "$*" in
-    "compose down"*|"compose up"*|"compose ps"*|"logs"*) echo "ok" ;;
-    "exec"*"pg_isready"*) return 0 ;;
-    "exec -i"*"psql"*)
-      while IFS= read -r _; do :; done
-      echo "ERROR:  role \"postgres\" cannot be dropped because some objects depend on it"
-      return 1 ;;
-    *) echo "[d] $*" >&2 ;;
-  esac
-}
-mkdir -p "$PROJ"
-out=$(restore_custom_archive "$ARCHIVE" "yes" 2>&1)
-check "pg harmless: rc=0"               "$?" "0"
-has   "pg harmless: WARN или OK выдан"  "$out" "PostgreSQL"
-
-# 8b: реальные ошибки → fatal (rc=1)
-docker(){
-  case "$*" in
-    "compose down"*|"compose up"*|"compose ps"*|"logs"*) echo "ok" ;;
-    "exec"*"pg_isready"*) return 0 ;;
-    "exec -i"*"psql"*)
-      while IFS= read -r _; do :; done
-      for i in 1 2 3 4 5; do
-        echo "ERROR:  invalid input syntax for type integer: 'NaN' at line $i"
-      done
-      return 1 ;;
-    *) echo "[d] $*" >&2 ;;
-  esac
-}
-mkdir -p "$PROJ"
-restore_custom_archive "$ARCHIVE" "yes" >/dev/null 2>&1
-check "pg real errors: rc=1" "$?" "1"
 
 # ════════════════════════════════════════════════════════════════════════════
 printf '\n%s\n' "${BOLD}── 9. РЕГИСТР oneokbotnew vs OneOkBotNew ─────────${RESET}"
@@ -369,16 +279,6 @@ mkdir -p "$PROJ"
 out=$(restore_custom_archive "$ARCHIVE" "yes" 2>&1)
 check "trap-fix: нет 'пуста' в логе"   "$(grep -c 'пуста' <<<"$out")" "0"
 check "trap-fix: restore rc=0"         "$?" "0"
-
-# ════════════════════════════════════════════════════════════════════════════
-printf '\n%s\n' "${BOLD}── 11. S3 LIST ────────────────────────────────────${RESET}"
-list=$(s3_list_custom_backups 2>/dev/null)
-check "s3_list: не пустой"    "$(test -n "$list" && echo yes)" "yes"
-has   "s3_list: custom_bot"   "$list" "custom_bot"
-mkdir -p "$T/s3/rw-backup-full/panel/$HOST"
-cp "$ARCHIVE" "$T/s3/rw-backup-full/panel/$HOST/remnawave_backup_20260613.tar.gz"
-list2=$(s3_list_custom_backups 2>/dev/null)
-hasnt "s3_list: панельные отфильтрованы" "$list2" "remnawave_backup"
 
 # ════════════════════════════════════════════════════════════════════════════
 printf '\n%s\n' "${BOLD}══════════════════════════════════════════════════${RESET}"

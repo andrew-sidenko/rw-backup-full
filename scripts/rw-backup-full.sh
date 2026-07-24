@@ -155,7 +155,9 @@ truthy() {
 }
 
 safe_project_name() {
-  echo "$1" | tr -c 'A-Za-z0-9_.-' '_'
+  # printf, а не echo: echo добавляет \n, который tr превращает в '_' —
+  # получалось лишнее подчёркивание в конце имени (custom_bot_name__timestamp).
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
 }
 
 full_s3_prefix_normalized() {
@@ -839,6 +841,18 @@ select_restore_archive() {
 }
 
 restore_custom_archive() {
+  # Обёртка: временный каталог чистим ПОСЛЕ возврата рабочей функции.
+  # trap ... RETURN здесь применять нельзя: при source (тесты/интеграции) он
+  # срабатывает и на возврат из вложенного `source PROFILE.env`, снося tmp
+  # прямо посреди восстановления (известная проблема v3, ср. wal-lib.sh).
+  RW_RESTORE_TMP_ROOT=""
+  local __rc=0
+  _restore_custom_archive_impl "$@" || __rc=$?
+  [[ -n "${RW_RESTORE_TMP_ROOT:-}" ]] && rm -rf "$RW_RESTORE_TMP_ROOT"
+  return "$__rc"
+}
+
+_restore_custom_archive_impl() {
   local archive="$1"
   local assume_yes="${2:-no}"
 
@@ -847,18 +861,14 @@ restore_custom_archive() {
     return 1
   }
 
-  local restore_ts="$(date +%Y%m%d_%H%M%S)"
+  # _$$ в имени — чтобы параллельные/повторные запуски не делили один tmp.
+  local restore_ts="$(date +%Y%m%d_%H%M%S)_$$"
   local tmp_root="/tmp/rw-custom-restore-${restore_ts}"
+  RW_RESTORE_TMP_ROOT="$tmp_root"
   local extract_dir="${tmp_root}/outer"
   local project_extract_dir="${tmp_root}/project"
 
   mkdir -p "$extract_dir" "$project_extract_dir"
-
-  cleanup_restore_tmp() {
-    rm -rf "$tmp_root"
-  }
-
-  trap cleanup_restore_tmp RETURN
 
   msg INFO "Распаковываю архив: ${archive}"
 
