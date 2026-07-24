@@ -58,6 +58,20 @@ wal_load_full_config
 command -v jq >/dev/null 2>&1 || { msg ERR "Нужен jq"; exit 1; }
 wal_lock "verify-stack-${PROJECT}" || exit 0
 
+PROFILES_DIR="${PROFILES_DIR:-${INSTALL_DIR}/verify-profiles.d}"
+# Проверка СОДЕРЖИМОГО восстановленной БД тем же профилем, что и в
+# verify-fleet.sh (verify-profiles.d/<тип>.env): обязательные таблицы,
+# минимум таблиц/строк. Без этого "стек поднялся" означало только "процессы
+# запущены", а не "данные реально там".
+load_profile() { # <kind>
+  PROFILE_REQUIRED_TABLES=""; PROFILE_MIN_TABLES="1"; PROFILE_MIN_TOTAL_ROWS="1"
+  local f="${PROFILES_DIR}/$1.env"
+  if [[ -f "$f" ]]; then
+    set +u; # shellcheck disable=SC1090
+    source "$f"; set -u
+  fi
+}
+
 # --source задан: подтягиваем манифест указанного сервера (та же логика,
 # что в verify-fleet.sh) и материализуем ЕГО S3-бэкенд как временный
 # s3.d-файл — дальше config-restore.sh и остальной скрипт работают как
@@ -102,7 +116,30 @@ if [[ -n "$REMOTE_SOURCE" ]]; then
 
   export S3D_DIR="$REMOTE_S3D"
   export RW_SOURCE_ID="$(jq -r .source <<<"$SRV_JSON")"
+
+  # Telegram — та же ошибка предположения "один хост": wal_notify по
+  # умолчанию берёт FULL_TG_BOT_TOKEN/CHAT_ID из ЛОКАЛЬНОГО конфига
+  # песочницы, который обычно пуст (уведомления настроены на самом
+  # проекте). Манифест сервера уже несёт его собственные настройки —
+  # переопределяем ими на время этого запуска.
+  SRV_TG_TOKEN="$(jq -r '.telegram.token // ""' <<<"$SRV_JSON")"
+  SRV_TG_CHAT="$(jq -r '.telegram.chat_id // ""' <<<"$SRV_JSON")"
+  SRV_TG_THREAD="$(jq -r '.telegram.thread_id // ""' <<<"$SRV_JSON")"
+  if [[ -n "$SRV_TG_TOKEN" && -n "$SRV_TG_CHAT" ]]; then
+    FULL_TG_BOT_TOKEN="$SRV_TG_TOKEN"
+    FULL_TG_CHAT_ID="$SRV_TG_CHAT"
+    FULL_TG_MESSAGE_THREAD_ID="$SRV_TG_THREAD"
+  else
+    msg WARN "У сервера '${REMOTE_SOURCE}' не настроен Telegram в манифесте — уведомление о результате не уйдёт (только метрика и лог)"
+  fi
+
   msg OK "Источник: ${RW_SOURCE_ID} (бэкенд $(jq -r .name <<<"$BJ"), реквизиты из манифеста)"
+
+  # Тип инстанса и контрольные таблицы — для проверки СОДЕРЖИМОГО БД
+  # (не только «контейнер жив»), тем же профилем, что использует verify-fleet.
+  IJ="$(jq -c --arg n "$PROJECT" '.instances[]? | select(.name == $n)' <<<"$SRV_JSON" | head -n1)"
+  [[ -n "$IJ" ]] && INST_KIND_REMOTE="$(jq -r '.kind // "bot"' <<<"$IJ")" || INST_KIND_REMOTE="$([[ "$PROJECT" == "panel" ]] && echo panel || echo bot)"
+  [[ -n "$IJ" ]] && INST_VTABLES_REMOTE="$(jq -r '.verify_tables // ""' <<<"$IJ")" || INST_VTABLES_REMOTE=""
 fi
 
 SID="$$"
@@ -262,6 +299,7 @@ msg OK "[${PROJECT}] конфигурация изолирована (порты
 # --------------------------------------------------------------------------
 # 4. База данных из бэкапа — в той же изолированной сети
 # --------------------------------------------------------------------------
+DB_PROFILE_FAIL=""
 if [[ -n "$DB_SERVICE" ]]; then
   msg INFO "[${PROJECT}] поднимаю БД (${DB_SERVICE}) из бэкапа..."
   DB_IMAGE="$(jq -r --arg s "$DB_SERVICE" '.services[$s].image' "$RESOLVED")"
@@ -302,7 +340,26 @@ if [[ -n "$DB_SERVICE" ]]; then
         if [[ -n "$sql" ]]; then
           gzip -dc "$sql" | docker exec -i "$DB_C" psql -q -U "$DB_USER" -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>&1 || true
           rows="$(docker exec "$DB_C" psql -qtAX -U "$DB_USER" -d postgres -c 'SELECT coalesce(sum(n_live_tup),0)::bigint FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
-          msg OK "[${PROJECT}] база восстановлена из $(basename "$key") (строк ≈ ${rows})"
+          tables="$(docker exec "$DB_C" psql -qtAX -U "$DB_USER" -d postgres -c 'SELECT count(*) FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
+          msg OK "[${PROJECT}] база восстановлена из $(basename "$key") (таблиц=${tables}, строк ≈ ${rows})"
+
+          # Проверка СОДЕРЖИМОГО, не только факта заливки: профиль по типу
+          # инстанса (verify-profiles.d/<kind>.env) — обязательные таблицы,
+          # минимумы. Провал здесь помечает ВЕСЬ прогон как неудачный.
+          load_profile "${INST_KIND_REMOTE:-$([[ "$PROJECT" == "panel" ]] && echo panel || echo bot)}"
+          (( ${tables:-0} < ${PROFILE_MIN_TABLES:-1} )) && DB_PROFILE_FAIL+=" таблиц=${tables}<${PROFILE_MIN_TABLES}"
+          (( ${rows:-0} < ${PROFILE_MIN_TOTAL_ROWS:-1} )) && DB_PROFILE_FAIL+=" строк=${rows}<${PROFILE_MIN_TOTAL_ROWS}"
+          for tbl in ${INST_VTABLES_REMOTE:-} ${PROFILE_REQUIRED_TABLES:-}; do
+            [[ -n "$tbl" ]] || continue
+            cnt="$(docker exec "$DB_C" psql -qtAX -U "$DB_USER" -d postgres -c "SELECT count(*) FROM ${tbl}" 2>/dev/null || echo FAIL)"
+            if [[ "$cnt" == "FAIL" ]]; then DB_PROFILE_FAIL+=" ${tbl}:отсутствует"
+            elif [[ "$cnt" == "0" ]]; then DB_PROFILE_FAIL+=" ${tbl}:пустая"; fi
+          done
+          if [[ -n "$DB_PROFILE_FAIL" ]]; then
+            msg ERR "[${PROJECT}] проверка данных не прошла:${DB_PROFILE_FAIL}"
+          else
+            msg OK "[${PROJECT}] проверка данных пройдена (профиль ${INST_KIND_REMOTE:-panel})"
+          fi
         fi
       fi
     else
@@ -351,18 +408,20 @@ fi
 
 if (( total == 0 )); then
   fail "ни одного контейнера не запущено"
-elif [[ -n "$problems" ]] || [[ -n "$leak" ]]; then
-  msg ERR "[${PROJECT}] стек ${running}/${total}:${problems}${leak}"
+elif [[ -n "$problems" ]] || [[ -n "$leak" ]] || [[ -n "$DB_PROFILE_FAIL" ]]; then
+  msg ERR "[${PROJECT}] стек ${running}/${total}:${problems}${leak}${DB_PROFILE_FAIL:+ данные:${DB_PROFILE_FAIL}}"
   write_metric 0
   wal_notify "🔴 Проверка полного стека ${PROJECT} (изолированно)
 Хост: $(wal_hostname)
 Контейнеров живо: ${running}/${total}
-${problems}${leak}"
+${problems}${leak}${DB_PROFILE_FAIL:+
+Данные: ${DB_PROFILE_FAIL}}"
   exit 1
 else
-  msg OK "[${PROJECT}] стек поднялся полностью: ${running}/${total} контейнеров, изоляция подтверждена"
+  msg OK "[${PROJECT}] стек поднялся полностью: ${running}/${total} контейнеров, данные проверены, изоляция подтверждена"
+  msg INFO "Контейнеры и сеть уже убраны (без --keep убирается всегда, включая успешный прогон) — для ручного разбора: --keep"
   write_metric 1
   wal_notify "🟢 Полное восстановление ${PROJECT} проверено (изолированно)
 Хост: $(wal_hostname)
-Каталог из трекера + база из бэкапа + ${running}/${total} контейнеров"
+Каталог из трекера + база из бэкапа (данные проверены) + ${running}/${total} контейнеров"
 fi
