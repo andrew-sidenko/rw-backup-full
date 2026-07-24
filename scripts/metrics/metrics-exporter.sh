@@ -61,12 +61,16 @@ emit "# TYPE rw_local_latest_archive_age_seconds gauge"
 
 cat_stat() { # <category> <glob> <dir>
   local cat="$1" glob="$2" dir="$3" cnt bytes newest age=-1
-  cnt="$(find "$dir" -maxdepth 1 -name "$glob" -type f 2>/dev/null | wc -l | tr -d ' ')"
-  bytes="$(find "$dir" -maxdepth 1 -name "$glob" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
-  newest="$(find "$dir" -maxdepth 1 -name "$glob" -type f -printf '%T@\n' 2>/dev/null | sort -nr | head -n1)"
+  # Под pipefail неудача find (каталог отсутствует/недоступен) убивает весь
+  # скрипт, даже если wc/awk/sort/head после него отработали успешно — та же
+  # причина, что и у бага с du ниже. `|| true` — намеренная защита, значения
+  # по умолчанию (0/пусто) emit-ятся ниже как обычно.
+  cnt="$(find "$dir" -maxdepth 1 -name "$glob" -type f 2>/dev/null | wc -l | tr -d ' ' || true)"
+  bytes="$(find "$dir" -maxdepth 1 -name "$glob" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}' || true)"
+  newest="$(find "$dir" -maxdepth 1 -name "$glob" -type f -printf '%T@\n' 2>/dev/null | sort -nr | head -n1 || true)"
   [[ -n "$newest" ]] && age=$(( $(date +%s) - ${newest%.*} ))
-  emit "rw_local_archives_count{category=\"${cat}\"} ${cnt}"
-  emit "rw_local_archives_bytes{category=\"${cat}\"} ${bytes}"
+  emit "rw_local_archives_count{category=\"${cat}\"} ${cnt:-0}"
+  emit "rw_local_archives_bytes{category=\"${cat}\"} ${bytes:-0}"
   emit "rw_local_latest_archive_age_seconds{category=\"${cat}\"} ${age}"
 }
 cat_stat panel      'remnawave_backup_*.tar.gz' "$BACKUP_DIR"
@@ -77,7 +81,15 @@ emit "# HELP rw_wal_local_bytes Размер локального WAL-храни
 emit "# TYPE rw_wal_local_bytes gauge"
 while IFS= read -r inst; do
   [[ -n "$inst" ]] || continue
-  b="$(du -sb "${WAL_ROOT}/${inst}" 2>/dev/null | awk '{print $1}')"
+  b=0
+  # Инстанс описан в instances.d/, но WAL-архивация ещё ни разу не
+  # включалась (wal-enable не запускался) — каталога попросту нет. Раньше
+  # `du` на несуществующий путь падал ненулевым кодом, и под set -e это
+  # валило ВЕСЬ экспортер целиком: ни диски, ни локальные архивы, ни S3
+  # не публиковались из-за одного ещё не забутстрапленного инстанса.
+  if [[ -d "${WAL_ROOT}/${inst}" ]]; then
+    b="$(du -sb "${WAL_ROOT}/${inst}" 2>/dev/null | awk '{print $1}')"
+  fi
   emit "rw_wal_local_bytes{instance=\"${inst}\"} ${b:-0}"
 done < <(wal_list_instances)
 
@@ -107,7 +119,11 @@ if truthy "${FULL_METRICS_S3_SIZES:-true}" && command -v aws >/dev/null 2>&1; th
     for pair in "panel:${B_PREFIX}/panel/${HOST}/" "custom-bot:${B_PREFIX}/custom-bot/${HOST}/" "wal:${B_PREFIX}/wal/${HOST}/"; do
       cat="${pair%%:*}"; pfx="${pair#*:}"
       s3m_category_enabled "$cat" || continue
-      summ="$(s3m_aws s3 ls "s3://${B_BUCKET}/${pfx}" --recursive --summarize 2>/dev/null | tail -n2)"
+      # Тот же риск, что и с find/du выше: если aws упадёт (сеть, ключи),
+      # tail всё равно завершится успешно, но под pipefail неудача aws
+      # убьёт весь экспортер — один недоступный бэкенд остановил бы сбор
+      # метрик по ВСЕМ бэкендам и категориям. `|| true` — намеренно.
+      summ="$(s3m_aws s3 ls "s3://${B_BUCKET}/${pfx}" --recursive --summarize 2>/dev/null | tail -n2 || true)"
       if [[ -n "$summ" ]]; then
         reachable=1
         objs="$(grep -oE 'Total Objects: [0-9]+' <<<"$summ" | grep -oE '[0-9]+' || echo 0)"

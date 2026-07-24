@@ -88,9 +88,16 @@ cat > "$unit" <<EOF_U
 Description=rw-backup-full fleet web service
 After=network-online.target
 Wants=network-online.target
+OnFailure=rw-notify-failure@%n.service
 
 [Service]
 EnvironmentFile=${ENV_FILE}
+# "+" обязателен: без него ExecStartPre выполняется в ТОМ ЖЕ сандбоксе, что и
+# сам процесс (включая уже применённый ReadWritePaths), и падение из-за
+# отсутствующего каталога происходит ДО того, как этот mkdir успел бы его
+# создать — "+" запускает команду вне сандбокса, каталог гарантированно
+# появляется раньше, чем systemd строит mount namespace для основного процесса.
+ExecStartPre=+/usr/bin/mkdir -p /var/lib/node_exporter/textfile_collector
 ExecStart=${WEB_DIR}/venv/bin/python ${WEB_DIR}/app.py
 Restart=on-failure
 User=root

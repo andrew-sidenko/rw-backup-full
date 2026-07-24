@@ -68,8 +68,19 @@ if [[ -z "$TOKEN" && -f "$WEB_ENV" ]]; then
 fi
 [[ -n "$TOKEN" ]] || { msg ERR "WEB_TOKEN не найден (${WEB_ENV})"; exit 1; }
 
-MANIFEST="$(curl -fsS -m 300 -H "x-token: ${TOKEN}" "${WEB_URL}/api/fleet/manifest?force=1")" \
-  || { msg ERR "Веб-сервис недоступен: ${WEB_URL}. Песочница проверяет парк по его данным."; exit 1; }
+# Ordering в systemd (After=rw-backup-web.service) гарантирует только порядок
+# ЗАПУСКА юнитов, а не готовность HTTP-сервера принимать соединения — uvicorn
+# может подняться на секунду позже, чем systemd посчитает сервис "started".
+# Раньше единственная попытка без ретраев проваливала ВЕСЬ дневной прогон
+# (следующий шанс — только через сутки по OnCalendar).
+MANIFEST=""
+for attempt in 1 2 3 4 5; do
+  MANIFEST="$(curl -fsS -m 60 -H "x-token: ${TOKEN}" "${WEB_URL}/api/fleet/manifest?force=1" 2>/dev/null)" && break
+  msg WARN "Веб-сервис недоступен (попытка ${attempt}/5), повтор через $((attempt * 5))с..."
+  sleep $((attempt * 5))
+  MANIFEST=""
+done
+[[ -n "$MANIFEST" ]] || { msg ERR "Веб-сервис недоступен после 5 попыток: ${WEB_URL}. Проверка парка пропущена."; exit 1; }
 
 DEPTH="${DEPTH_OVERRIDE:-$(jq -r '.settings.depth // "standard"' <<<"$MANIFEST")}"
 PARALLEL="$(jq -r '.settings.parallel // 2' <<<"$MANIFEST")"

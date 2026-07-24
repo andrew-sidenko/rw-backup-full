@@ -1357,7 +1357,7 @@ status_json() {
   panel_last="$(latest_panel_backup 2>/dev/null || true)"
   panel_ts=0
   [[ -n "$panel_last" ]] && panel_ts="$(stat -c %Y "$panel_last" 2>/dev/null || echo 0)"
-  custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ')"
+  custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ' || true)"
 
   printf '{'
   printf '"host":"%s","version":"5.0.0","time":%s,' "$host" "$ts"
@@ -1386,8 +1386,12 @@ status_json() {
       [[ -e "$f" ]] || continue
       name="$(basename "$f" .env)"
       c="$(grep -E '^INST_CONTAINER=' "$f" | head -n1 | cut -d'"' -f2)"
-      spool="$(find "${wr}/${name}/spool/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ')"
-      bb="$(find "${wr}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l | tr -d ' ')"
+      # find под pipefail валит весь status --json, если WAL для инстанса ещё
+      # ни разу не включался (каталога нет) — веб-сервис показал бы сервер
+      # "offline" целиком из-за одного не забутстрапленного инстанса.
+      spool="$(find "${wr}/${name}/spool/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ' || true)"
+      bb="$(find "${wr}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l | tr -d ' ' || true)"
+      spool="${spool:-0}"; bb="${bb:-0}"
       bbts="$(cat "${wr}/${name}/state/last_success" 2>/dev/null || echo 0)"
       (( first )) || printf ','
       first=0
@@ -1514,7 +1518,7 @@ wal_status_all() {
   local f name c wal_root="/var/lib/rw-wal"
   for f in "$INSTANCES_DIR"/*.env; do
     name="$(basename "$f" .env)"
-    c="$(grep -E '^INST_CONTAINER=' "$f" | head -n1 | cut -d'"' -f2)"
+    c="$(grep -E '^INST_CONTAINER=' "$f" | head -n1 | cut -d'"' -f2 || true)"
     echo -e "${CYAN}● ${name}${RESET} (контейнер: ${c:-?})"
 
     if [[ -n "$c" ]] && docker ps -q -f "name=^${c}$" | grep -q .; then
@@ -1528,13 +1532,16 @@ wal_status_all() {
     fi
 
     local spool arch bb
-    spool="$(find "${wal_root}/${name}/spool/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l)"
-    arch="$(find "${wal_root}/${name}/archive" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l)"
-    bb="$(find "${wal_root}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l)"
-    echo "    спул=${spool}  локальный WAL=${arch}  базовых бэкапов=${bb}"
+    # Тот же класс бага, что уронил metrics-exporter.sh: инстанс описан в
+    # instances.d/, но WAL для него ещё ни разу не включался — каталога нет,
+    # find падает, и под pipefail это валит весь `wal-status` целиком.
+    spool="$(find "${wal_root}/${name}/spool/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l || true)"
+    arch="$(find "${wal_root}/${name}/archive" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l || true)"
+    bb="$(find "${wal_root}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l || true)"
+    echo "    спул=${spool:-0}  локальный WAL=${arch:-0}  базовых бэкапов=${bb:-0}"
 
     local last_meta
-    last_meta="$(find "${wal_root}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | sort -r | head -n1)"
+    last_meta="$(find "${wal_root}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | sort -r | head -n1 || true)"
     if [[ -n "$last_meta" ]]; then
       echo "    последний базовый: $(grep -E '^CREATED_AT=' "$last_meta" | cut -d'"' -f2)"
     fi

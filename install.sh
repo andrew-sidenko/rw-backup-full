@@ -124,6 +124,12 @@ if ask "Шаг 2: копирование файлов v5" \
   for f in "$SRC_DIR"/scripts/metrics/*.sh; do put 0755 "$f" "${INSTALL_DIR}/scripts/metrics/$(basename "$f")"; done
   mkdir -p "${INSTALL_DIR}/scripts/track"
   for f in "$SRC_DIR"/scripts/track/*.sh; do put 0755 "$f" "${INSTALL_DIR}/scripts/track/$(basename "$f")"; done
+  mkdir -p "${INSTALL_DIR}/scripts/host"
+  for f in "$SRC_DIR"/scripts/host/*.sh; do put 0755 "$f" "${INSTALL_DIR}/scripts/host/$(basename "$f")"; done
+  if [[ -f "$SRC_DIR/tmpfiles.d/rw-backup-full.conf" ]]; then
+    put 0644 "$SRC_DIR/tmpfiles.d/rw-backup-full.conf" /etc/tmpfiles.d/rw-backup-full.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/rw-backup-full.conf 2>/dev/null || true
+  fi
   for f in "$SRC_DIR"/scripts/sandbox/*.sh; do
     put 0755 "$f" "${INSTALL_DIR}/scripts/sandbox/$(basename "$f")"
   done
@@ -261,7 +267,7 @@ comp_on() { [[ " ${CUR_COMPONENTS} " == *" $1 "* ]]; }
 # --------------------------------------------------------------------------
 UNITS_PROD=(rw-wal-ship@.service rw-wal-ship@.timer rw-basebackup@.service rw-basebackup@.timer \
             rw-metrics-export.service rw-metrics-export.timer)
-UNITS_ALL=(rw-sandbox-verify.service rw-sandbox-verify.timer)
+UNITS_ALL=(rw-sandbox-verify.service rw-sandbox-verify.timer rw-notify-failure@.service)
 if ask "Шаг 5: systemd-юниты" \
 "Будет сделано:
   - установка/обновление юнитов: $([[ $ROLE == prod ]] && echo "${UNITS_PROD[*]} ") ${UNITS_ALL[*]}

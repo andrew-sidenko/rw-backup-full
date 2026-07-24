@@ -45,7 +45,9 @@ shipped=0
 failed=0
 s3_failed=0
 
-incoming_count="$(find "${INST_SPOOL_DIR}/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ')"
+# find под pipefail валит скрипт, если каталога нет (spool ещё не создан) —
+# та же причина, что уронила metrics-exporter.sh на этом же классе бага.
+incoming_count="$(find "${INST_SPOOL_DIR}/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ' || true)"
 msg INFO "[${INSTANCE}] шиппер: в спуле ${incoming_count} сегментов"
 
 mapfile -t WAL_BACKENDS < <(wal_s3_backends)
@@ -154,9 +156,11 @@ fi
 # --------------------------------------------------------------------------
 # 3. Метрики
 # --------------------------------------------------------------------------
-spool_count="$(find "$SPOOL_IN" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ')"
-archive_count="$(find "$INST_ARCHIVE_DIR" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ')"
-archive_bytes="$(du -sb "$INST_ARCHIVE_DIR" 2>/dev/null | awk '{print $1}')"
+spool_count="$(find "$SPOOL_IN" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ' || true)"
+archive_count="$(find "$INST_ARCHIVE_DIR" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ' || true)"
+archive_bytes="$(du -sb "$INST_ARCHIVE_DIR" 2>/dev/null | awk '{print $1}' || true)"
+spool_count="${spool_count:-0}"
+archive_count="${archive_count:-0}"
 archive_bytes="${archive_bytes:-0}"
 pending_s3="$(( s3_failed ))"
 

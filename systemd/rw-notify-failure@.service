@@ -1,0 +1,6 @@
+[Unit]
+Description=rw-backup-full: notify Telegram about failure of %i
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rw-backup-restore/scripts/host/notify-unit-failure.sh %i

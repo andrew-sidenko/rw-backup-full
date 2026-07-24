@@ -1,8 +1,12 @@
 [Unit]
+OnFailure=rw-notify-failure@%n.service
 Description=rw-backup-full: sandbox backup verification
-After=docker.service network-online.target
+After=docker.service network-online.target rw-backup-web.service
 Requires=docker.service
 Wants=network-online.target
+# Не Requires=rw-backup-web.service: на хостах без компонента web юнита
+# может не существовать вовсе — After= в этом случае просто не действует,
+# а Requires= намертво отказал бы стартовать таймер.
 
 [Service]
 Type=oneshot
