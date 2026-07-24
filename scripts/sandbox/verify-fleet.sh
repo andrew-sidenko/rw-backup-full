@@ -550,6 +550,34 @@ echo "${head_line}"
 echo "${SUMMARY}"
 echo "========================================"
 
+# История прогонов для веб-панели (JSON, последние N файлов).
+HISTORY_DIR="${VERIFY_HISTORY_DIR:-${INSTALL_DIR}/web-data/verify-history}"
+mkdir -p "$HISTORY_DIR"
+HIST_TS="$(date -u +%Y%m%d_%H%M%S)"
+HIST_FILE="${HISTORY_DIR}/fleet_${HIST_TS}.json"
+{
+  printf '{'
+  printf '"type":"fleet","ts":%s,"host":"%s","depth":"%s","total":%s,"passed":%s,' \
+    "$(date +%s)" "$(wal_hostname)" "$DEPTH" "$TOTAL" "$PASSED"
+  printf '"results":['
+  first=1
+  for rf in "$RESULTS_DIR"/r*; do
+    [[ -e "$rf" ]] || continue
+    line="$(cat "$rf")"
+    ok=false; [[ "$line" == OK* ]] && ok=true
+    src_l="$(sed -n 's/^[A-Z]* \[\([^ ×]*\).*/\1/p' <<<"$line")"
+    detail="$(printf '%s' "${line#* }" | sed 's/"/\\"/g')"
+    (( first )) || printf ','
+    first=0
+    printf '{"ok":%s,"source":"%s","detail":"%s"}' "$ok" "${src_l:-?}" "$detail"
+  done
+  printf ']}'
+  printf '\n'
+} > "$HIST_FILE"
+chmod 644 "$HIST_FILE" 2>/dev/null || true
+# Ротация: оставляем не больше 60 прогонов.
+ls -1t "$HISTORY_DIR"/fleet_*.json 2>/dev/null | tail -n +61 | xargs -r rm -f --
+
 # Персональные отчёты — в Telegram каждого сервера (настройки из манифеста)
 while IFS= read -r srv; do
   src="$(jq -r '.source // .id' <<<"$srv")"

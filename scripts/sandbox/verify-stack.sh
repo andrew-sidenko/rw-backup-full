@@ -89,12 +89,45 @@ load_profile() { # <kind>
 # скрипту — без этого путь в S3 указывал бы на хост песочницы, а не на
 # сервер, где реально лежат бэкапы.
 REMOTE_S3D=""
+CREDS_ROOT="${FLEET_CREDS_DIR:-${INSTALL_DIR}/fleet-creds}"
 if [[ -n "$REMOTE_SOURCE" ]]; then
+  # 1) Свежий кэш sync-fleet-creds (быстрее и не зависит от краткого даунтайма веб).
+  # 2) Иначе — манифест из веб-сервиса (как раньше).
+  CACHED="${CREDS_ROOT}/${REMOTE_SOURCE}"
+  USED_CACHE="false"
+  if [[ -d "${CACHED}/s3.d" ]] && ls "${CACHED}/s3.d"/*.env >/dev/null 2>&1; then
+    REMOTE_S3D="$(mktemp -d)"
+    cp -a "${CACHED}/s3.d/." "${REMOTE_S3D}/"
+    export S3D_DIR="$REMOTE_S3D"
+    if [[ -f "${CACHED}/telegram.env" ]]; then
+      # shellcheck disable=SC1090
+      set +u; source "${CACHED}/telegram.env"; set -u
+      [[ -n "${RW_SOURCE_ID:-}" ]] && export RW_SOURCE_ID
+    fi
+    export RW_SOURCE_ID="${RW_SOURCE_ID:-$REMOTE_SOURCE}"
+    if [[ -n "${FULL_TG_BOT_TOKEN:-}" && -n "${FULL_TG_CHAT_ID:-}" ]]; then
+      :
+    else
+      msg WARN "В кэше ${CACHED} нет Telegram — уведомление может не уйти"
+    fi
+    USED_CACHE="true"
+    age_note=""
+    if [[ -f "${CACHED}/synced_at" ]]; then
+      age_s=$(( $(date +%s) - $(cat "${CACHED}/synced_at" 2>/dev/null || echo 0) ))
+      age_note=" (синхр. ${age_s}с назад)"
+    fi
+    msg OK "Источник: ${RW_SOURCE_ID} (S3/TG из fleet-creds${age_note})"
+    # Тип инстанса из кэша не хранится — ниже дотянем из манифеста, если веб доступен.
+    INST_KIND_REMOTE="$([[ "$PROJECT" == "panel" ]] && echo panel || echo bot)"
+    INST_VTABLES_REMOTE=""
+  fi
+
+  if [[ "$USED_CACHE" != "true" ]]; then
   WEB_ENV="${WEB_ENV:-/etc/rw-backup-web.env}"
   WEB_URL="${RW_WEB_URL:-http://127.0.0.1:8787}"
   TOKEN="${WEB_TOKEN:-}"
   [[ -z "$TOKEN" && -f "$WEB_ENV" ]] && TOKEN="$(grep -E '^WEB_TOKEN=' "$WEB_ENV" | head -n1 | cut -d= -f2- || true)"
-  [[ -n "$TOKEN" ]] || { msg ERR "WEB_TOKEN не найден (${WEB_ENV}) — нужен для --source"; exit 1; }
+  [[ -n "$TOKEN" ]] || { msg ERR "WEB_TOKEN не найден (${WEB_ENV}) — нужен для --source (или сначала: rw-backup-full sync-creds)"; exit 1; }
 
   MANIFEST=""
   for attempt in 1 2 3; do
@@ -149,6 +182,26 @@ if [[ -n "$REMOTE_SOURCE" ]]; then
   IJ="$(jq -c --arg n "$PROJECT" '.instances[]? | select(.name == $n)' <<<"$SRV_JSON" | head -n1)"
   [[ -n "$IJ" ]] && INST_KIND_REMOTE="$(jq -r '.kind // "bot"' <<<"$IJ")" || INST_KIND_REMOTE="$([[ "$PROJECT" == "panel" ]] && echo panel || echo bot)"
   [[ -n "$IJ" ]] && INST_VTABLES_REMOTE="$(jq -r '.verify_tables // ""' <<<"$IJ")" || INST_VTABLES_REMOTE=""
+  fi
+
+  # Если взяли кэш — по возможности дополним kind/verify_tables из манифеста.
+  if [[ "$USED_CACHE" == "true" ]]; then
+    WEB_ENV="${WEB_ENV:-/etc/rw-backup-web.env}"
+    WEB_URL="${RW_WEB_URL:-http://127.0.0.1:8787}"
+    TOKEN="${WEB_TOKEN:-}"
+    [[ -z "$TOKEN" && -f "$WEB_ENV" ]] && TOKEN="$(grep -E '^WEB_TOKEN=' "$WEB_ENV" | head -n1 | cut -d= -f2- || true)"
+    if [[ -n "$TOKEN" ]]; then
+      MANIFEST="$(curl -fsS -m 20 -H "x-token: ${TOKEN}" "${WEB_URL}/api/fleet/manifest" 2>/dev/null || true)"
+      if [[ -n "$MANIFEST" ]]; then
+        SRV_JSON="$(jq -c --arg s "$REMOTE_SOURCE" '.servers[] | select(.source == $s or .id == $s)' <<<"$MANIFEST" | head -n1 || true)"
+        if [[ -n "$SRV_JSON" ]]; then
+          IJ="$(jq -c --arg n "$PROJECT" '.instances[]? | select(.name == $n)' <<<"$SRV_JSON" | head -n1 || true)"
+          [[ -n "$IJ" ]] && INST_KIND_REMOTE="$(jq -r '.kind // "bot"' <<<"$IJ")"
+          [[ -n "$IJ" ]] && INST_VTABLES_REMOTE="$(jq -r '.verify_tables // ""' <<<"$IJ")"
+        fi
+      fi
+    fi
+  fi
 fi
 
 SID="$$"
@@ -633,6 +686,13 @@ if (( total == 0 )); then
 elif [[ -n "$problems" ]] || [[ -n "$leak" ]] || [[ -n "$DB_PROFILE_FAIL" ]] || [[ -n "$svc_problems" ]]; then
   msg ERR "[${PROJECT}] стек ${running}/${total}:${problems}${svc_problems}${leak}${DB_PROFILE_FAIL:+ данные:${DB_PROFILE_FAIL}}"
   write_metric 0
+  # История для веб-панели
+  HISTORY_DIR="${VERIFY_HISTORY_DIR:-${INSTALL_DIR}/web-data/verify-history}"
+  mkdir -p "$HISTORY_DIR"
+  printf '{"type":"stack","ts":%s,"host":"%s","project":"%s","source":"%s","ok":false,"detail":%s}\n' \
+    "$(date +%s)" "$(wal_hostname)" "$PROJECT" "${RW_SOURCE_ID:-$(wal_hostname)}" \
+    "$(jq -Rn --arg s "containers ${running}/${total}${problems}${svc_problems}${DB_PROFILE_FAIL:+ data:${DB_PROFILE_FAIL}}" '$s' 2>/dev/null || echo "\"fail\"")" \
+    > "${HISTORY_DIR}/stack_$(date -u +%Y%m%d_%H%M%S).json" 2>/dev/null || true
   wal_notify "🔴 Проверка полного стека ${PROJECT} (изолированно)
 Хост: $(wal_hostname)
 Контейнеров живо: ${running}/${total}
@@ -643,6 +703,13 @@ else
   msg OK "[${PROJECT}] стек поднялся полностью: ${running}/${total} контейнеров, сервисов проверено ${svc_checked}, данные проверены, изоляция подтверждена"
   msg INFO "Контейнеры и сеть уже убраны (без --keep убирается всегда, включая успешный прогон) — для ручного разбора: --keep"
   write_metric 1
+  HISTORY_DIR="${VERIFY_HISTORY_DIR:-${INSTALL_DIR}/web-data/verify-history}"
+  mkdir -p "$HISTORY_DIR"
+  printf '{"type":"stack","ts":%s,"host":"%s","project":"%s","source":"%s","ok":true,"detail":"containers %s/%s services %s"}\n' \
+    "$(date +%s)" "$(wal_hostname)" "$PROJECT" "${RW_SOURCE_ID:-$(wal_hostname)}" \
+    "$running" "$total" "$svc_checked" \
+    > "${HISTORY_DIR}/stack_$(date -u +%Y%m%d_%H%M%S).json" 2>/dev/null || true
+  ls -1t "$HISTORY_DIR"/stack_*.json 2>/dev/null | tail -n +41 | xargs -r rm -f --
   wal_notify "🟢 Полное восстановление ${PROJECT} проверено (изолированно)
 Хост: $(wal_hostname)
 Каталог из трекера + БД (${DB_MODE_DESC:-?}) + ${running}/${total} контейнеров, сервисов отвечает ${svc_checked}"
