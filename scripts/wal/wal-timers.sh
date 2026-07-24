@@ -49,13 +49,16 @@ TZ_OPT="${INST_SCHEDULE_TZ:-}"
 # запуск строго по календарю; Persistent=true в шаблоне добьёт пропущенные
 # запуски после простоя сервера.
 render_dropin() {
-  local file="$1" times="$2" interval="$3" desc="$4"
+  local file="$1" times="$2" interval="$3" desc="$4" jitter="${5:-0}"
   {
     echo "# managed-by: rw-backup-full (расписание из instances.d/${INSTANCE}.env)"
     echo "# ${desc}"
     echo "[Timer]"
     echo "OnUnitActiveSec="
     echo "OnBootSec="
+    # Джиттер только для тяжёлого базового бэкапа: разносит нагрузку на S3 между
+    # серверами. WAL-шиппер идёт непрерывно, его сдвигать нельзя (растёт RPO).
+    [[ "$jitter" =~ ^[0-9]+$ ]] && (( jitter > 0 )) && echo "RandomizedDelaySec=${jitter}s"
     if [[ -n "$times" ]]; then
       echo "OnCalendar="
       wal_render_calendar_lines "$times" "$TZ_OPT"
@@ -97,10 +100,14 @@ d1="/etc/systemd/system/rw-wal-ship@${INSTANCE}.timer.d"
 d2="/etc/systemd/system/rw-basebackup@${INSTANCE}.timer.d"
 mkdir -p "$d1" "$d2"
 
+base_jitter="${FULL_SCHEDULE_JITTER_SEC:-900}"
+[[ "$base_jitter" =~ ^[0-9]+$ ]] || base_jitter=900
+
+# WAL-ship — без джиттера (непрерывность важнее); базовый бэкап — с джиттером.
 render_dropin "${d1}/override.conf" "$ship_times" "${ship_min}min" \
-  "Отправка WAL: $([[ -n "$ship_times" ]] && echo "по времени: ${ship_times}${TZ_OPT:+ ($TZ_OPT)}" || echo "каждые ${ship_min} мин")"
+  "Отправка WAL: $([[ -n "$ship_times" ]] && echo "по времени: ${ship_times}${TZ_OPT:+ ($TZ_OPT)}" || echo "каждые ${ship_min} мин")" 0
 render_dropin "${d2}/override.conf" "$base_times" "${base_h}h" \
-  "Базовый бэкап: $([[ -n "$base_times" ]] && echo "по времени: ${base_times}${TZ_OPT:+ ($TZ_OPT)}" || echo "каждые ${base_h} ч")"
+  "Базовый бэкап: $([[ -n "$base_times" ]] && echo "по времени: ${base_times}${TZ_OPT:+ ($TZ_OPT)}" || echo "каждые ${base_h} ч")" "$base_jitter"
 
 systemctl daemon-reload
 # restart, а не только enable --now: активный таймер должен перечитать drop-in

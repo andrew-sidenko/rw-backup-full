@@ -37,6 +37,9 @@ FULL_LOCAL_RETENTION_DAYS="3"
 FULL_EXTERNAL_S3_RETENTION_DAYS="10"
 FULL_TIMER_INTERVAL_HOURS="3"
 FULL_TIMER_MODE="backup-all"
+# Случайный сдвиг тяжёлых операций (сек): разносит нагрузку на S3 между серверами.
+# systemd -> RandomizedDelaySec таймера; контейнер/cron -> пауза внутри скрипта.
+FULL_SCHEDULE_JITTER_SEC="900"
 FULL_INCLUDE_EXTRA_CONFIGS="true"
 FULL_PANEL_EXTERNAL_S3_ENABLED="true"
 FULL_CUSTOM_EXTERNAL_S3_ENABLED="true"
@@ -1220,19 +1223,23 @@ IOSchedulingPriority=7
 EOF_SERVICE
 
   local times="${FULL_TIMER_TIMES:-}" tz="${FULL_SCHEDULE_TZ:-}" cal="" t desc
+  local jitter="${FULL_SCHEDULE_JITTER_SEC:-900}"
+  [[ "$jitter" =~ ^[0-9]+$ ]] || jitter=900
+  local rnd=""
+  (( jitter > 0 )) && rnd="RandomizedDelaySec=${jitter}s"$'\n'
   if [[ -n "$times" ]]; then
     times="$(parse_times_list "$times")" || { msg ERR "FULL_TIMER_TIMES некорректен"; return 1; }
     for t in $times; do
       cal+="OnCalendar=*-*-* ${t}${tz:+ ${tz}}"$'\n'
     done
     desc="Run rw-backup-full at: ${times}${tz:+ (${tz})}"
-    msg INFO "Расписание: ${times}${tz:+ (${tz})}"
+    msg INFO "Расписание: ${times}${tz:+ (${tz})}${jitter:+; джиттер до ${jitter}s}"
     cat > /etc/systemd/system/rw-backup-full.timer <<EOF_TIMER
 [Unit]
 Description=${desc}
 
 [Timer]
-${cal}Persistent=true
+${cal}${rnd}Persistent=true
 Unit=rw-backup-full.service
 
 [Install]
@@ -1246,7 +1253,7 @@ Description=Run rw-backup-full every ${hours} hours
 [Timer]
 OnBootSec=10min
 OnUnitActiveSec=${hours}h
-Persistent=true
+${rnd}Persistent=true
 Unit=rw-backup-full.service
 
 [Install]
@@ -1262,6 +1269,9 @@ EOF_TIMER
 }
 
 run_timer_mode() {
+  # Разнос нагрузки на S3 между серверами (в контейнере/cron; под systemd —
+  # через RandomizedDelaySec таймера, тогда функция сама пропустит паузу).
+  declare -F wal_jitter_sleep >/dev/null && wal_jitter_sleep
   case "${FULL_TIMER_MODE:-backup-all}" in
     backup-all) backup_all ;;
     panel-backup) backup_panel_only ;;
@@ -1278,7 +1288,9 @@ show_config_summary() {
   echo "BACKUP_DIR:                         ${BACKUP_DIR}"
   echo
   echo "FULL_TIMER_MODE:                    ${FULL_TIMER_MODE}"
+  echo "FULL_TIMER_TIMES:                   ${FULL_TIMER_TIMES:-(интервал)}"
   echo "FULL_TIMER_INTERVAL_HOURS:          ${FULL_TIMER_INTERVAL_HOURS}"
+  echo "FULL_SCHEDULE_JITTER_SEC:           ${FULL_SCHEDULE_JITTER_SEC:-900}"
   echo "FULL_LOCAL_RETENTION_DAYS:          ${FULL_LOCAL_RETENTION_DAYS}"
   echo "FULL_EXTERNAL_S3_RETENTION_DAYS:    ${FULL_EXTERNAL_S3_RETENTION_DAYS}"
   echo
