@@ -509,6 +509,7 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 <button onclick="addDlg.showModal()">+ Добавить сервер</button>
 </div></div>
 <div class="card"><b>Песочница (этот сервер):</b> <span id="sandbox" class="mut">…</span></div>
+<div class="card"><b>Парк (сводно):</b> <span id="fleet" class="mut">…</span></div>
 <div class="card"><b>История проверок:</b>
 <button onclick="loadHistory()">⟳</button>
 <div id="history" class="mut">…</div></div>
@@ -573,21 +574,59 @@ async function refreshAll(){
   loadSandbox();
   loadHistory();
 }
+function fmtB(n){ if(n==null) return '—'; const u=['Б','КБ','МБ','ГБ','ТБ']; let i=0; n=+n; while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(i?1:0)+u[i]; }
+function ago(ts,now){ if(!ts) return 'нет'; const s=now-ts; if(s<3600) return Math.round(s/60)+'м назад'; if(s<86400) return Math.round(s/3600)+'ч назад'; return Math.round(s/86400)+'д назад'; }
+window._fleet = {};
+function renderFleetTotals(){
+  const v=Object.values(window._fleet); const el=$('fleet'); if(!el||!v.length) return;
+  const online=v.filter(x=>x.online).length;
+  const errs=v.reduce((a,x)=>a+(x.errors||0),0);
+  const s3=v.reduce((a,x)=>a+(x.s3bytes||0),0);
+  el.innerHTML = `серверов online: <b class="${online===v.length?'ok':'bad'}">${online}/${v.length}</b>`+
+    ` · суммарно в S3: <b>${fmtB(s3)}</b>`+
+    (errs?` · <b class="bad">ошибок: ${errs}</b>`:` · <span class="ok">ошибок нет</span>`);
+}
 async function loadStatus(sid){
   try{
     const r = await api('GET',`/api/servers/${sid}/status`);
     const b = $('st-'+sid), i = $('info-'+sid);
-    if(!r.ok){ b.textContent='offline'; b.className='badge bad'; i.textContent=r.error||''; return; }
-    const st = r.status;
+    if(!r.ok){ b.textContent='offline'; b.className='badge bad'; i.textContent=r.error||''; window._fleet[sid]={online:false}; renderFleetTotals(); return; }
+    const st = r.status; const now = st.time||Math.floor(Date.now()/1000);
     b.textContent='online'; b.className='badge ok';
-    const age = st.panel.last_backup_ts? Math.round((st.time-st.panel.last_backup_ts)/3600)+'ч назад':'нет';
-    const wal = (st.wal_instances||[]).map(w=>`${w.name}:${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups}`).join('  ')||'—';
+    const page = ago(st.panel.last_backup_ts, now);
     const comps = st.components || '—';
-    const disk = st.disk_free_bytes!=null ? (st.disk_free_bytes/2**30).toFixed(1)+' ГБ своб.' : '—';
-    i.innerHTML = `компоненты: <code>${comps}</code><br>
-      панель: ${st.panel.detected?'да':'нет'}, бэкап: ${age} · ботов-архивов: ${st.custom_archives}
-      · диск: ${disk}<br>S3: ${(st.s3_backends||[]).map(b=>b.name+(b.enabled?'':'(off)')).join(', ')||'—'}<br>WAL: ${wal}`;
+    const disk = st.disk_free_bytes!=null ? fmtB(st.disk_free_bytes)+' своб.' : '—';
+    const locsz = st.local_backup_bytes!=null ? fmtB(st.local_backup_bytes) : '—';
+    const errs = st.errors||0;
+    const s3 = (st.s3_backends||[]).map(x=>{
+      const warn = x.reachable===false?' <span class="bad">⚠ недоступен</span>':'';
+      const off = x.enabled?'':'(off)';
+      return `&nbsp;&nbsp;${x.name}${off}: <b>${fmtB(x.bytes)}</b> / ${x.objects||0} об.${warn}`;
+    }).join('<br>') || '&nbsp;&nbsp;—';
+    const wal = (st.wal_instances||[]).map(w=>
+      `&nbsp;&nbsp;${w.name}: ${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups} · база ${ago(w.last_basebackup_ts,now)} · WAL ${ago(w.last_wal_ts,now)}`
+    ).join('<br>') || '&nbsp;&nbsp;—';
+    i.innerHTML = `компоненты: <code>${comps}</code>`+
+      (errs?` · <b class="bad">ошибок: ${errs}</b>`:` · <span class="ok">ошибок нет</span>`)+`<br>`+
+      `панель: ${st.panel.detected?'да':'нет'}, бэкап: ${page} · ботов-архивов: ${st.custom_archives}<br>`+
+      `место: занято локально <b>${locsz}</b> · диск ${disk}<br>`+
+      `S3-хранилища:<br>${s3}<br>`+
+      `WAL:<br>${wal}`;
+    const s3sum = (st.s3_backends||[]).reduce((a,x)=>a+(+x.bytes||0),0);
+    window._fleet[sid]={online:true, errors:errs, s3bytes:s3sum};
+    renderFleetTotals();
+    loadServerVerdict(sid);
   }catch(e){ if(e!=='auth'){ $('st-'+sid).textContent='err'; $('st-'+sid).className='badge bad'; } }
+}
+async function loadServerVerdict(sid){
+  try{
+    const r = await api('GET',`/api/servers/${sid}/verify?limit=1`);
+    const i = $('info-'+sid); if(!i||!r.history||!r.history.length) return;
+    const h=r.history[0];
+    const ok = h.type==='fleet' ? (h.passed===h.total) : h.ok;
+    const when = h.ts? new Date(h.ts*1000).toLocaleString():'';
+    i.innerHTML += `<br>последняя проверка: <b class="${ok?'ok':'bad'}">${ok?'ПРОЙДЕНА':'ОШИБКА'}</b> <span class="mut">${when}</span>`;
+  }catch(e){}
 }
 async function loadSandbox(){
   const r = await api('GET','/api/sandbox/summary');
