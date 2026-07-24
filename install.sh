@@ -130,6 +130,9 @@ if ask "Шаг 2: копирование файлов v5" \
     put 0644 "$SRC_DIR/tmpfiles.d/rw-backup-full.conf" /etc/tmpfiles.d/rw-backup-full.conf
     systemd-tmpfiles --create /etc/tmpfiles.d/rw-backup-full.conf 2>/dev/null || true
   fi
+  if [[ -f "$SRC_DIR/logrotate.d/rw-backup-full" ]] && [[ -d /etc/logrotate.d ]]; then
+    put 0644 "$SRC_DIR/logrotate.d/rw-backup-full" /etc/logrotate.d/rw-backup-full
+  fi
   for f in "$SRC_DIR"/scripts/sandbox/*.sh; do
     put 0755 "$f" "${INSTALL_DIR}/scripts/sandbox/$(basename "$f")"
   done
@@ -164,6 +167,12 @@ else
 fi
 [[ "$ROLE" == "prod" && ! -f "$ORIGINAL_CONFIG" && ! $ORIG_DETECTED == true ]] && \
   say "Оригинальный config.env отсутствует — не нужен: v5 делает panel-бэкап встроенным движком"
+
+if [[ "$ROLE" == "prod" && "$ORIG_DETECTED" == "true" ]]; then
+  say "Обнаружен оригинальный distillium-скрипт. v5 его не вызывает (панель — встроенный движок),"
+  say "но его СОБСТВЕННАЯ cron-запись могла остаться и дублировать бэкап параллельно."
+  say "Проверить и при необходимости отключить: sudo rw-backup-full decommission-original"
+fi
 
 # --------------------------------------------------------------------------
 # 4. Миграция (настройки не дублируются)

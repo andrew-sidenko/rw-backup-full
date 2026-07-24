@@ -1,0 +1,29 @@
+# rw-backup-full: ротация файловых логов проекта.
+#
+# Основной путь логирования — journald (systemd) + Telegram-уведомления,
+# отдельных лог-файлов у самого rw-backup-full нет. Но на серверах, где
+# ранее (до перехода на v5) стоял оригинальный distillium-скрипт, часто
+# остаётся его собственный cron-лог, растущий без ограничений — включаем
+# ротацию и для него, даже если сам job уже отключён decommission-original
+# (старый файл никуда не делся и продолжал бы занимать место).
+/var/log/rw_backup_cron.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    maxsize 50M
+}
+
+# state/basebackup.err и подобные диагностические файлы WAL-слоя — на
+# случай, если на каком-то инстансе накопится история ошибок.
+/var/lib/rw-wal/*/state/*.err {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    maxsize 10M
+}

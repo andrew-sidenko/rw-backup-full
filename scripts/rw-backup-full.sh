@@ -194,7 +194,14 @@ send_full_telegram_message() {
     args=(--proxy "$FULL_TG_PROXY" "${args[@]}")
   fi
 
-  curl "${args[@]}" >/dev/null 2>&1
+  # Разовые сетевые сбои (curl exit 56/28/7) не должны стоить пропущенного
+  # уведомления — 3 попытки с нарастающей паузой, как и при выгрузке в S3.
+  local attempt
+  for attempt in 1 2 3; do
+    curl "${args[@]}" >/dev/null 2>&1 && return 0
+    sleep $((attempt * 3))
+  done
+  return 1
 }
 
 full_s3_upload() {
@@ -1445,6 +1452,58 @@ fleet_manifest() {
 # Приводит systemd-таймеры в соответствие с FULL_COMPONENTS: лишние
 # останавливаются, нужные включаются. Юниты не удаляются — возврат
 # компонента не требует переустановки.
+# Обнаруживает и (с согласия) отключает cron-запись оригинального
+# distillium-скрипта — она ставится ЕГО СОБСТВЕННЫМ установщиком отдельно
+# от наших systemd-юнитов, и после перехода на v5 (встроенный движок панели)
+# продолжает работать по инерции. Реальный найденный на проде эффект:
+# оригинал и rw-backup-full.service оба гоняли pg_dumpall + tar одного и
+# того же /opt/remnawave в один и тот же каталог — двойная нагрузка на БД
+# и риск гонки при записи.
+decommission_original() {
+  local found=0 crontab_hits cron_d_hits
+
+  crontab_hits="$(crontab -l 2>/dev/null | grep -nE 'backup-restore\.sh|rw-backup([^-_a-zA-Z]|$)' || true)"
+  cron_d_hits=""
+  if [[ -d /etc/cron.d ]]; then
+    cron_d_hits="$(grep -rlE 'backup-restore\.sh' /etc/cron.d/ 2>/dev/null || true)"
+  fi
+
+  [[ -n "$crontab_hits" ]] && found=1
+  [[ -n "$cron_d_hits" ]] && found=1
+
+  if (( found == 0 )); then
+    msg OK "Cron-записей оригинального rw-backup не найдено — нечего отключать"
+    return 0
+  fi
+
+  echo -e "${YELLOW}${BOLD}Найдено дублирование: оригинальный distillium-скрипт всё ещё в cron${RESET}"
+  echo "Панель уже бэкапится встроенным движком (rw-backup-full.service);"
+  echo "эти записи — leftover от установки, которая была ДО перехода на v5."
+  [[ -n "$crontab_hits" ]] && { echo; echo "В crontab root:"; echo "$crontab_hits" | sed 's/^/  /'; }
+  [[ -n "$cron_d_hits" ]] && { echo; echo "В /etc/cron.d/:"; echo "$cron_d_hits" | sed 's/^/  /'; }
+  echo
+  echo "Будет сделано: строки закомментированы (не удалены — обратимо)."
+  echo "Crontab root предварительно сохраняется в /root/.crontab.before-rw-backup-full.<дата>."
+  read -r -p "Отключить дублирующий cron? [y/N]: " a
+  [[ "$a" == y || "$a" == Y ]] || { msg INFO "Отменено, cron не тронут"; return 0; }
+
+  if [[ -n "$crontab_hits" ]]; then
+    local bak="/root/.crontab.before-rw-backup-full.$(date +%Y%m%d_%H%M%S)"
+    crontab -l > "$bak" 2>/dev/null || true
+    crontab -l 2>/dev/null | sed -E 's@^([^#].*(backup-restore\.sh|rw-backup[^-_a-zA-Z]).*)@# disabled by rw-backup-full (dup with v5 engine): \1@' | crontab -
+    msg OK "crontab root обновлён (резерв: ${bak})"
+  fi
+  if [[ -n "$cron_d_hits" ]]; then
+    local f
+    for f in $cron_d_hits; do
+      cp -a "$f" "${f}.before-rw-backup-full.$(date +%Y%m%d_%H%M%S)"
+      sed -i -E 's@^([^#].*backup-restore\.sh.*)@# disabled by rw-backup-full (dup with v5 engine): \1@' "$f"
+      msg OK "отключено в ${f} (резерв рядом)"
+    done
+  fi
+  msg OK "Готово. Откат: восстановить файл(ы) резерва или раскомментировать строки."
+}
+
 apply_components() {
   local changed=0
   _tm() { # <компонент> <юнит>
@@ -1670,6 +1729,7 @@ WAL / PITR (v4):
 Компоненты:
   rw-backup-full components                      что включено на сервере
   rw-backup-full apply-components                применить FULL_COMPONENTS к таймерам
+  rw-backup-full decommission-original          отключить дублирующий cron оригинального rw-backup
   rw-backup-full verify-fleet [--server ID] [--backend N] [--depth D]
                                                 проверка парка: сервер × хранилище
   rw-backup-full fleet-pack pack|unpack         перенос настроек песочницы одним файлом
@@ -1753,6 +1813,8 @@ case "$cmd" in
     done ;;
   apply-components)
     apply_components ;;
+  decommission-original)
+    decommission_original ;;
   verify)
     shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-entry.sh" "$@" ;;
   verify-fleet)

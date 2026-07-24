@@ -284,9 +284,17 @@ wal_notify() {
   [[ -n "${FULL_TG_MESSAGE_THREAD_ID:-}" ]] &&
     form+=(-F "message_thread_id=${FULL_TG_MESSAGE_THREAD_ID}")
 
-  curl -sS -m 25 "${proxy[@]}" \
-    "https://api.telegram.org/bot${FULL_TG_BOT_TOKEN}/sendMessage" \
-    "${form[@]}" >/dev/null 2>&1 || true
+  # Разовые сетевые сбои (curl exit 56/28/7 — сброс соединения, таймаут)
+  # не должны стоить пропущенного уведомления: 3 попытки с нарастающей паузой,
+  # как и для выгрузок в S3.
+  local attempt
+  for attempt in 1 2 3; do
+    curl -sS -m 25 "${proxy[@]}" \
+      "https://api.telegram.org/bot${FULL_TG_BOT_TOKEN}/sendMessage" \
+      "${form[@]}" >/dev/null 2>&1 && return 0
+    sleep $((attempt * 3))
+  done
+  return 0
 }
 
 # --------------------------------------------------------------------------

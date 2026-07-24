@@ -214,7 +214,7 @@ rw_wal_retention_last_run_timestamp_seconds{instance="${INSTANCE}"} $(date +%s)
 # HELP rw_basebackup_count Количество хранимых базовых бэкапов.
 # TYPE rw_basebackup_count gauge
 rw_basebackup_count{instance="${INSTANCE}",location="local"} ${#local_metas[@]}
-rw_basebackup_count{instance="${INSTANCE}",location="s3"} ${#s3_metas[@]:-0}
+rw_basebackup_count{instance="${INSTANCE}",location="s3"} ${#s3_metas[@]}
 EOF_M
 
 exit 0

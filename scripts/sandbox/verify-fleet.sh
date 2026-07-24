@@ -121,8 +121,12 @@ maws() { # maws <backend_json> <aws args...>
 
 tg_send() { # tg_send <token> <chat> <text>
   [[ -n "$1" && -n "$2" ]] || return 0
-  curl -sS -m 30 "https://api.telegram.org/bot$1/sendMessage" \
-    -d "chat_id=$2" --data-urlencode "text=$3" >/dev/null 2>&1 || true
+  local attempt
+  for attempt in 1 2 3; do
+    curl -sS -m 30 "https://api.telegram.org/bot$1/sendMessage" \
+      -d "chat_id=$2" --data-urlencode "text=$3" >/dev/null 2>&1 && return 0
+    sleep $((attempt * 3))
+  done
 }
 
 # --------------------------------------------------------------------------
