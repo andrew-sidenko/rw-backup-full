@@ -2,6 +2,9 @@
 
 ## Cursor Cloud specific instructions
 
+**Communication language:** always communicate with the user in Russian (per their explicit
+preference).
+
 `rw-backup-full` is a single product: a Bash CLI backup/restore toolkit for Remnawave panels
 and Telegram-bot Docker-Compose projects, plus a small FastAPI **web console** (`web/app.py`).
 Authoritative docs are in Russian (`README-RU.md`); short overview in `README.md`.
