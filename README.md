@@ -36,7 +36,9 @@ rw-backup-full verify-stack panel --source <ID> [--db-mode dump|base|pitr] [--ke
 rw-backup-full status-digest                       # same as 09:00/21:00 summary
 ```
 
-Credentials are never hand-edited on the sandbox: the web service pulls each server’s `fleet-manifest` over SSH (S3 backends + Telegram). `sync-creds` materializes them under `fleet-creds/<server-id>/`. Per-server events go to that server’s Telegram; fleet-wide errors are broadcast to all servers’ Telegram chats. Brief digests run at **09:00 and 21:00**.
+Credentials are never hand-edited on the sandbox: the web service pulls each server’s `fleet-manifest` over SSH (S3 backends + Telegram). `sync-creds` materializes them under `fleet-creds/<server-id>/`. Per-server events go to that server’s Telegram; fleet-wide errors are broadcast to all servers’ Telegram chats. Brief digests run at **09:00 and 21:00** and include occupied/free disk plus the space each backup occupies in every S3 storage.
+
+By default heavy operations run at night (logical dump 03:00, panel basebackup 04:30, bot basebackup 05:00) while WAL ships continuously; a per-server random offset (`FULL_SCHEDULE_JITTER_SEC`) avoids hammering S3 from many servers at once. Set `FULL_S3_STRICT="true"` to fail a backup (with an alert) when the copy did not reach every configured S3 storage.
 
 Each backup/check uploads a **`.txt` journal** next to the archive (same stem name) in S3; retention deletes the journal with the data.
 
@@ -44,7 +46,9 @@ Each backup/check uploads a **`.txt` journal** next to the archive (same stem na
 
 Runs on the sandbox (`http://127.0.0.1:8787`, token in `/etc/rw-backup-web.env`):
 
-- per-server status: components, backups, disk, WAL, S3
+- per-server status: components, backup freshness, WAL instances (spool, basebackup + WAL freshness), error count
+- storage sizes per server: locally occupied + free disk, and size/objects per S3 backend (with unreachable flag)
+- latest verify verdict per server, plus a fleet summary card (online count, total S3 usage, total errors)
 - sandbox summary: last fleet-verify pass/fail, credential sync age
 - verify history (fleet + stack runs) and per-server history
 - APIs: `/api/fleet/manifest`, `/api/fleet/overview`, `/api/verify/history`, `/api/servers/{id}/verify`
