@@ -297,6 +297,22 @@ wal_notify() {
   return 0
 }
 
+# Отправка в конкретный чат (токен/чат сервера-источника события).
+wal_notify_to() { # <token> <chat_id> <text> [thread_id]
+  local token="$1" chat="$2" text="$3" thread="${4:-}"
+  [[ -n "$token" && -n "$chat" ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local -a form=(-F "chat_id=${chat}" -F "text=${text}")
+  [[ -n "$thread" ]] && form+=(-F "message_thread_id=${thread}")
+  local attempt
+  for attempt in 1 2 3; do
+    curl -sS -m 25 "https://api.telegram.org/bot${token}/sendMessage" \
+      "${form[@]}" >/dev/null 2>&1 && return 0
+    sleep $((attempt * 3))
+  done
+  return 0
+}
+
 # --------------------------------------------------------------------------
 # Загрузка общей конфигурации
 # --------------------------------------------------------------------------

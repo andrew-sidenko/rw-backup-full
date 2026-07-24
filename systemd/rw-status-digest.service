@@ -1,0 +1,7 @@
+[Unit]
+Description=rw-backup-full: morning/evening status digest to Telegram
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rw-backup-restore/scripts/metrics/status-digest.sh
+Nice=10

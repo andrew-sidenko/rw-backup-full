@@ -344,14 +344,63 @@ def api_fleet_manifest(force: int = 0):
 def api_sandbox_summary():
     """Последние результаты песочницы из локальных .prom-файлов."""
     result = {}
-    for f in glob.glob(f"{METRICS_DIR}/rw_sandbox_*.prom"):
+    for f in glob.glob(f"{METRICS_DIR}/rw_sandbox_*.prom") + glob.glob(f"{METRICS_DIR}/rw_fleet_*.prom"):
         for line in Path(f).read_text().splitlines():
             if line.startswith("#") or not line.strip():
                 continue
             m = re.match(r"^(\w+)(\{[^}]*\})?\s+([-\d.]+)", line)
             if m:
                 result[m.group(1) + (m.group(2) or "")] = float(m.group(3))
-    return {"ok": True, "metrics": result}
+    # Кэш кредов: когда последний раз синхронизировали
+    creds_root = Path(INSTALL_DIR) / "fleet-creds"
+    creds = {}
+    if creds_root.is_dir():
+        for d in creds_root.iterdir():
+            if d.is_dir() and (d / "synced_at").exists():
+                try:
+                    creds[d.name] = int((d / "synced_at").read_text().strip())
+                except Exception:
+                    creds[d.name] = 0
+    return {"ok": True, "metrics": result, "creds_synced": creds}
+
+
+@app.get("/api/fleet/overview", dependencies=[Depends(auth)])
+def api_fleet_overview():
+    """Сводка парка для панели управления: серверы, проверки, ошибки."""
+    fleet = load_fleet()
+    summary = api_sandbox_summary()
+    metrics = summary.get("metrics", {})
+    servers_out = []
+    for srv in fleet["servers"]:
+        entry = {"id": srv["id"], "host": srv.get("host"), "note": srv.get("note", ""),
+                 "type": srv.get("type", "ssh")}
+        # Статус по SSH (короткий таймаут)
+        try:
+            rc, out, err = ssh_run(srv, ALLOWED_ACTIONS["status"], timeout=20)
+            if rc == 0:
+                entry["status"] = json.loads(out.strip().splitlines()[-1])
+                entry["reachable"] = True
+            else:
+                entry["reachable"] = False
+                entry["error"] = (err or f"rc={rc}")[-200:]
+        except Exception as e:
+            entry["reachable"] = False
+            entry["error"] = str(e)[:200]
+        # Метрики проверок по этому source
+        src = (entry.get("status") or {}).get("host") or srv["id"]
+        fails = [k for k, v in metrics.items()
+                 if k.startswith("rw_fleet_verify_ok{") and f'source="{src}"' in k and v == 0.0]
+        entry["verify_fails"] = len(fails)
+        entry["creds_synced_at"] = summary.get("creds_synced", {}).get(srv["id"])
+        servers_out.append(entry)
+    return {
+        "ok": True,
+        "settings": fleet["settings"],
+        "servers": servers_out,
+        "fleet_checks_total": metrics.get("rw_fleet_verify_checks_total"),
+        "fleet_checks_passed": metrics.get("rw_fleet_verify_checks_passed"),
+        "fleet_last_run": metrics.get("rw_fleet_verify_last_run_timestamp_seconds"),
+    }
 
 
 @app.get("/api/pubkey", dependencies=[Depends(auth)])
@@ -454,10 +503,26 @@ async function loadStatus(sid){
     const st = r.status;
     b.textContent='online'; b.className='badge ok';
     const age = st.panel.last_backup_ts? Math.round((st.time-st.panel.last_backup_ts)/3600)+'ч назад':'нет';
-    const wal = st.wal_instances.map(w=>`${w.name}:${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups}`).join('  ')||'—';
-    i.innerHTML = `панель: ${st.panel.detected?'да':'нет'}, бэкап: ${age} · ботов-архивов: ${st.custom_archives}
-      · диск: ${(st.disk_free_bytes/2**30).toFixed(1)} ГБ своб.<br>S3: ${st.s3_backends.map(b=>b.name+(b.enabled?'':'(off)')).join(', ')||'—'}<br>WAL: ${wal}`;
+    const wal = (st.wal_instances||[]).map(w=>`${w.name}:${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups}`).join('  ')||'—';
+    const comps = st.components || '—';
+    const disk = st.disk_free_bytes!=null ? (st.disk_free_bytes/2**30).toFixed(1)+' ГБ своб.' : '—';
+    i.innerHTML = `компоненты: <code>${comps}</code><br>
+      панель: ${st.panel.detected?'да':'нет'}, бэкап: ${age} · ботов-архивов: ${st.custom_archives}
+      · диск: ${disk}<br>S3: ${(st.s3_backends||[]).map(b=>b.name+(b.enabled?'':'(off)')).join(', ')||'—'}<br>WAL: ${wal}`;
   }catch(e){ if(e!=='auth'){ $('st-'+sid).textContent='err'; $('st-'+sid).className='badge bad'; } }
+}
+async function loadSandbox(){
+  const r = await api('GET','/api/sandbox/summary');
+  const m = r.metrics||{};
+  const tot = m['rw_fleet_verify_checks_total']?? m['rw_sandbox_checks_total']??'—';
+  const pass = m['rw_fleet_verify_checks_passed']?? m['rw_sandbox_checks_passed']??'—';
+  const ts = m['rw_fleet_verify_last_run_timestamp_seconds']?? m['rw_sandbox_last_run_timestamp_seconds'];
+  const fails = Object.entries(m).filter(([k,v])=>k.includes('verify_ok')&&v===0).length;
+  const synced = Object.keys(r.creds_synced||{}).length;
+  $('sandbox').innerHTML = `проверок: <b class="${pass===tot?'ok':'bad'}">${pass}/${tot}</b>`+
+    (fails?` · ошибок матрицы: <b class="bad">${fails}</b>`:'')+
+    (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'')+
+    ` · кредов синхр.: ${synced}`;
 }
 async function act(sid,a){
   log(`▶ ${sid}: ${a}…`);
@@ -491,14 +556,6 @@ async function saveCfg(){
   const r = await api('PUT',`/api/servers/${curSid}/config?path=`+encodeURIComponent($('cfgFile').value),
     {content: $('cfgBody').value});
   log((r.ok?'✅ Сохранено: ':'❌ Ошибка: ')+$('cfgFile').value+' @ '+curSid+(r.note?' — '+r.note:''));
-}
-async function loadSandbox(){
-  const r = await api('GET','/api/sandbox/summary');
-  const m = r.metrics||{};
-  const tot = m['rw_sandbox_checks_total']??'—', pass = m['rw_sandbox_checks_passed']??'—';
-  const ts = m['rw_sandbox_last_run_timestamp_seconds'];
-  $('sandbox').innerHTML = `проверок: <b class="${pass===tot?'ok':'bad'}">${pass}/${tot}</b>`+
-    (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'');
 }
 async function showPubkey(){
   const r = await api('GET','/api/pubkey');

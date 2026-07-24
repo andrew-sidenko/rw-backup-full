@@ -30,6 +30,7 @@ source "${SCRIPT_DIR}/../lib/wal-lib.sh"
 # молча игнорируются, потому что на момент их подстановки файл ещё не
 # прочитан. Раньше эта строка отсутствовала вовсе.
 wal_load_full_config
+require_component sandbox
 
 PROFILES_DIR="${PROFILES_DIR:-${INSTALL_DIR}/verify-profiles.d}"
 WEB_ENV="${WEB_ENV:-/etc/rw-backup-web.env}"
@@ -53,6 +54,12 @@ command -v curl >/dev/null 2>&1 || { msg ERR "Нужен curl"; exit 1; }
 
 wal_lock "fleet-verify" || exit 0
 mkdir -p "$RESULTS_DIR"
+
+# Актуализация S3/TG кредов с подключённых серверов перед проверкой.
+if [[ -x "${SCRIPT_DIR}/sync-fleet-creds.sh" ]]; then
+  "${SCRIPT_DIR}/sync-fleet-creds.sh" || msg WARN "sync-fleet-creds: не удалось обновить кэш кредов"
+fi
+
 cleanup() {
   docker ps -aq -f "label=rw-fleet-session=$$" 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
   rm -rf "${SANDBOX_WORK:?}/work.$$" "$RESULTS_DIR" 2>/dev/null || true
@@ -557,5 +564,40 @@ done <<<"$servers_json"
 sum_t="$(jq -r '.settings.tg_summary.token // ""' <<<"$MANIFEST")"
 sum_c="$(jq -r '.settings.tg_summary.chat_id // ""' <<<"$MANIFEST")"
 tg_send "$sum_t" "$sum_c" "${head_line}${SUMMARY}"
+
+# Общие события/ошибки парка — во ВСЕ TG серверов (не только «свой» отчёт).
+if (( PASSED < TOTAL )) || (( TOTAL == 0 )); then
+  COMMON="${head_line}
+Общее событие парка (ошибки/итог):${SUMMARY}"
+  while IFS= read -r srv; do
+    tgt="$(jq -r '.telegram.token // ""' <<<"$srv")"
+    tgc="$(jq -r '.telegram.chat_id // ""' <<<"$srv")"
+    tg_send "$tgt" "$tgc" "$COMMON"
+  done <<<"$servers_json"
+fi
+
+# Журнал прогона → S3 рядом с результатами (имя = fleet-verify_<host>_<ts>.txt)
+JOURNAL_DIR="${SANDBOX_WORK}/journals"
+mkdir -p "$JOURNAL_DIR"
+JNAME="fleet-verify_$(wal_hostname)_$(date -u +%Y-%m-%d_%H_%M_%S).txt"
+JFILE="${JOURNAL_DIR}/${JNAME}"
+{
+  echo "rw-backup-full fleet-verify journal"
+  echo "host=$(wal_hostname) created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "depth=${DEPTH} parallel=${PARALLEL} history=${HISTORY}"
+  echo "result=${PASSED}/${TOTAL}"
+  echo "---"
+  echo "${SUMMARY}"
+} > "$JFILE"
+# Выкладываем журнал в каждый бэкенд первого доступного сервера (категория panel как служебная)
+# через временную материализацию кредов; не фатально при отсутствии aws/бэкендов.
+if declare -F s3m_upload_all >/dev/null && command -v aws >/dev/null 2>&1; then
+  first_sid="$(jq -r '.servers[]? | select(.reachable==true) | .id' <<<"$MANIFEST" | head -n1 || true)"
+  if [[ -n "$first_sid" && -d "${INSTALL_DIR}/fleet-creds/${first_sid}/s3.d" ]]; then
+    S3D_DIR="${INSTALL_DIR}/fleet-creds/${first_sid}/s3.d" \
+      s3m_upload_all "panel" "$JFILE" "fleet-verify-journal" 2>/dev/null \
+      || msg WARN "Журнал прогона не выгружен в S3 (некритично)"
+  fi
+fi
 
 (( TOTAL > 0 && PASSED == TOTAL ))

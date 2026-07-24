@@ -106,13 +106,29 @@ s3m_logical_key() { printf '%s/%s/%s/%s' "$B_PREFIX" "$1" "$(rw_source_id)" "$2"
 # База WAL-слоя: <prefix>/wal/<host>/<instance>
 s3m_wal_base()    { printf '%s/wal/%s/%s' "$B_PREFIX" "$(rw_source_id)" "$1"; }
 
+# Имя текстового журнала рядом с архивом: foo.tar.gz -> foo.txt, foo.age -> foo.txt
+s3m_journal_name() {
+  local base="$1"
+  case "$base" in
+    *.tar.gz) printf '%s.txt' "${base%.tar.gz}" ;;
+    *.tar.zst) printf '%s.txt' "${base%.tar.zst}" ;;
+    *.age)    printf '%s.txt' "${base%.age}" ;;
+    *)        printf '%s.txt' "${base%.*}" ;;
+  esac
+}
+
 # Загрузка файла во ВСЕ включённые бэкенды категории.
+# Опционально 4-й аргумент — текстовый журнал результатов: выкладывается
+# рядом с тем же stem-именем (.txt) для удобного поиска; при ротации
+# удаляется вместе с архивом (см. s3m_retention_one).
 # Возврат: 0 если хотя бы один успех ИЛИ нет ни одного включённого; 1 если все упали.
 s3m_upload_all() {
-  local category="$1" file="$2" label="${3:-}"
-  local name ok=0 targeted=0 fname size
+  local category="$1" file="$2" label="${3:-}" journal="${4:-}"
+  local name ok=0 targeted=0 fname size jname
   fname="$(basename "$file")"
   size="$(du -h "$file" 2>/dev/null | awk '{print $1}')"
+  jname=""
+  [[ -n "$journal" && -f "$journal" ]] && jname="$(s3m_journal_name "$fname")"
   command -v aws >/dev/null 2>&1 || { msg WARN "awscli не найден — S3-выгрузка пропущена"; return 0; }
 
   for name in $(s3m_backends); do
@@ -130,6 +146,20 @@ s3m_upload_all() {
     done
     if [[ "$done" == "true" ]]; then
       ok=$((ok+1)); msg OK "S3[${name}]: ${uri}"
+      if [[ -n "$jname" ]]; then
+        local jkey juri jdone=false
+        jkey="$(s3m_logical_key "$category" "$jname")"
+        juri="s3://${B_BUCKET}/${jkey}"
+        for attempt in 1 2 3; do
+          if s3m_aws s3 cp "$journal" "$juri" --only-show-errors 2>"$up_err"; then jdone=true; break; fi
+          sleep $((attempt*3))
+        done
+        if [[ "$jdone" == "true" ]]; then
+          msg OK "S3[${name}]: журнал ${juri}"
+        else
+          msg WARN "S3[${name}]: архив загружен, журнал ${jname} — нет"
+        fi
+      fi
       if truthy "${FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD:-false}" && declare -F send_full_telegram_message >/dev/null; then
         send_full_telegram_message "✅ S3 [${name}]: ${label:-$category}
 Файл: ${fname} (${size})
@@ -173,7 +203,7 @@ s3m_retention_one() {  # <backend> <category> <days>
   local total; total="$(wc -l <<<"$listing")"
   local deletable=$(( total - keep_min )); (( deletable < 0 )) && deletable=0
 
-  local f ts epoch removed=0
+  local f ts epoch removed=0 jname
   while IFS= read -r f; do
     (( removed >= deletable )) && break
     # timestamp: YYYY-MM-DD_HH_MM_SS или YYYYMMDD_HHMMSS
@@ -186,9 +216,14 @@ s3m_retention_one() {  # <backend> <category> <days>
     fi
     epoch="$(date -d "$ts" +%s 2>/dev/null || echo 0)"
     (( epoch > 0 && epoch < cutoff )) || continue
-    s3m_aws s3 rm "s3://${B_BUCKET}/${prefix}${f}" --only-show-errors 2>/dev/null && removed=$((removed+1))
+    if s3m_aws s3 rm "s3://${B_BUCKET}/${prefix}${f}" --only-show-errors 2>/dev/null; then
+      removed=$((removed+1))
+      # Журнал результатов (.txt с тем же stem) удаляется вместе с архивом.
+      jname="$(s3m_journal_name "$f")"
+      s3m_aws s3 rm "s3://${B_BUCKET}/${prefix}${jname}" --only-show-errors 2>/dev/null || true
+    fi
   done <<<"$listing"
-  (( removed > 0 )) && msg OK "S3[${name}] ${category}: удалено ${removed} архивов старше ${days} дн."
+  (( removed > 0 )) && msg OK "S3[${name}] ${category}: удалено ${removed} архивов (+журналы) старше ${days} дн."
   return 0
 }
 
