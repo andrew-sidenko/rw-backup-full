@@ -1399,29 +1399,55 @@ status_json() {
   [[ -n "$panel_last" ]] && panel_ts="$(stat -c %Y "$panel_last" 2>/dev/null || echo 0)"
   custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ' || true)"
 
+  # S3-объёмы/доступность и число ошибок берём из ЛОКАЛЬНЫХ метрик
+  # (rw_exporter.prom пишет metrics-exporter), чтобы status --json не ходил в сеть.
+  local _mdir="${WAL_METRICS_DIR:-/var/lib/node_exporter/textfile_collector}"
+  declare -A _s3b _s3o _s3r
+  if [[ -f "${_mdir}/rw_exporter.prom" ]]; then
+    local _l _bk _v
+    while IFS= read -r _l; do
+      case "$_l" in
+        'rw_s3_category_bytes{'*)   _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3b["$_bk"]=$(( ${_s3b["$_bk"]:-0} + _v )) ;;
+        'rw_s3_category_objects{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3o["$_bk"]=$(( ${_s3o["$_bk"]:-0} + _v )) ;;
+        'rw_s3_backend_reachable{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; _s3r["$_bk"]="$_v" ;;
+      esac
+    done < "${_mdir}/rw_exporter.prom"
+  fi
+  local err_cnt=0
+  [[ -d "$_mdir" ]] && err_cnt="$(grep -hE 'rw_.*_last_result 0$|rw_fleet_verify_ok\{.*\} 0$' "$_mdir"/rw_*.prom 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+  [[ "$err_cnt" =~ ^[0-9]+$ ]] || err_cnt=0
+  local wr="${WAL_ROOT:-/var/lib/rw-wal}"
+  # Занятый локально объём (каталог бэкапов + WAL).
+  local lb_bytes
+  lb_bytes="$(du -sb "$BACKUP_DIR" "$wr" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  [[ "$lb_bytes" =~ ^[0-9]+$ ]] || lb_bytes=0
+
   printf '{'
   printf '"host":"%s","version":"5.5.0","time":%s,' "$host" "$ts"
   printf '"components":"%s",' "${FULL_COMPONENTS:-panel-backup custom-backup wal config-track metrics}"
   printf '"panel":{"detected":%s,"last_backup":"%s","last_backup_ts":%s},'     "$( (command -v docker >/dev/null 2>&1 && local_panel_detected) && echo true || echo false)"     "$(basename "${panel_last:-}" 2>/dev/null)" "$panel_ts"
   printf '"custom_archives":%s,' "$custom_cnt"
   printf '"disk_free_bytes":%s,' "$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ')"
-  # S3-бэкенды
+  printf '"local_backup_bytes":%s,' "$lb_bytes"
+  printf '"errors":%s,' "$err_cnt"
+  # S3-бэкенды (с объёмом/доступностью из локальных метрик)
   printf '"s3_backends":['
-  local n first=1
+  local n first=1 _reach
   for n in $(s3m_backends 2>/dev/null); do
     (( first )) || printf ','
     first=0
+    _reach="$([[ "${_s3r[$n]:-1}" == "0" ]] && echo false || echo true)"
     if s3m_load "$n" 2>/dev/null; then
-      printf '{"name":"%s","enabled":%s,"bucket":"%s"}' "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET"
+      printf '{"name":"%s","enabled":%s,"bucket":"%s","bytes":%s,"objects":%s,"reachable":%s}' "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
     else
-      printf '{"name":"%s","enabled":false,"bucket":""}' "$n"
+      printf '{"name":"%s","enabled":false,"bucket":"","bytes":%s,"objects":%s,"reachable":%s}' "$n" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
     fi
   done
   printf '],'
   # WAL-инстансы
   printf '"wal_instances":['
   first=1
-  local f name c spool bb bbts wr="/var/lib/rw-wal"
+  local f name c spool bb bbts walts
   if [[ -d "$INSTANCES_DIR" ]]; then
     for f in "$INSTANCES_DIR"/*.env; do
       [[ -e "$f" ]] || continue
@@ -1434,9 +1460,13 @@ status_json() {
       bb="$(find "${wr}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l | tr -d ' ' || true)"
       spool="${spool:-0}"; bb="${bb:-0}"
       bbts="$(cat "${wr}/${name}/state/last_success" 2>/dev/null || echo 0)"
+      # Свежесть WAL: mtime новейшего заархивированного сегмента (для UI —
+      # видно, что поток WAL живой, а не только базовые бэкапы).
+      walts="$(find "${wr}/${name}/archive" -maxdepth 1 -type f -name '0*' -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1 || echo 0)"
+      walts="${walts:-0}"
       (( first )) || printf ','
       first=0
-      printf '{"name":"%s","container":"%s","running":%s,"spool":%s,"basebackups":%s,"last_basebackup_ts":%s,"timer_active":%s}'         "$name" "$c"         "$( (command -v docker >/dev/null 2>&1 && docker ps -q -f "name=^${c}$" 2>/dev/null | grep -q .) && echo true || echo false)"         "$spool" "$bb" "$bbts"         "$(systemctl is-active "rw-wal-ship@${name}.timer" >/dev/null 2>&1 && echo true || echo false)"
+      printf '{"name":"%s","container":"%s","running":%s,"spool":%s,"basebackups":%s,"last_basebackup_ts":%s,"last_wal_ts":%s,"timer_active":%s}'         "$name" "$c"         "$( (command -v docker >/dev/null 2>&1 && docker ps -q -f "name=^${c}$" 2>/dev/null | grep -q .) && echo true || echo false)"         "$spool" "$bb" "$bbts" "$walts"         "$(systemctl is-active "rw-wal-ship@${name}.timer" >/dev/null 2>&1 && echo true || echo false)"
     done
   fi
   printf ']}'
