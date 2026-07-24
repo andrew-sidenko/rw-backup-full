@@ -128,7 +128,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { msg ERR "[${PROJECT}] $1"; write_metric 0; exit 1; }
+NOTIFIED="false"
+notify_failure() { # <причина>
+  # Единая точка выхода для ЛЮБОГО отказа — и явного (fail()), и неожиданного
+  # (перехваченного ERR trap'ом ниже). Раньше на неявных сбоях (например,
+  # command not found, unbound variable, любая непроверенная команда под
+  # set -e где-то в середине скрипта) выполнение обрывалось молча: без
+  # сообщения в консоль, без Telegram, без метрики — только пустой возврат
+  # в шелл. Гвард NOTIFIED защищает от двойного уведомления, если fail()
+  # уже отчитался, а следом ещё сработает ERR trap на его же exit.
+  [[ "$NOTIFIED" == "true" ]] && return
+  NOTIFIED="true"
+  local reason="$1"
+  msg ERR "[${PROJECT}] ${reason}"
+  write_metric 0
+  wal_notify "🔴 Проверка полного стека ${PROJECT} — сбой
+Хост: $(wal_hostname)
+${reason}"
+}
+
+fail() { notify_failure "$1"; exit 1; }
+
+# errtrace: ERR-ловушка должна срабатывать и внутри функций/подстановок,
+# не только в теле скрипта верхнего уровня.
+set -o errtrace
+trap 'notify_failure "неожиданная ошибка (строка ${LINENO}, команда: ${BASH_COMMAND})"' ERR
 
 write_metric() {
   wal_metric_write "rw_stack_verify_${PROJECT//[^a-zA-Z0-9]/_}" <<EOF_M
@@ -156,10 +180,28 @@ done
 [[ -n "$COMPOSE" ]] || fail "в восстановленном каталоге нет docker-compose"
 msg OK "[${PROJECT}] каталог восстановлен ($(find "$RESTORED" -type f | wc -l) файлов)"
 
-# Исходный корень проекта нужен, чтобы перенаправить абсолютные bind-монты
-# с боевых путей на восстановленную копию.
-ORIG_ROOT="$(grep -oE '^[^|]+\|[^|]+\|[^|]+' <<<"$(bash -c "source ${SCRIPT_DIR}/../lib/discovery.sh; disc_one '${PROJECT}'" 2>/dev/null)" | cut -d'|' -f3)"
-ORIG_ROOT="${ORIG_ROOT:-/opt/${PROJECT}}"
+# Исходный корень проекта нужен, чтобы перенаправить АБСОЛЮТНЫЕ bind-монты
+# (не './относительные' — те и так резолвятся compose'ом относительно
+# восстановленного каталога правильно сами) с боевых путей на копию.
+#
+# lib/discovery.sh ищет проект ЛОКАЛЬНО по running-контейнерам — при
+# --source (обычный случай: песочница отдельная от прода) это ничего не
+# найдёт и раньше молча подставляло неверный /opt/<project>. Для панели
+# используем ту же конвенцию, что и panel-backup.sh (PANEL_ROOT_DIR); для
+# ботов такой конвенции нет — путь можно узнать только с самого сервера,
+# поэтому честно предупреждаем об ограничении, а не подставляем догадку.
+if [[ "$PROJECT" == "panel" ]]; then
+  ORIG_ROOT="${PANEL_ROOT_DIR:-/opt/remnawave}"
+else
+  ORIG_ROOT="$(grep -oE '^[^|]+\|[^|]+\|[^|]+' <<<"$(bash -c "source ${SCRIPT_DIR}/../lib/discovery.sh; disc_one '${PROJECT}'" 2>/dev/null)" | cut -d'|' -f3)"
+  if [[ -z "$ORIG_ROOT" ]]; then
+    if [[ -n "$REMOTE_SOURCE" ]]; then
+      msg WARN "[${PROJECT}] исходный путь бота неизвестен в режиме --source — абсолютные bind-монты (если есть в compose, помимо ./относительных) не будут перенаправлены на восстановленную копию"
+    fi
+    ORIG_ROOT="/opt/${PROJECT}"
+  fi
+fi
+msg INFO "[${PROJECT}] исходный каталог (для перенаправления bind-монтов): ${ORIG_ROOT}"
 
 # --------------------------------------------------------------------------
 # 2. Изолированная сеть
@@ -221,6 +263,7 @@ msg OK "[${PROJECT}] конфигурация изолирована (порты
 # 4. База данных из бэкапа — в той же изолированной сети
 # --------------------------------------------------------------------------
 if [[ -n "$DB_SERVICE" ]]; then
+  msg INFO "[${PROJECT}] поднимаю БД (${DB_SERVICE}) из бэкапа..."
   DB_IMAGE="$(jq -r --arg s "$DB_SERVICE" '.services[$s].image' "$RESOLVED")"
   DB_NAME_ORIG="$(jq -r --arg s "$DB_SERVICE" '.services[$s].container_name // ""' "$RESOLVED")"
   DB_USER="$(jq -r --arg s "$DB_SERVICE" '.services[$s].environment.POSTGRES_USER // "postgres"' "$RESOLVED")"
