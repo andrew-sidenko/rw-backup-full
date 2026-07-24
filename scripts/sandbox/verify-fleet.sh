@@ -25,6 +25,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/wal-lib.sh
 source "${SCRIPT_DIR}/../lib/wal-lib.sh"
 
+# ВАЖНО: конфиг грузится ДО вычисления любых переменных ниже — иначе
+# RW_WEB_URL/SANDBOX_AGE_IDENTITY/SANDBOX_PG_VERSION из rw-backup-full.env
+# молча игнорируются, потому что на момент их подстановки файл ещё не
+# прочитан. Раньше эта строка отсутствовала вовсе.
+wal_load_full_config
+
 PROFILES_DIR="${PROFILES_DIR:-${INSTALL_DIR}/verify-profiles.d}"
 WEB_ENV="${WEB_ENV:-/etc/rw-backup-web.env}"
 WEB_URL="${RW_WEB_URL:-http://127.0.0.1:8787}"
