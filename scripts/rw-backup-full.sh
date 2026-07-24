@@ -17,6 +17,13 @@ elif [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib/s3-multi.sh" ]]; then
   # shellcheck disable=SC1091
   source "$(dirname "${BASH_SOURCE[0]}")/lib/s3-multi.sh"
 fi
+if [[ -f "${INSTALL_DIR}/scripts/lib/wal-lib.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${INSTALL_DIR}/scripts/lib/wal-lib.sh"
+elif [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib/wal-lib.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$(dirname "${BASH_SOURCE[0]}")/lib/wal-lib.sh"
+fi
 
 RED=$'\e[31m'
 GREEN=$'\e[32m'
@@ -206,11 +213,13 @@ send_full_telegram_message() {
 
 full_s3_upload() {
   # v5: выгрузка во ВСЕ настроенные S3-бэкенды категории (s3.d/*.env).
+  # Опционально 4-й аргумент — текстовый журнал (.txt рядом с архивом).
   local file_path="$1"
   local category="$2"
   local label="$3"
+  local journal="${4:-}"
   if declare -F s3m_upload_all >/dev/null; then
-    s3m_upload_all "$category" "$file_path" "$label"
+    s3m_upload_all "$category" "$file_path" "$label" ${journal:+"$journal"}
     return $?
   fi
 
@@ -733,8 +742,20 @@ NOTES
   msg OK "Backup создан: ${FINAL_ARCHIVE}"
   du -h "$FINAL_ARCHIVE" || true
 
+  local journal jname
+  jname="$(declare -F s3m_journal_name >/dev/null && s3m_journal_name "$(basename "$FINAL_ARCHIVE")" || echo "$(basename "$FINAL_ARCHIVE" .tar.gz).txt")"
+  journal="${BACKUP_DIR}/${jname}"
+  {
+    echo "rw-backup-full custom-bot backup journal"
+    echo "host=$(hostname -s 2>/dev/null || hostname) project=${PROJECT_NAME}"
+    echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "file=$(basename "$FINAL_ARCHIVE")"
+    echo "size=$(du -h "$FINAL_ARCHIVE" | awk '{print $1}')"
+    echo "result=ok"
+  } > "$journal"
+
   if truthy "$FULL_CUSTOM_EXTERNAL_S3_ENABLED"; then
-    full_s3_upload "$FINAL_ARCHIVE" "custom-bot" "$PROJECT_NAME" || msg WARN "Не удалось загрузить custom bot backup во внешний S3"
+    full_s3_upload "$FINAL_ARCHIVE" "custom-bot" "$PROJECT_NAME" "$journal" || msg WARN "Не удалось загрузить custom bot backup во внешний S3"
     full_s3_retention_cleanup
   fi
 
@@ -1367,7 +1388,8 @@ status_json() {
   custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ' || true)"
 
   printf '{'
-  printf '"host":"%s","version":"5.0.0","time":%s,' "$host" "$ts"
+  printf '"host":"%s","version":"5.5.0","time":%s,' "$host" "$ts"
+  printf '"components":"%s",' "${FULL_COMPONENTS:-panel-backup custom-backup wal config-track metrics}"
   printf '"panel":{"detected":%s,"last_backup":"%s","last_backup_ts":%s},'     "$( (command -v docker >/dev/null 2>&1 && local_panel_detected) && echo true || echo false)"     "$(basename "${panel_last:-}" 2>/dev/null)" "$panel_ts"
   printf '"custom_archives":%s,' "$custom_cnt"
   printf '"disk_free_bytes":%s,' "$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ')"
@@ -1523,6 +1545,16 @@ apply_components() {
   _tm metrics      rw-metrics-export.timer
   _tm config-track rw-config-track.timer
   _tm sandbox      rw-sandbox-verify.timer
+  # Сводка 09:00/21:00 — при любом из metrics/sandbox/web
+  if component_enabled metrics || component_enabled sandbox || component_enabled web; then
+    systemctl is-enabled rw-status-digest.timer >/dev/null 2>&1 || {
+      systemctl enable --now rw-status-digest.timer >/dev/null 2>&1 && { msg OK "включён rw-status-digest.timer"; changed=1; }
+    }
+  else
+    systemctl is-enabled rw-status-digest.timer >/dev/null 2>&1 && {
+      systemctl disable --now rw-status-digest.timer >/dev/null 2>&1 && { msg OK "выключен rw-status-digest.timer"; changed=1; }
+    }
+  fi
 
   # WAL — таймеры на каждый инстанс
   local f inst
@@ -1622,16 +1654,75 @@ menu_header() {
   echo
 }
 
-# ask_choice <заголовок> <вариант1> <вариант2> ... -> печатает выбранный
+# ask_choice <заголовок> <вариант1> <вариант2> ... -> печатает выбранный текст
+# Варианты хранятся в массиве (не через ${!N}): иначе при пустом/битом вводе
+# легко получить одинаковый «пустой» результат для любого пункта меню.
 ask_choice() {
   local title="$1"; shift
+  local -a opts=("$@")
   local i=1 opt
   echo -e "  ${BOLD}${title}${RESET}" >&2
-  for opt in "$@"; do echo "    ${i}) ${opt}" >&2; i=$((i+1)); done
-  local pick; read -r -p "  Выбор [1]: " pick >&2
+  for opt in "${opts[@]}"; do echo "    ${i}) ${opt}" >&2; i=$((i+1)); done
+  local pick
+  read -r -p "  Выбор [1]: " pick >&2 || true
   pick="${pick:-1}"
-  [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= $# )) || pick=1
-  echo "${!pick}"
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#opts[@]} )); then
+    pick=1
+  fi
+  printf '%s\n' "${opts[$((pick-1))]}"
+}
+
+# Динамическое меню: показывает только пункты с непустым ключом действия.
+# Формат аргументов: пары «ключ» «подпись».
+# Печатает выбранный ключ в stdout. 0 / пустой ввод → печатает "0".
+# MENU_BACK_LABEL — подпись пункта 0 (по умолчанию «Назад»).
+menu_pick() {
+  local -a keys=() labels=()
+  local key label i=1 pick back="${MENU_BACK_LABEL:-Назад}"
+  while [[ $# -ge 2 ]]; do
+    key="$1"; label="$2"; shift 2
+    keys+=("$key"); labels+=("$label")
+    printf '  %d. %s\n' "$i" "$label" >&2
+    i=$((i+1))
+  done
+  echo >&2
+  echo "  0. ${back}" >&2
+  echo >&2
+  read -r -p "[?] Выбор: " pick || true
+  echo >&2
+  [[ -z "$pick" || "$pick" == "0" ]] && { printf '0\n'; return 0; }
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#keys[@]} )); then
+    echo -e "${RED}[ERR]${RESET} Некорректный выбор" >&2
+    printf '?\n'
+    return 0
+  fi
+  printf '%s\n' "${keys[$((pick-1))]}"
+}
+
+# Список ID серверов из fleet.json / кэша веб-сервиса (для меню песочницы).
+fleet_server_ids() {
+  local f="${RW_FLEET_FILE:-${INSTALL_DIR}/fleet.json}"
+  local cache="${INSTALL_DIR}/web-data/manifest-cache.json"
+  if [[ -f "$f" ]] && command -v jq >/dev/null 2>&1; then
+    jq -r '.servers[]?.id // empty' "$f" 2>/dev/null || true
+  elif [[ -f "$cache" ]] && command -v jq >/dev/null 2>&1; then
+    jq -r '.servers[]?.id // empty' "$cache" 2>/dev/null || true
+  fi
+}
+
+pick_fleet_server() {
+  local -a ids=()
+  local id
+  while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done < <(fleet_server_ids)
+  if (( ${#ids[@]} == 0 )); then
+    msg WARN "В парке нет серверов (fleet.json). Добавьте через веб-интерфейс."
+    return 1
+  fi
+  if (( ${#ids[@]} == 1 )); then
+    printf '%s' "${ids[0]}"
+    return 0
+  fi
+  ask_choice "Сервер-источник:" "${ids[@]}"
 }
 
 # Выбор инстанса из instances.d (вместо ручного ввода имени)
@@ -1665,23 +1756,27 @@ menu_backup() {
   while true; do
     menu_header
     echo -e " ${BOLD}Резервное копирование${RESET}"
-    echo "  1. Бэкап панели          логический архив: дамп БД + каталог панели"
-    echo "  2. Бэкап ботов из /home  compose-проекты: дамп + Redis + каталог"
-    echo "  3. Бэкап всего           панель и боты подряд"
-    echo "  4. Снимок каталогов      трекер: конфиги, код, ресурсы (инкрементально)"
-    echo "  5. Что отслеживается     список проектов и накопленных снимков"
-    echo
-    echo "  0. Назад"
-    echo
-    read -r -p "[?] Выбор: " c; echo
+    local -a args=()
+    component_enabled panel-backup  && args+=(panel "Бэкап панели          логический архив: дамп БД + каталог панели")
+    component_enabled custom-backup && args+=(custom "Бэкап ботов из /home  compose-проекты: дамп + Redis + каталог")
+    if component_enabled panel-backup && component_enabled custom-backup; then
+      args+=(all "Бэкап всего           панель и боты подряд")
+    fi
+    component_enabled config-track && args+=(track "Снимок каталогов      трекер: конфиги, код, ресурсы (инкрементально)")
+    component_enabled config-track && args+=(track-list "Что отслеживается     список проектов и накопленных снимков")
+    if (( ${#args[@]} == 0 )); then
+      msg WARN "Нет включённых компонентов бэкапа (panel-backup / custom-backup / config-track)"
+      pause; return
+    fi
+    local c; c="$(menu_pick "${args[@]}")"
     case "$c" in
-      1) run_panel_backup; pause ;;
-      2) backup_custom_menu; pause ;;
-      3) backup_all; pause ;;
-      4) "${TRACK_SCRIPTS_DIR}/config-track.sh" || true; pause ;;
-      5) "${TRACK_SCRIPTS_DIR}/config-track.sh" --list || true; pause ;;
-      0|"") return ;;
-      *) msg ERR "Некорректный выбор"; sleep 1 ;;
+      panel) run_panel_backup; pause ;;
+      custom) backup_custom_menu; pause ;;
+      all) backup_all; pause ;;
+      track) "${TRACK_SCRIPTS_DIR}/config-track.sh" || true; pause ;;
+      track-list) "${TRACK_SCRIPTS_DIR}/config-track.sh" --list || true; pause ;;
+      0) return ;;
+      *) sleep 1 ;;
     esac
   done
 }
@@ -1690,19 +1785,17 @@ menu_restore() {
   while true; do
     menu_header
     echo -e " ${BOLD}Восстановление${RESET}  (рабочие данные не трогаются без явного подтверждения)"
-    echo "  1. Панель из архива      пошагово, со страховочными копиями"
-    echo "  2. Бот из архива         выбор архива, откат старого каталога"
-    echo "  3. Каталог из трекера    на любой момент времени, в указанный путь"
-    echo "  4. PITR из WAL           восстановление БД на точку во времени"
-    echo "  5. Чистый сервер         полное развёртывание с нуля (зависимости, конфиги, БД)"
-    echo
-    echo "  0. Назад"
-    echo
-    read -r -p "[?] Выбор: " c; echo
+    local -a args=()
+    component_enabled panel-backup  && args+=(panel "Панель из архива      пошагово, со страховочными копиями")
+    component_enabled custom-backup && args+=(custom "Бот из архива         выбор архива, откат старого каталога")
+    component_enabled config-track  && args+=(track "Каталог из трекера    на любой момент времени, в указанный путь")
+    component_enabled wal           && args+=(pitr "PITR из WAL           восстановление БД на точку во времени")
+    args+=(bare "Чистый сервер         полное развёртывание с нуля (зависимости, конфиги, БД)")
+    local c; c="$(menu_pick "${args[@]}")"
     case "$c" in
-      1) "${PANEL_SCRIPTS_DIR}/panel-restore.sh" || true; pause ;;
-      2) restore_custom_menu; pause ;;
-      3)
+      panel) "${PANEL_SCRIPTS_DIR}/panel-restore.sh" || true; pause ;;
+      custom) restore_custom_menu; pause ;;
+      track)
         read -r -p "  Проект: " pr
         read -r -p "  Куда восстановить (--dest): " dst
         read -r -p "  На момент (пусто = последнее состояние): " at
@@ -1714,7 +1807,7 @@ menu_restore() {
           fi
         fi
         pause ;;
-      4)
+      pitr)
         local inst target
         inst="$(pick_instance)" || { pause; continue; }
         target="$(ask_choice "Точка восстановления:" \
@@ -1729,39 +1822,38 @@ menu_restore() {
             [[ -n "$tt" ]] && { "${WAL_SCRIPTS_DIR}/pitr-restore.sh" "$inst" --target-time "$tt" || true; } ;;
         esac
         pause ;;
-      5)
+      bare)
         msg INFO "Запускается на ЧИСТОМ сервере из клона репозитория:"
         msg INFO "  sudo scripts/host/bare-restore.sh --source <ID-сервера> --project <проект>"
         pause ;;
-      0|"") return ;;
-      *) msg ERR "Некорректный выбор"; sleep 1 ;;
+      0) return ;;
+      *) sleep 1 ;;
     esac
   done
 }
 
 menu_wal() {
+  component_enabled wal || { msg WARN "Компонент wal выключен"; pause; return; }
   while true; do
     menu_header
     echo -e " ${BOLD}WAL-архивация и PITR${RESET}"
-    echo "  1. Статус                archive_mode, спул, базовые бэкапы, таймеры"
-    echo "  2. Включить архивацию    ВНИМАНИЕ: требует рестарта контейнера БД"
-    echo "  3. Выключить архивацию   снять override и таймеры"
-    echo "  4. Базовый бэкап сейчас  полный pg_basebackup инстанса"
-    echo "  5. Отправить WAL сейчас  прогнать спул в архив и S3"
-    echo "  6. Очистка по retention  удалить лишнее по границе базовых бэкапов"
-    echo "  7. Перечитать расписания применить *_TIMES/интервалы из конфига"
-    echo
-    echo "  0. Назад"
-    echo
-    read -r -p "[?] Выбор: " c; echo
+    local c
+    c="$(menu_pick \
+      status "Статус                archive_mode, спул, базовые бэкапы, таймеры" \
+      enable "Включить архивацию    ВНИМАНИЕ: требует рестарта контейнера БД" \
+      disable "Выключить архивацию   снять override и таймеры" \
+      base "Базовый бэкап сейчас  полный pg_basebackup инстанса" \
+      ship "Отправить WAL сейчас  прогнать спул в архив и S3" \
+      ret "Очистка по retention  удалить лишнее по границе базовых бэкапов" \
+      timers "Перечитать расписания применить *_TIMES/интервалы из конфига")"
     local inst
     case "$c" in
-      1) wal_status_all; pause ;;
-      2) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/enable-archiving.sh" "$inst" || true; }; pause ;;
-      3) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/enable-archiving.sh" "$inst" --disable || true; }; pause ;;
-      4) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/basebackup.sh" "$inst" || true; }; pause ;;
-      5) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/wal-ship.sh" "$inst" || true; }; pause ;;
-      6)
+      status) wal_status_all; pause ;;
+      enable) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/enable-archiving.sh" "$inst" || true; }; pause ;;
+      disable) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/enable-archiving.sh" "$inst" --disable || true; }; pause ;;
+      base) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/basebackup.sh" "$inst" || true; }; pause ;;
+      ship) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/wal-ship.sh" "$inst" || true; }; pause ;;
+      ret)
         inst="$(pick_instance)" || { pause; continue; }
         local dry
         dry="$(ask_choice "Режим:" "показать, что удалилось бы (dry-run)" "удалить")"
@@ -1771,60 +1863,69 @@ menu_wal() {
           "${WAL_SCRIPTS_DIR}/wal-retention.sh" "$inst" || true
         fi
         pause ;;
-      7) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/wal-timers.sh" "$inst" || true; }; pause ;;
-      0|"") return ;;
-      *) msg ERR "Некорректный выбор"; sleep 1 ;;
+      timers) inst="$(pick_instance)" && { "${WAL_SCRIPTS_DIR}/wal-timers.sh" "$inst" || true; }; pause ;;
+      0) return ;;
+      *) sleep 1 ;;
     esac
   done
 }
 
 menu_verify() {
+  component_enabled sandbox || { msg WARN "Компонент sandbox выключен — проверки восстановимости недоступны"; pause; return; }
   while true; do
     menu_header
     echo -e " ${BOLD}Проверка восстановимости${RESET}  (на сервере-песочнице)"
-    echo "  1. Проверка парка        все серверы × все хранилища × все категории"
-    echo "  2. Полный стек           каталог + БД + подъём контейнеров в изоляции"
-    echo "  3. Локальная проверка    PITR-цепочки и архивы этого сервера"
-    echo "  4. План ротации          что будет проверяться в следующий прогон"
-    echo
-    echo "  0. Назад"
-    echo
-    read -r -p "[?] Выбор: " c; echo
+    local c
+    c="$(menu_pick \
+      fleet "Проверка парка        все серверы × все хранилища × все категории" \
+      stack "Полный стек           каталог + БД + подъём контейнеров в изоляции" \
+      local "Локальная проверка    PITR-цепочки и архивы этого сервера" \
+      plan "План ротации          что будет проверяться в следующий прогон" \
+      sync "Обновить S3/TG креды  скопировать с подключённых серверов")"
     case "$c" in
-      1)
+      fleet)
         local scope depth
         scope="$(ask_choice "Охват:" "весь парк" "один сервер")"
         depth="$(ask_choice "Глубина:" "стандартная" "быстрая (quick)" "глубокая (deep: pg_dumpall + amcheck)")"
-        local -a args=()
-        case "$depth" in быстр*) args+=(--depth quick) ;; глубок*) args+=(--depth deep) ;; esac
+        local -a fargs=()
+        case "$depth" in быстр*) fargs+=(--depth quick) ;; глубок*) fargs+=(--depth deep) ;; esac
         if [[ "$scope" == один* ]]; then
-          read -r -p "  ID сервера: " sid
-          [[ -n "$sid" ]] && args+=(--server "$sid")
+          local sid
+          sid="$(pick_fleet_server)" || { pause; continue; }
+          fargs+=(--server "$sid")
         fi
-        "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" "${args[@]}" || true
+        msg INFO "Запуск: verify-fleet.sh ${fargs[*]-}"
+        # Актуализируем креды перед прогоном (S3/TG с серверов).
+        "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
+        "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" ${fargs[@]+"${fargs[@]}"} || true
         pause ;;
-      2)
+      stack)
         read -r -p "  Проект [panel]: " pr; pr="${pr:-panel}"
-        read -r -p "  ID сервера-источника (пусто = этот хост): " sid
-        local mode keep
+        local sid mode keep
+        sid="$(pick_fleet_server)" || {
+          read -r -p "  ID сервера-источника вручную: " sid
+          [[ -n "$sid" ]] || { msg ERR "Без --source на песочнице стек не из чего собирать"; pause; continue; }
+        }
         mode="$(ask_choice "Способ подъёма БД:" \
           "автоматически по ротации" "логический дамп" "базовый бэкап" "базовый бэкап + WAL (PITR)")"
         keep="$(ask_choice "После проверки:" "убрать всё" "оставить контейнеры для разбора")"
-        local -a args=("$pr")
-        [[ -n "$sid" ]] && args+=(--source "$sid")
+        local -a sargs=("$pr" --source "$sid")
         case "$mode" in
-          логический*) args+=(--db-mode dump) ;;
-          "базовый бэкап") args+=(--db-mode base) ;;
-          *WAL*) args+=(--db-mode pitr) ;;
+          логический*) sargs+=(--db-mode dump) ;;
+          "базовый бэкап") sargs+=(--db-mode base) ;;
+          *WAL*|*"PITR"*) sargs+=(--db-mode pitr) ;;
         esac
-        [[ "$keep" == оставить* ]] && args+=(--keep)
-        "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "${args[@]}" || true
+        [[ "$keep" == оставить* ]] && sargs+=(--keep)
+        msg INFO "Запуск: verify-stack.sh ${sargs[*]}"
+        "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
+        "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "${sargs[@]}" || true
         pause ;;
-      3) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
-      4)
+      local) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
+      plan)
         read -r -p "  Проект [panel]: " pr; pr="${pr:-panel}"
-        read -r -p "  ID сервера [$(rw_source_id)]: " sid; sid="${sid:-$(rw_source_id)}"
-        local bn
+        local sid bn
+        sid="$(pick_fleet_server 2>/dev/null)" || sid="$(rw_source_id)"
+        read -r -p "  ID сервера [${sid}]: " sid_in; sid="${sid_in:-$sid}"
         bn="$(s3m_backends | head -n1)"
         if [[ -n "$bn" ]] && s3m_load "$bn"; then
           msg INFO "Следующий прогон проверит:"
@@ -1832,11 +1933,27 @@ menu_verify() {
           AWS_DEFAULT_REGION="${B_REGION:-us-east-1}" AWS_ENDPOINT_URL="${B_ENDPOINT:-}" \
           VERIFY_PLAN_DRYRUN=1 "${SANDBOX_SCRIPTS_DIR}/verify-plan.sh" "$pr" "$sid" "$B_BUCKET" "$B_PREFIX" || true
         else
-          msg ERR "Нет доступного S3-бэкенда"
+          # На песочнице локальных s3.d обычно нет — берём из кэша кредов.
+          local cred="${INSTALL_DIR}/fleet-creds/${sid}/s3.d"
+          if [[ -d "$cred" ]]; then
+            bn="$(basename "$(ls "$cred"/*.env 2>/dev/null | head -n1)" .env || true)"
+            if [[ -n "$bn" ]]; then
+              S3D_DIR="$cred" s3m_load "$bn" || true
+              msg INFO "Следующий прогон проверит (креды ${sid}):"
+              AWS_ACCESS_KEY_ID="$B_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$B_SECRET_KEY" \
+              AWS_DEFAULT_REGION="${B_REGION:-us-east-1}" AWS_ENDPOINT_URL="${B_ENDPOINT:-}" \
+              VERIFY_PLAN_DRYRUN=1 "${SANDBOX_SCRIPTS_DIR}/verify-plan.sh" "$pr" "$sid" "$B_BUCKET" "$B_PREFIX" || true
+            else
+              msg ERR "Нет S3-бэкенда. Сначала: пункт «Обновить S3/TG креды»"
+            fi
+          else
+            msg ERR "Нет доступного S3-бэкенда. Сначала: пункт «Обновить S3/TG креды»"
+          fi
         fi
         pause ;;
-      0|"") return ;;
-      *) msg ERR "Некорректный выбор"; sleep 1 ;;
+      sync) "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true; pause ;;
+      0) return ;;
+      *) sleep 1 ;;
     esac
   done
 }
@@ -1845,26 +1962,24 @@ menu_storage() {
   while true; do
     menu_header
     echo -e " ${BOLD}Хранилища${RESET}"
-    echo "  1. Список бэкендов       что настроено, какие категории и сроки"
-    echo "  2. Добавить бэкенд       новое S3-хранилище со своими retention"
-    echo "  3. Удалить бэкенд        только конфигурацию, данные в бакете целы"
-    echo "  4. Диагностика связи     листинг, запись, чтение, удаление + ошибки aws"
-    echo "  5. Очистка по retention  применить сроки хранения ко всем бэкендам"
-    echo
-    echo "  0. Назад"
-    echo
-    read -r -p "[?] Выбор: " c; echo
+    local c
+    c="$(menu_pick \
+      list "Список бэкендов       что настроено, какие категории и сроки" \
+      add "Добавить бэкенд       новое S3-хранилище со своими retention" \
+      del "Удалить бэкенд        только конфигурацию, данные в бакете целы" \
+      test "Диагностика связи     листинг, запись, чтение, удаление + ошибки aws" \
+      clean "Очистка по retention  применить сроки хранения ко всем бэкендам")"
     case "$c" in
-      1) s3_backends_list; pause ;;
-      2) s3_backend_add; pause ;;
-      3) s3_backend_remove; pause ;;
-      4)
+      list) s3_backends_list; pause ;;
+      add) s3_backend_add; pause ;;
+      del) s3_backend_remove; pause ;;
+      test)
         read -r -p "  Имя бэкенда (пусто = все): " bn
         if [[ -n "$bn" ]]; then s3m_test_backend "$bn" || true; else s3m_test_all || true; fi
         pause ;;
-      5) full_s3_retention_cleanup; pause ;;
-      0|"") return ;;
-      *) msg ERR "Некорректный выбор"; sleep 1 ;;
+      clean) full_s3_retention_cleanup; pause ;;
+      0) return ;;
+      *) sleep 1 ;;
     esac
   done
 }
@@ -1873,21 +1988,21 @@ menu_settings() {
   while true; do
     menu_header
     echo -e " ${BOLD}Настройки${RESET}"
-    echo "  1. Показать конфигурацию  текущие значения из единого конфига"
-    echo "  2. Компоненты сервера     что этот сервер делает (FULL_COMPONENTS)"
-    echo "  3. Расписание бэкапов     интервал или конкретные времена"
-    echo "  4. Telegram               токен, чат, тема"
-    echo "  5. Сроки хранения         локально и во внешних хранилищах"
-    echo "  6. Таймер песочницы       расписание проверок восстановимости"
-    echo "  7. Метрики сейчас         выгрузить для Grafana немедленно"
-    echo "  8. Отключить старый cron  убрать дублирующий distillium-скрипт"
-    echo
-    echo "  0. Назад"
-    echo
-    read -r -p "[?] Выбор: " c; echo
+    local -a args=(
+      cfg "Показать конфигурацию  текущие значения из единого конфига"
+      comps "Компоненты сервера     что этот сервер делает (FULL_COMPONENTS)"
+      timer "Расписание бэкапов     интервал или конкретные времена"
+      tg "Telegram               токен, чат, тема"
+      ret "Сроки хранения         локально и во внешних хранилищах"
+    )
+    component_enabled sandbox && args+=(sandbox-timer "Таймер песочницы       расписание проверок восстановимости")
+    component_enabled metrics && args+=(metrics "Метрики сейчас         выгрузить для Grafana немедленно")
+    args+=(digest "Сводка сейчас          краткий отчёт в Telegram (09:00/21:00)")
+    args+=(decommission "Отключить старый cron  убрать дублирующий distillium-скрипт")
+    local c; c="$(menu_pick "${args[@]}")"
     case "$c" in
-      1) show_config_summary; pause ;;
-      2)
+      cfg) show_config_summary; pause ;;
+      comps)
         echo "Включено: ${FULL_COMPONENTS:-(по умолчанию)}"
         for comp in panel-backup custom-backup wal config-track metrics sandbox web; do
           component_enabled "$comp" && echo "  ✅ $comp" || echo "  ⬜ $comp"
@@ -1901,14 +2016,15 @@ menu_settings() {
           apply_components
         fi
         pause ;;
-      3) configure_timer; pause ;;
-      4) configure_telegram; pause ;;
-      5) configure_retention; pause ;;
-      6) sandbox_timer_install; pause ;;
-      7) "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" || true; pause ;;
-      8) decommission_original; pause ;;
-      0|"") return ;;
-      *) msg ERR "Некорректный выбор"; sleep 1 ;;
+      timer) configure_timer; pause ;;
+      tg) configure_telegram; pause ;;
+      ret) configure_retention; pause ;;
+      sandbox-timer) sandbox_timer_install; pause ;;
+      metrics) "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" || true; pause ;;
+      digest) "${METRICS_SCRIPTS_DIR}/status-digest.sh" || true; pause ;;
+      decommission) decommission_original; pause ;;
+      0) return ;;
+      *) sleep 1 ;;
     esac
   done
 }
@@ -1917,34 +2033,35 @@ main_menu() {
   while true; do
     load_config
     menu_header
-    echo "  1. Резервное копирование    бэкапы панели, ботов, снимки каталогов"
-    echo "  2. Восстановление           из архивов, из WAL, на чистый сервер"
-    echo "  3. WAL-архивация и PITR     непрерывная защита БД"
-    echo "  4. Проверка восстановимости песочница: парк, стек, ротация проверок"
-    echo "  5. Хранилища                внешние S3, диагностика, retention"
-    echo "  6. Настройки                конфиг, компоненты, расписания, Telegram"
-    echo
-    echo "  7. Состояние                статус WAL, найденные проекты, конфигурация"
-    echo
-    echo "  0. Выход"
-    echo
-    read -r -p "[?] Выбор: " choice
-    echo
-
+    local -a args=()
+    if component_enabled panel-backup || component_enabled custom-backup || component_enabled config-track; then
+      args+=(backup "Резервное копирование    бэкапы панели, ботов, снимки каталогов")
+    fi
+    if component_enabled panel-backup || component_enabled custom-backup || component_enabled config-track || component_enabled wal; then
+      args+=(restore "Восстановление           из архивов, из WAL, на чистый сервер")
+    fi
+    component_enabled wal && args+=(wal "WAL-архивация и PITR     непрерывная защита БД")
+    component_enabled sandbox && args+=(verify "Проверка восстановимости песочница: парк, стек, ротация проверок")
+    # Хранилища: на проде — свои s3.d; на песочнице тоже полезно смотреть/тестировать кэш.
+    args+=(storage "Хранилища                внешние S3, диагностика, retention")
+    args+=(settings "Настройки                конфиг, компоненты, расписания, Telegram")
+    args+=(status "Состояние                статус, найденные проекты, конфигурация")
+    local choice; choice="$(MENU_BACK_LABEL=Выход menu_pick "${args[@]}")"
     case "$choice" in
-      1) menu_backup ;;
-      2) menu_restore ;;
-      3) menu_wal ;;
-      4) menu_verify ;;
-      5) menu_storage ;;
-      6) menu_settings ;;
-      7)
-        wal_status_all
+      backup) menu_backup ;;
+      restore) menu_restore ;;
+      wal) menu_wal ;;
+      verify) menu_verify ;;
+      storage) menu_storage ;;
+      settings) menu_settings ;;
+      status)
+        component_enabled wal && wal_status_all
         echo
-        print_custom_projects
+        component_enabled custom-backup && print_custom_projects
+        show_config_summary
         pause ;;
       0) exit 0 ;;
-      *) msg ERR "Некорректный выбор"; sleep 1 ;;
+      *) sleep 1 ;;
     esac
   done
 }
@@ -2007,6 +2124,8 @@ WAL / PITR (v4):
   rw-backup-full verify-fleet [--server ID] [--backend N] [--depth D]
                                                 проверка парка: сервер × хранилище
   rw-backup-full fleet-pack pack|unpack         перенос настроек песочницы одним файлом
+  rw-backup-full sync-creds                     актуализировать S3/TG с серверов парка
+  rw-backup-full status-digest                  краткая сводка в Telegram (09:00/21:00)
 EOF_USAGE
 }
 
@@ -2099,6 +2218,10 @@ case "$cmd" in
     shift; exec "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" "$@" ;;
   fleet-pack)
     shift; exec "${SANDBOX_SCRIPTS_DIR}/fleet-pack.sh" "$@" ;;
+  sync-creds)
+    exec "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" ;;
+  status-digest)
+    exec "${METRICS_SCRIPTS_DIR}/status-digest.sh" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac

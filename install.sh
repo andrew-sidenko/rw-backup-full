@@ -280,8 +280,11 @@ comp_on() { [[ " ${CUR_COMPONENTS} " == *" $1 "* ]]; }
 # 5. systemd
 # --------------------------------------------------------------------------
 UNITS_PROD=(rw-wal-ship@.service rw-wal-ship@.timer rw-basebackup@.service rw-basebackup@.timer \
-            rw-metrics-export.service rw-metrics-export.timer)
-UNITS_ALL=(rw-sandbox-verify.service rw-sandbox-verify.timer rw-notify-failure@.service rw-verify-stack.service rw-verify-stack.timer)
+            rw-metrics-export.service rw-metrics-export.timer \
+            rw-status-digest.service rw-status-digest.timer)
+UNITS_ALL=(rw-sandbox-verify.service rw-sandbox-verify.timer rw-notify-failure@.service \
+           rw-verify-stack.service rw-verify-stack.timer \
+           rw-status-digest.service rw-status-digest.timer)
 if ask "Шаг 5: systemd-юниты" \
 "Будет сделано:
   - установка/обновление юнитов: $([[ $ROLE == prod ]] && echo "${UNITS_PROD[*]} ") ${UNITS_ALL[*]}
@@ -327,6 +330,14 @@ if ask "Шаг 5: systemd-юниты" \
       ok "rw-config-track.timer включён"
     fi
   fi
+  if (comp_on metrics || comp_on sandbox || comp_on web) && ask "Шаг 5г: сводки в Telegram в 09:00 и 21:00" \
+"Будет сделано: systemctl enable --now rw-status-digest.timer.
+Последствия: дважды в сутки краткая сводка (диски, актуальность бэкапов,
+результаты проверок, ошибки) уходит в Telegram этого сервера; на песочнице
+общие итоги дополнительно рассылаются по TG всех серверов парка."; then
+    systemctl enable --now rw-status-digest.timer
+    ok "rw-status-digest.timer включён"
+  fi
 fi
 
 # --------------------------------------------------------------------------
@@ -371,9 +382,11 @@ if [[ "$ROLE" == "prod" ]]; then
 EOF_N
 else
   cat <<'EOF_N'
-  nano /opt/rw-backup-restore/rw-backup-full.env   # S3-доступ на чтение
-  scp prod:/opt/rw-backup-restore/instances.d/*.env /opt/rw-backup-restore/instances.d/
-  rw-backup-full verify                            # пробная проверка
+  # Песочница: реквизиты S3/TG подтягиваются с серверов автоматически
+  rw-backup-full sync-creds                    # актуализировать кэш кредов
+  rw-backup-full verify                        # пробная проверка парка
+  rw-backup-full verify-stack panel --source <ID> --db-mode dump
   Веб-интерфейс: http://127.0.0.1:8787 (токен в /etc/rw-backup-web.env)
+  Меню показывает только пункты компонентов sandbox/metrics/web
 EOF_N
 fi

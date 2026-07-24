@@ -63,6 +63,7 @@ case "${DB_MODE_FORCE:-}" in
 esac
 
 wal_load_full_config
+require_component sandbox
 command -v jq >/dev/null 2>&1 || { msg ERR "Нужен jq"; exit 1; }
 wal_lock "verify-stack-${PROJECT}" || exit 0
 
