@@ -163,6 +163,27 @@ ENCRYPTED="$([[ -n "$enc_ext" ]] && echo true || echo false)"
 DURATION_SECONDS="${duration}"
 EOF_META
 
+# Текстовый журнал рядом с архивом (то же stem-имя). Retention локально
+# удаляет ${base}.* и в S3 — все ключи с префиксом base_…, включая .txt.
+journal_file="${INST_BASEBACKUP_DIR}/${base_name}.txt"
+{
+  echo "rw-backup-full basebackup journal"
+  echo "instance=${INSTANCE} kind=${INST_KIND} host=$(wal_hostname)"
+  echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "file=$(basename "$out_file")"
+  echo "size_bytes=${size_bytes}"
+  echo "sha256=${sha}"
+  echo "pg_version=${pgver}"
+  echo "start_segment=${start_segment}"
+  echo "end_segment=${end_segment}"
+  echo "duration_seconds=${duration}"
+  echo "result=ok"
+  if [[ -f "${INST_STATE_DIR}/last_basebackup_members.txt" ]]; then
+    echo "--- members (first 40) ---"
+    head -n 40 "${INST_STATE_DIR}/last_basebackup_members.txt"
+  fi
+} > "$journal_file"
+
 echo "$(date +%s)" > "${INST_STATE_DIR}/last_success"
 
 msg OK "[${INSTANCE}] базовый бэкап готов: $(basename "$out_file") ($(numfmt --to=iec "$size_bytes" 2>/dev/null || echo "${size_bytes}B"), ${duration}s)"
@@ -184,6 +205,8 @@ if [[ "$NO_S3" != "--no-s3" ]] && wal_s3_ready; then
       if wal_aws s3 cp "$out_file" "$(wal_s3_uri "basebackup/$(basename "$out_file")")" --only-show-errors 2>"$bb_err" &&
          wal_aws s3 cp "$meta_file" "$(wal_s3_uri "basebackup/$(basename "$meta_file")")" --only-show-errors 2>>"$bb_err"; then
         b_ok=true
+        # Журнал — best-effort: архив уже на месте.
+        wal_aws s3 cp "$journal_file" "$(wal_s3_uri "basebackup/$(basename "$journal_file")")" --only-show-errors 2>>"$bb_err" || true
         break
       fi
       sleep $((attempt * 5))

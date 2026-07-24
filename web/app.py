@@ -403,6 +403,75 @@ def api_fleet_overview():
     }
 
 
+HISTORY_DIR = Path(os.environ.get(
+    "VERIFY_HISTORY_DIR", f"{INSTALL_DIR}/web-data/verify-history"))
+
+
+def _load_history(limit: int = 20, server: str | None = None) -> list[dict]:
+    """Читает JSON-историю прогонов fleet/stack (новые сверху)."""
+    if not HISTORY_DIR.is_dir():
+        return []
+    files = sorted(
+        list(HISTORY_DIR.glob("fleet_*.json")) + list(HISTORY_DIR.glob("stack_*.json")),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    out = []
+    for f in files:
+        if len(out) >= limit:
+            break
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        if server:
+            # fleet: фильтр по results[].source; stack: по source
+            if data.get("type") == "fleet":
+                filtered = [r for r in data.get("results", [])
+                            if r.get("source") == server]
+                if not filtered:
+                    continue
+                data = dict(data)
+                data["results"] = filtered
+                data["total"] = len(filtered)
+                data["passed"] = sum(1 for r in filtered if r.get("ok"))
+            elif data.get("source") != server and data.get("project") != server:
+                continue
+        data["_file"] = f.name
+        out.append(data)
+    return out
+
+
+@app.get("/api/verify/history", dependencies=[Depends(auth)])
+def api_verify_history(limit: int = 20, server: str | None = None):
+    """История проверок восстановимости (fleet + stack) для панели."""
+    limit = max(1, min(limit, 100))
+    return {"ok": True, "history": _load_history(limit, server)}
+
+
+@app.get("/api/servers/{sid}/verify", dependencies=[Depends(auth)])
+def api_server_verify(sid: str, limit: int = 10):
+    """История проверок, относящихся к конкретному серверу."""
+    get_server(sid)  # 404 если нет
+    limit = max(1, min(limit, 50))
+    # Ищем и по id карточки, и по hostname из статуса (source в S3).
+    hist = _load_history(limit * 3, server=sid)
+    # Дополнительно — по source из последнего статуса / манифеста
+    try:
+        rc, out, _ = ssh_run(get_server(sid), ALLOWED_ACTIONS["status"], timeout=15)
+        if rc == 0:
+            st = json.loads(out.strip().splitlines()[-1])
+            src = st.get("host")
+            if src and src != sid:
+                extra = _load_history(limit * 3, server=src)
+                seen = {h.get("_file") for h in hist}
+                for h in extra:
+                    if h.get("_file") not in seen:
+                        hist.append(h)
+    except Exception:
+        pass
+    hist.sort(key=lambda h: h.get("ts", 0), reverse=True)
+    return {"ok": True, "server": sid, "history": hist[:limit]}
+
+
 @app.get("/api/pubkey", dependencies=[Depends(auth)])
 def api_pubkey():
     pub = Path(SSH_KEY + ".pub")
@@ -440,6 +509,9 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 <button onclick="addDlg.showModal()">+ Добавить сервер</button>
 </div></div>
 <div class="card"><b>Песочница (этот сервер):</b> <span id="sandbox" class="mut">…</span></div>
+<div class="card"><b>История проверок:</b>
+<button onclick="loadHistory()">⟳</button>
+<div id="history" class="mut">…</div></div>
 <div id="servers" class="grid"></div>
 <pre id="log" class="mut">Журнал операций…</pre>
 
@@ -460,6 +532,10 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 сервере не изменяются. Перед записью на сервере создаётся резервная копия файла.</p>
 <div class="row"><button class="pri" onclick="saveCfg()">Сохранить на сервер</button>
 <button onclick="cfgDlg.close()">Закрыть</button></div></dialog>
+
+<dialog id="histDlg"><h3 id="histTitle">Проверки</h3>
+<pre id="histBody" style="max-height:420px"></pre>
+<div class="row"><button onclick="histDlg.close()">Закрыть</button></div></dialog>
 
 <script>
 let TOK = localStorage.getItem('rwtok')||''; if(TOK) document.getElementById('tok').value = TOK;
@@ -487,6 +563,7 @@ async function refreshAll(){
       <button onclick="act('${s.id}','custom-backup')">Бэкап ботов</button>
       <button onclick="act('${s.id}','wal-status')">WAL-статус</button>
       <button onclick="act('${s.id}','verify-local')">Verify</button>
+      <button onclick="showServerVerify('${s.id}')">История проверок</button>
       <button onclick="openCfg('${s.id}')">⚙ Конфиги</button>
       <button onclick="delServer('${s.id}')" class="bad">✕</button>
       </div>`;
@@ -494,6 +571,7 @@ async function refreshAll(){
     loadStatus(s.id);
   });
   loadSandbox();
+  loadHistory();
 }
 async function loadStatus(sid){
   try{
@@ -523,6 +601,39 @@ async function loadSandbox(){
     (fails?` · ошибок матрицы: <b class="bad">${fails}</b>`:'')+
     (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'')+
     ` · кредов синхр.: ${synced}`;
+}
+function fmtHist(h){
+  const when = h.ts? new Date(h.ts*1000).toLocaleString() : h._file;
+  if(h.type==='fleet'){
+    const cls = h.passed===h.total?'ok':'bad';
+    return `<div><span class="${cls}">fleet</span> ${when} — <b class="${cls}">${h.passed}/${h.total}</b> (depth=${h.depth||'?'})`+
+      (h.results||[]).slice(0,8).map(r=>`<div class="mut" style="margin-left:12px">${r.ok?'✅':'❌'} ${r.source}: ${(r.detail||'').slice(0,120)}</div>`).join('')+
+      `</div>`;
+  }
+  const cls = h.ok?'ok':'bad';
+  return `<div><span class="${cls}">stack</span> ${when} — <b>${h.project||'?'}</b> src=${h.source||'?'} <span class="${cls}">${h.ok?'ok':'fail'}</span> <span class="mut">${h.detail||''}</span></div>`;
+}
+async function loadHistory(){
+  try{
+    const r = await api('GET','/api/verify/history?limit=12');
+    const box = $('history');
+    if(!r.history || !r.history.length){ box.innerHTML='<span class="mut">пока нет прогонов</span>'; return; }
+    box.innerHTML = r.history.map(fmtHist).join('');
+  }catch(e){ if(e!=='auth') $('history').textContent='ошибка загрузки истории'; }
+}
+async function showServerVerify(sid){
+  $('histTitle').textContent = 'Проверки: '+sid;
+  $('histBody').textContent = 'загрузка…';
+  histDlg.showModal();
+  const r = await api('GET',`/api/servers/${sid}/verify?limit=15`);
+  if(!r.history || !r.history.length){ $('histBody').textContent='нет записей для этого сервера'; return; }
+  $('histBody').textContent = r.history.map(h=>{
+    if(h.type==='fleet'){
+      return new Date((h.ts||0)*1000).toLocaleString()+' fleet '+h.passed+'/'+h.total+'\\n'+
+        (h.results||[]).map(x=>'  '+(x.ok?'OK':'FAIL')+' '+(x.detail||'')).join('\\n');
+    }
+    return new Date((h.ts||0)*1000).toLocaleString()+' stack '+(h.ok?'OK':'FAIL')+' '+(h.project||'')+' '+(h.detail||'');
+  }).join('\\n\\n');
 }
 async function act(sid,a){
   log(`▶ ${sid}: ${a}…`);

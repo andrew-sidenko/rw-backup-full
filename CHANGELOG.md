@@ -1,5 +1,17 @@
 # Changelog
 
+## v5.5.1 (2026-07-24)
+
+### Добавлено
+- **Журналы `.txt` для WAL basebackup** (рядом с `base_*.tar*` / `.meta`); локальная и S3-retention уже удаляют `${base}.*` / префикс `base_…`, включая журнал.
+- **История проверок в веб**: `web-data/verify-history/` (fleet + stack JSON), API `/api/verify/history` и `/api/servers/{id}/verify`, блок истории и кнопка на карточке сервера.
+- **verify-stack предпочитает `fleet-creds/<id>`** при `--source` (быстрее, переживает краткий даунтайм веб); kind/таблицы дополняются из манифеста при наличии.
+- **Юнит-тесты** `test/unit_menu_and_journals.sh`: ask_choice/menu_pick, journal names, sync-creds (мок), фильтр истории.
+
+### Изменено
+- Английский `README.md` приведён к v5.5 (роли, песочница, журналы, веб).
+
+
 ## v5.5.0 (2026-07-24)
 
 ### Исправлено

@@ -78,6 +78,7 @@ rw-backup-full status-digest
 ```
 
 Метрики: `rw_fleet_verify_ok{source,backend,category}`, `rw_fleet_server_reachable{server}`.  
-Веб-панель: статус серверов (компоненты, бэкапы, диск, WAL, S3), сводка песочницы, API `/api/fleet/overview`.
+Веб-панель: статус серверов (компоненты, бэкапы, диск, WAL, S3), сводка песочницы, история проверок (`/api/verify/history`, кнопка на карточке), API `/api/fleet/overview`.  
+`verify-stack --source` предпочитает кэш `fleet-creds/<id>/` после `sync-creds` (веб не обязателен на каждый запуск).
 
 PITR-цепочки тоже в матрице (см. CHANGELOG v5.2.0 про staging WAL). Подтверждено на живом сервере для `INST_KIND=panel`; для `bot`/`site` механизм тот же, но на реальном инстансе бота отдельно не прогонялся.
