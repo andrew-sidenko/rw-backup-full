@@ -173,6 +173,18 @@ ${uri}" || true
     rm -f "$up_err"
   done
   (( targeted == 0 )) && return 0
+  # Строгий режим: копия обязана уйти во ВСЕ целевые хранилища. При частичной
+  # выгрузке задача помечается неуспешной + алерт — иначе деградацию
+  # диверсификации (одно из хранилищ упало) легко не заметить.
+  if truthy "${FULL_S3_STRICT:-false}" && (( ok < targeted )); then
+    msg ERR "S3 strict: копия ушла только в ${ok}/${targeted} хранилищ (FULL_S3_STRICT=true) — задача неуспешна"
+    if declare -F send_full_telegram_message >/dev/null; then
+      send_full_telegram_message "❌ S3 strict: ${label:-$category}
+Файл: ${fname}
+Принято хранилищами: ${ok}/${targeted} — диверсификация нарушена" || true
+    fi
+    return 1
+  fi
   (( ok > 0 ))
 }
 
