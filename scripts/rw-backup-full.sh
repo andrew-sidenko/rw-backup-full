@@ -1724,7 +1724,8 @@ WAL / PITR (v4):
   rw-backup-full config-track [проект] [--full]  снимок сейчас
   rw-backup-full config-track --list             что отслеживается
   rw-backup-full config-restore <проект> --dest DIR [--at "дата"]
-  rw-backup-full verify-stack <проект>           проверка полного стека в изоляции
+  rw-backup-full verify-stack <проект> [--source ID]  проверка полного стека в изоляции
+                                                (--source обязателен, если проект на другом сервере)
 
 Компоненты:
   rw-backup-full components                      что включено на сервере

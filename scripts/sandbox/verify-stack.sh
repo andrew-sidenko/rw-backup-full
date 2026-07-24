@@ -24,7 +24,14 @@
 #   6. bind-монты внутрь боевых каталогов перенаправляются на восстановленную
 #      копию, а всё, что осталось за её пределами, монтируется только на чтение.
 #
-#   verify-stack.sh <проект> [--keep] [--from-s3|--from-local]
+#   verify-stack.sh <проект> [--source ID] [--keep] [--from-s3|--from-local]
+#
+# --source ID — идентификатор источника ПРОВЕРЯЕМОГО сервера (тот же, что
+# в его манифесте / карточке в веб-интерфейсе), НЕ хоста песочницы. Нужен
+# всегда, когда проект физически живёт на другом сервере (обычный случай:
+# песочница отдельная, панель — на проде). Реквизиты S3 при этом берутся
+# не из локального s3.d песочницы (там обычно ничего нет), а из манифеста
+# указанного сервера — тем же путём, что и у verify-fleet.sh.
 
 set -euo pipefail
 
@@ -36,12 +43,13 @@ PROJECT="${1:-}"
 [[ -n "$PROJECT" && "$PROJECT" != -* ]] || { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
 shift
 
-KEEP="false"; SRC="s3"
+KEEP="false"; SRC="s3"; REMOTE_SOURCE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep)       KEEP="true"; shift ;;
     --from-s3)    SRC="s3"; shift ;;
     --from-local) SRC="local"; shift ;;
+    --source)     REMOTE_SOURCE="$2"; shift 2 ;;
     *) msg ERR "Неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
@@ -50,13 +58,64 @@ wal_load_full_config
 command -v jq >/dev/null 2>&1 || { msg ERR "Нужен jq"; exit 1; }
 wal_lock "verify-stack-${PROJECT}" || exit 0
 
+# --source задан: подтягиваем манифест указанного сервера (та же логика,
+# что в verify-fleet.sh) и материализуем ЕГО S3-бэкенд как временный
+# s3.d-файл — дальше config-restore.sh и остальной скрипт работают как
+# обычно, просто с чужими кредами вместо (обычно пустых) локальных.
+# RW_SOURCE_ID переопределяет rw_source_id()/wal_hostname() ВЕЗДЕ ниже по
+# скрипту — без этого путь в S3 указывал бы на хост песочницы, а не на
+# сервер, где реально лежат бэкапы.
+REMOTE_S3D=""
+if [[ -n "$REMOTE_SOURCE" ]]; then
+  WEB_ENV="${WEB_ENV:-/etc/rw-backup-web.env}"
+  WEB_URL="${RW_WEB_URL:-http://127.0.0.1:8787}"
+  TOKEN="${WEB_TOKEN:-}"
+  [[ -z "$TOKEN" && -f "$WEB_ENV" ]] && TOKEN="$(grep -E '^WEB_TOKEN=' "$WEB_ENV" | head -n1 | cut -d= -f2- || true)"
+  [[ -n "$TOKEN" ]] || { msg ERR "WEB_TOKEN не найден (${WEB_ENV}) — нужен для --source"; exit 1; }
+
+  MANIFEST=""
+  for attempt in 1 2 3; do
+    MANIFEST="$(curl -fsS -m 60 -H "x-token: ${TOKEN}" "${WEB_URL}/api/fleet/manifest" 2>/dev/null)" && break
+    sleep $((attempt * 3))
+  done
+  [[ -n "$MANIFEST" ]] || { msg ERR "Веб-сервис недоступен: ${WEB_URL}"; exit 1; }
+
+  SRV_JSON="$(jq -c --arg s "$REMOTE_SOURCE" '.servers[] | select(.source == $s or .id == $s)' <<<"$MANIFEST" | head -n1)"
+  [[ -n "$SRV_JSON" ]] || { msg ERR "Сервер с source/id '${REMOTE_SOURCE}' не найден в манифесте (проверьте карточку в веб-интерфейсе)"; exit 1; }
+  [[ "$(jq -r .reachable <<<"$SRV_JSON")" == "true" ]] || msg WARN "Сервер '${REMOTE_SOURCE}' помечен недоступным в последнем манифесте — используем закэшированные данные"
+
+  BJ="$(jq -c '[.backends[]? | select(.enabled == true and (.panel == true or .custom == true))] | first // empty' <<<"$SRV_JSON")"
+  [[ -n "$BJ" ]] || { msg ERR "У сервера '${REMOTE_SOURCE}' нет включённого S3-бэкенда с panel/custom"; exit 1; }
+
+  REMOTE_S3D="$(mktemp -d)"
+  jq -r '
+    "B_ENABLED=\"true\""
+    + "\nB_ENDPOINT=\"" + (.endpoint // "") + "\""
+    + "\nB_BUCKET=\"" + .bucket + "\""
+    + "\nB_ACCESS_KEY=\"" + .access_key + "\""
+    + "\nB_SECRET_KEY=\"" + .secret_key + "\""
+    + "\nB_REGION=\"" + (.region // "us-east-1") + "\""
+    + "\nB_PREFIX=\"" + (.prefix // "rw-backup-full") + "\""
+    + "\nB_UPLOAD_PANEL=\"true\"\nB_UPLOAD_CUSTOM=\"true\"\nB_UPLOAD_WAL=\"true\""
+  ' <<<"$BJ" > "${REMOTE_S3D}/remote.env"
+  chmod 600 "${REMOTE_S3D}/remote.env"
+
+  export S3D_DIR="$REMOTE_S3D"
+  export RW_SOURCE_ID="$(jq -r .source <<<"$SRV_JSON")"
+  msg OK "Источник: ${RW_SOURCE_ID} (бэкенд $(jq -r .name <<<"$BJ"), реквизиты из манифеста)"
+fi
+
 SID="$$"
 NET="rw-sbx-net-${SID}"
 CPROJ="rwsbx${SID}"
+mkdir -p "${SANDBOX_WORK:-/var/lib/rw-wal/sandbox}"
 WORK="$(mktemp -d "${SANDBOX_WORK:-/var/lib/rw-wal/sandbox}/stack.XXXXXX")"
 RESTORED="${WORK}/root"
 
 cleanup() {
+  # Временные реквизиты удалённого бэкенда — секреты, убираются ВСЕГДА,
+  # даже если --keep оставляет остальное для разбора.
+  [[ -n "$REMOTE_S3D" ]] && rm -rf "$REMOTE_S3D"
   if [[ "$KEEP" == "true" ]]; then
     msg INFO "Оставлено по --keep: сеть ${NET}, проект ${CPROJ}, каталог ${WORK}"
     msg INFO "Убрать: docker compose -p ${CPROJ} down -v; docker network rm ${NET}; rm -rf ${WORK}"
