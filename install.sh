@@ -63,6 +63,11 @@ put() { # put <mode> <src> <dst>
 V3_DETECTED="false"; [[ -f "${INSTALL_DIR}/rw-backup-full.sh" ]] && V3_DETECTED="true"
 ORIG_DETECTED="false"; [[ -x "${INSTALL_DIR}/backup-restore.sh" || -x /usr/local/bin/rw-backup ]] && ORIG_DETECTED="true"
 
+# Если репозиторий развернули так, что права на запуск потерялись
+# (архив без unix-модов, копирование через Windows-шару и т.п.) — чиним сразу,
+# иначе install.sh упадёт на первом же вызове вложенного скрипта.
+find "$SRC_DIR" -name '*.sh' ! -perm -u+x -exec chmod +x {} + 2>/dev/null || true
+
 echo -e "${C_B}Установка rw-backup-full v5 (роль: ${ROLE})${C_R}"
 echo "Обнаружено:"
 echo "  предыдущая версия rw-backup-full: $([[ $V3_DETECTED == true ]] && echo 'ДА (обновление)' || echo 'нет (чистая установка)')"
@@ -276,7 +281,7 @@ comp_on() { [[ " ${CUR_COMPONENTS} " == *" $1 "* ]]; }
 # --------------------------------------------------------------------------
 UNITS_PROD=(rw-wal-ship@.service rw-wal-ship@.timer rw-basebackup@.service rw-basebackup@.timer \
             rw-metrics-export.service rw-metrics-export.timer)
-UNITS_ALL=(rw-sandbox-verify.service rw-sandbox-verify.timer rw-notify-failure@.service)
+UNITS_ALL=(rw-sandbox-verify.service rw-sandbox-verify.timer rw-notify-failure@.service rw-verify-stack.service rw-verify-stack.timer)
 if ask "Шаг 5: systemd-юниты" \
 "Будет сделано:
   - установка/обновление юнитов: $([[ $ROLE == prod ]] && echo "${UNITS_PROD[*]} ") ${UNITS_ALL[*]}

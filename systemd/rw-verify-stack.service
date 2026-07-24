@@ -1,0 +1,19 @@
+[Unit]
+OnFailure=rw-notify-failure@%n.service
+Description=rw-backup-full: full stack restore verification (isolated)
+After=docker.service network-online.target rw-backup-web.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Проект и источник задаются drop-in'ом или переменными окружения:
+#   systemctl edit rw-verify-stack.service
+#   [Service]
+#   Environment=VS_PROJECT=panel
+#   Environment=VS_SOURCE=v567005
+Environment=VS_PROJECT=panel
+ExecStart=/bin/bash -c '/opt/rw-backup-restore/scripts/sandbox/verify-stack.sh "$VS_PROJECT" ${VS_SOURCE:+--source "$VS_SOURCE"}'
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=2h

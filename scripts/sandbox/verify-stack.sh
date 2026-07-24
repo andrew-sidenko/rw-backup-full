@@ -24,7 +24,7 @@
 #   6. bind-монты внутрь боевых каталогов перенаправляются на восстановленную
 #      копию, а всё, что осталось за её пределами, монтируется только на чтение.
 #
-#   verify-stack.sh <проект> [--source ID] [--keep] [--from-s3|--from-local]
+#   verify-stack.sh <проект> [--source ID] [--keep] [--db-mode dump|base|pitr]
 #
 # --source ID — идентификатор источника ПРОВЕРЯЕМОГО сервера (тот же, что
 # в его манифесте / карточке в веб-интерфейсе), НЕ хоста песочницы. Нужен
@@ -43,16 +43,24 @@ PROJECT="${1:-}"
 [[ -n "$PROJECT" && "$PROJECT" != -* ]] || { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
 shift
 
-KEEP="false"; SRC="s3"; REMOTE_SOURCE=""
+KEEP="false"; SRC="s3"; REMOTE_SOURCE=""; DB_MODE_FORCE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep)       KEEP="true"; shift ;;
     --from-s3)    SRC="s3"; shift ;;
     --from-local) SRC="local"; shift ;;
     --source)     REMOTE_SOURCE="$2"; shift 2 ;;
+    # Ручной выбор способа подъёма БД; без него работает ротация
+    # (см. verify-plan.sh): каждый новый дамп и базовый бэкап — по разу,
+    # остальные прогоны — PITR на равномерные точки внутри WAL.
+    --db-mode)    DB_MODE_FORCE="$2"; shift 2 ;;
     *) msg ERR "Неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
+case "${DB_MODE_FORCE:-}" in
+  ""|dump|base|pitr) ;;
+  *) msg ERR "--db-mode: допустимо dump | base | pitr"; exit 1 ;;
+esac
 
 wal_load_full_config
 command -v jq >/dev/null 2>&1 || { msg ERR "Нужен jq"; exit 1; }
@@ -300,8 +308,135 @@ msg OK "[${PROJECT}] конфигурация изолирована (порты
 # 4. База данных из бэкапа — в той же изолированной сети
 # --------------------------------------------------------------------------
 DB_PROFILE_FAIL=""
+DB_MODE_DESC=""
+
+# Общая проверка содержимого — одна и та же для любого способа восстановления
+# (логический дамп / базовый бэкап / PITR), чтобы критерий "данные на месте"
+# не зависел от того, каким путём БД подняли.
+check_db_profile() { # <контейнер> <пользователь>
+  local c="$1" u="$2" rows tables cnt tbl
+  tables="$(docker exec "$c" psql -qtAX -U "$u" -d postgres -c 'SELECT count(*) FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
+  rows="$(docker exec "$c" psql -qtAX -U "$u" -d postgres -c 'SELECT coalesce(sum(n_live_tup),0)::bigint FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
+  load_profile "${INST_KIND_REMOTE:-$([[ "$PROJECT" == "panel" ]] && echo panel || echo bot)}"
+  (( ${tables:-0} < ${PROFILE_MIN_TABLES:-1} )) && DB_PROFILE_FAIL+=" таблиц=${tables}<${PROFILE_MIN_TABLES}"
+  (( ${rows:-0} < ${PROFILE_MIN_TOTAL_ROWS:-1} )) && DB_PROFILE_FAIL+=" строк=${rows}<${PROFILE_MIN_TOTAL_ROWS}"
+  for tbl in ${INST_VTABLES_REMOTE:-} ${PROFILE_REQUIRED_TABLES:-}; do
+    [[ -n "$tbl" ]] || continue
+    cnt="$(docker exec "$c" psql -qtAX -U "$u" -d postgres -c "SELECT count(*) FROM ${tbl}" 2>/dev/null || echo FAIL)"
+    if [[ "$cnt" == "FAIL" ]]; then DB_PROFILE_FAIL+=" ${tbl}:отсутствует"
+    elif [[ "$cnt" == "0" ]]; then DB_PROFILE_FAIL+=" ${tbl}:пустая"; fi
+  done
+  msg INFO "[${PROJECT}] данные: таблиц=${tables}, строк ≈ ${rows}"
+  if [[ -n "$DB_PROFILE_FAIL" ]]; then
+    msg ERR "[${PROJECT}] проверка данных не прошла:${DB_PROFILE_FAIL}"
+  else
+    msg OK "[${PROJECT}] проверка данных пройдена (профиль ${INST_KIND_REMOTE:-panel})"
+  fi
+}
+
+# Восстановление БД из базового бэкапа + WAL (режимы base/pitr). Поднимается
+# в ТОЙ ЖЕ изолированной сети и с теми же сетевыми алиасами, что и при
+# логическом дампе, — приложение стека не видит разницы.
+restore_db_from_wal() { # <meta-файл в S3> <target-time|"">
+  local meta_name="$1" target_time="$2"
+  local wal_base="${B_PREFIX}/wal/$(rw_source_id)/${PROJECT}"
+  local pgdata="${WORK}/pgdata" walstage="${WORK}/walstage"
+  mkdir -p "$pgdata" "$walstage"
+
+  s3m_aws s3 cp "s3://${B_BUCKET}/${wal_base}/basebackup/${meta_name}" "${WORK}/backup.meta" \
+    --only-show-errors 2>/dev/null || { msg ERR "не скачался ${meta_name}"; return 1; }
+
+  local BACKUP_NAME FILE SHA256 START_SEGMENT PG_VERSION_NUM ENCRYPTED
+  set +u; # shellcheck disable=SC1090
+  source "${WORK}/backup.meta"; set -u
+
+  if truthy "${ENCRYPTED:-false}" && [[ -z "${SANDBOX_AGE_IDENTITY:-}" || ! -f "${SANDBOX_AGE_IDENTITY:-}" ]]; then
+    msg ERR "базовый бэкап зашифрован, SANDBOX_AGE_IDENTITY не задан"; return 1
+  fi
+
+  s3m_aws s3 cp "s3://${B_BUCKET}/${wal_base}/basebackup/${FILE}" "${WORK}/${FILE}" \
+    --only-show-errors 2>/dev/null || { msg ERR "не скачался ${FILE}"; return 1; }
+  local actual; actual="$(sha256sum "${WORK}/${FILE}" | awk '{print $1}')"
+  [[ "$actual" == "$SHA256" ]] || { msg ERR "SHA256 базового бэкапа не совпадает"; return 1; }
+
+  unpack_one() { # <имя файла>
+    local n="$1" b="$1"
+    if [[ "$b" == *.age ]]; then
+      b="${b%.age}"; age -d -i "$SANDBOX_AGE_IDENTITY" | wal_decompress_stream "$b"
+    else
+      wal_decompress_stream "$b"
+    fi
+  }
+
+  unpack_one "$FILE" < "${WORK}/${FILE}" | tar -xf - -C "$pgdata" 2>/dev/null
+  [[ -f "${pgdata}/PG_VERSION" ]] || { msg ERR "после распаковки нет PG_VERSION"; return 1; }
+
+  # Стейджинг WAL. .backup-файлы исключаются явно: их первые 24 символа
+  # совпадают с именем сегмента, и без фильтра backup-label подменял бы
+  # собой настоящий 16-МБ сегмент (см. CHANGELOG v5.2.0).
+  local staged=0 key seg is_hist
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    [[ "$key" == *.backup* ]] && continue
+    seg="${key:0:24}"; is_hist="false"
+    [[ "$key" == *.history* ]] && { is_hist="true"; seg="${key%%.history*}.history"; }
+    # shellcheck disable=SC2071
+    if [[ "$is_hist" == "true" ]] || [[ "$seg" > "$START_SEGMENT" ]] || [[ "$seg" == "$START_SEGMENT" ]]; then
+      [[ -f "${walstage}/${seg}" ]] && continue
+      if s3m_aws s3 cp "s3://${B_BUCKET}/${wal_base}/wal/${key}" - --only-show-errors 2>/dev/null \
+           | unpack_one "$key" > "${walstage}/${seg}.part" 2>/dev/null; then
+        mv -f "${walstage}/${seg}.part" "${walstage}/${seg}"
+        staged=$((staged + 1))
+      fi
+    fi
+  done < <(s3m_aws s3 ls "s3://${B_BUCKET}/${wal_base}/wal/" 2>/dev/null | awk '{print $4}' | sort)
+
+  local uid
+  uid="$(docker run --rm --entrypoint id "$DB_IMAGE" -u postgres 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ ]] || uid=999
+  chown -R "${uid}:${uid}" "$pgdata" "$walstage" 2>/dev/null || true
+  chmod 0700 "$pgdata"
+
+  {
+    echo ""
+    echo "archive_mode = 'off'"
+    echo "archive_command = ''"
+    echo "restore_command = 'cp /wal-archive/%f %p'"
+    echo "recovery_target_action = 'promote'"
+    [[ -n "$target_time" ]] && echo "recovery_target_time = '${target_time}'"
+  } >> "${pgdata}/postgresql.auto.conf"
+  touch "${pgdata}/recovery.signal"
+  rm -f "${pgdata}/postmaster.pid"
+
+  docker run -d --name "$DB_C" --label "rw-sandbox-stack=${SID}" \
+    --network "$NET" "${db_aliases[@]}" \
+    -v "${pgdata}:/var/lib/postgresql/data" \
+    -v "${walstage}:/wal-archive:ro" \
+    -e POSTGRES_PASSWORD="$DB_PASS" \
+    "$DB_IMAGE" -c listen_addresses='*' >/dev/null 2>&1 \
+    || { msg ERR "контейнер БД не создался"; return 1; }
+
+  local recovered=false in_rec
+  for _ in $(seq 1 300); do
+    if docker exec "$DB_C" pg_isready -h localhost -U "$DB_USER" >/dev/null 2>&1; then
+      in_rec="$(docker exec "$DB_C" psql -h localhost -U "$DB_USER" -d postgres -qtAX \
+        -c 'SELECT pg_is_in_recovery()' 2>/dev/null | tr -d ' ' || echo t)"
+      [[ "$in_rec" == "f" ]] && { recovered=true; break; }
+    fi
+    docker ps -q -f "name=${DB_C}" | grep -q . || break
+    sleep 2
+  done
+
+  if [[ "$recovered" != "true" ]]; then
+    msg ERR "восстановление не завершилось. Логи БД:"
+    docker logs "$DB_C" --tail 20 2>&1 | sed 's/^/    /' >&2
+    return 1
+  fi
+  msg OK "[${PROJECT}] БД восстановлена: ${BACKUP_NAME} + ${staged} WAL-сегментов${target_time:+ на момент ${target_time}}"
+  return 0
+}
+
 if [[ -n "$DB_SERVICE" ]]; then
-  msg INFO "[${PROJECT}] поднимаю БД (${DB_SERVICE}) из бэкапа..."
   DB_IMAGE="$(jq -r --arg s "$DB_SERVICE" '.services[$s].image' "$RESOLVED")"
   DB_NAME_ORIG="$(jq -r --arg s "$DB_SERVICE" '.services[$s].container_name // ""' "$RESOLVED")"
   DB_USER="$(jq -r --arg s "$DB_SERVICE" '.services[$s].environment.POSTGRES_USER // "postgres"' "$RESOLVED")"
@@ -313,59 +448,90 @@ if [[ -n "$DB_SERVICE" ]]; then
   db_aliases=(--network-alias "$DB_SERVICE")
   [[ -n "$DB_NAME_ORIG" ]] && db_aliases+=(--network-alias "$DB_NAME_ORIG")
 
-  docker run -d --name "$DB_C" --label "rw-sandbox-stack=${SID}" \
-    --network "$NET" "${db_aliases[@]}" \
-    -e POSTGRES_USER="$DB_USER" -e POSTGRES_PASSWORD="$DB_PASS" \
-    -e POSTGRES_DB="$(jq -r --arg s "$DB_SERVICE" '.services[$s].environment.POSTGRES_DB // "postgres"' "$RESOLVED")" \
-    "$DB_IMAGE" >/dev/null 2>&1 || fail "не удалось поднять БД (${DB_IMAGE})"
-
-  up=false
-  for _ in $(seq 1 90); do
-    docker exec "$DB_C" pg_isready -U "$DB_USER" >/dev/null 2>&1 && { up=true; break; }
-    sleep 1
-  done
-  [[ "$up" == "true" ]] || fail "БД не поднялась"
-
-  # Заливка свежего логического дампа проекта из S3.
-  DUMP_CAT="panel"; [[ "$PROJECT" != "panel" ]] && DUMP_CAT="custom-bot"
   bname="$(s3m_backends | head -n1)"
-  if [[ -n "$bname" ]] && s3m_load "$bname"; then
-    key="$(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/${DUMP_CAT}/$(rw_source_id)/" --recursive 2>/dev/null \
-      | awk '{print $1" "$2" "$4}' | sort | tail -n1 | awk '{print $3}')"
-    if [[ -n "$key" ]]; then
-      s3m_aws s3 cp "s3://${B_BUCKET}/${key}" "${WORK}/dump.tar.gz" --only-show-errors 2>/dev/null || true
-      if [[ -f "${WORK}/dump.tar.gz" ]]; then
-        mkdir -p "${WORK}/dump" && tar -xzf "${WORK}/dump.tar.gz" -C "${WORK}/dump" 2>/dev/null || true
-        sql="$(find "${WORK}/dump" -maxdepth 1 \( -name 'dump_*.sql.gz' -o -name 'postgres_dump.sql.gz' \) | head -n1)"
-        if [[ -n "$sql" ]]; then
-          gzip -dc "$sql" | docker exec -i "$DB_C" psql -q -U "$DB_USER" -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>&1 || true
-          rows="$(docker exec "$DB_C" psql -qtAX -U "$DB_USER" -d postgres -c 'SELECT coalesce(sum(n_live_tup),0)::bigint FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
-          tables="$(docker exec "$DB_C" psql -qtAX -U "$DB_USER" -d postgres -c 'SELECT count(*) FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
-          msg OK "[${PROJECT}] база восстановлена из $(basename "$key") (таблиц=${tables}, строк ≈ ${rows})"
+  if [[ -z "$bname" ]] || ! s3m_load "$bname"; then
+    msg WARN "[${PROJECT}] S3-бэкенд недоступен — стек поднимется с пустой базой"
+    PLAN_MODE="none"
+  elif [[ -n "$DB_MODE_FORCE" ]]; then
+    # Ручной выбор режима имеет приоритет над ротацией.
+    PLAN_MODE="$DB_MODE_FORCE"
+    if [[ "$PLAN_MODE" == "dump" ]]; then
+      PLAN_KEY="$(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/$([[ "$PROJECT" == "panel" ]] && echo panel || echo custom-bot)/$(rw_source_id)/" --recursive 2>/dev/null \
+        | awk '{print $1" "$2" "$4}' | sort | tail -n1 | awk '{print $3}')"
+    else
+      PLAN_META="$(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/wal/$(rw_source_id)/${PROJECT}/basebackup/" 2>/dev/null \
+        | awk '{print $4}' | grep -E '^base_.*\.meta$' | sort | tail -n1)"
+      PLAN_TARGET=""
+    fi
+  else
+    # Ротация: каждый новый дамп и каждый новый базовый бэкап проверяются
+    # по разу, остальные прогоны — PITR на равномерные точки внутри WAL.
+    PLAN="$(AWS_ACCESS_KEY_ID="$B_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$B_SECRET_KEY" \
+            AWS_DEFAULT_REGION="${B_REGION:-us-east-1}" \
+            AWS_ENDPOINT_URL="${B_ENDPOINT:-}" \
+            "${SCRIPT_DIR}/verify-plan.sh" "$PROJECT" "$(rw_source_id)" "$B_BUCKET" "$B_PREFIX" 2>/dev/null || true)"
+    PLAN_MODE="$(grep -oE 'MODE=[a-z]+' <<<"$PLAN" | cut -d= -f2 || true)"
+    PLAN_KEY="$(grep -oE 'KEY=[^ ]+' <<<"$PLAN" | cut -d= -f2 || true)"
+    PLAN_META="$(grep -oE 'META=[^ ]+' <<<"$PLAN" | cut -d= -f2 || true)"
+    PLAN_TARGET="$(sed -n 's/.*TARGET_TIME=\(.*\) SLOT=.*/\1/p' <<<"$PLAN")"
+    PLAN_SLOT="$(grep -oE 'SLOT=[0-9]+/[0-9]+' <<<"$PLAN" | cut -d= -f2 || true)"
+    [[ -n "$PLAN" ]] && msg INFO "[${PROJECT}] план проверки: ${PLAN}"
+  fi
 
-          # Проверка СОДЕРЖИМОГО, не только факта заливки: профиль по типу
-          # инстанса (verify-profiles.d/<kind>.env) — обязательные таблицы,
-          # минимумы. Провал здесь помечает ВЕСЬ прогон как неудачный.
-          load_profile "${INST_KIND_REMOTE:-$([[ "$PROJECT" == "panel" ]] && echo panel || echo bot)}"
-          (( ${tables:-0} < ${PROFILE_MIN_TABLES:-1} )) && DB_PROFILE_FAIL+=" таблиц=${tables}<${PROFILE_MIN_TABLES}"
-          (( ${rows:-0} < ${PROFILE_MIN_TOTAL_ROWS:-1} )) && DB_PROFILE_FAIL+=" строк=${rows}<${PROFILE_MIN_TOTAL_ROWS}"
-          for tbl in ${INST_VTABLES_REMOTE:-} ${PROFILE_REQUIRED_TABLES:-}; do
-            [[ -n "$tbl" ]] || continue
-            cnt="$(docker exec "$DB_C" psql -qtAX -U "$DB_USER" -d postgres -c "SELECT count(*) FROM ${tbl}" 2>/dev/null || echo FAIL)"
-            if [[ "$cnt" == "FAIL" ]]; then DB_PROFILE_FAIL+=" ${tbl}:отсутствует"
-            elif [[ "$cnt" == "0" ]]; then DB_PROFILE_FAIL+=" ${tbl}:пустая"; fi
-          done
-          if [[ -n "$DB_PROFILE_FAIL" ]]; then
-            msg ERR "[${PROJECT}] проверка данных не прошла:${DB_PROFILE_FAIL}"
+  case "${PLAN_MODE:-none}" in
+    dump)
+      DB_MODE_DESC="логический дамп"
+      msg INFO "[${PROJECT}] поднимаю БД из логического дампа..."
+      docker run -d --name "$DB_C" --label "rw-sandbox-stack=${SID}" \
+        --network "$NET" "${db_aliases[@]}" \
+        -e POSTGRES_USER="$DB_USER" -e POSTGRES_PASSWORD="$DB_PASS" \
+        -e POSTGRES_DB="$(jq -r --arg s "$DB_SERVICE" '.services[$s].environment.POSTGRES_DB // "postgres"' "$RESOLVED")" \
+        "$DB_IMAGE" >/dev/null 2>&1 || fail "не удалось поднять БД (${DB_IMAGE})"
+      up=false
+      for _ in $(seq 1 90); do
+        docker exec "$DB_C" pg_isready -U "$DB_USER" >/dev/null 2>&1 && { up=true; break; }
+        sleep 1
+      done
+      [[ "$up" == "true" ]] || fail "БД не поднялась"
+      if [[ -n "${PLAN_KEY:-}" ]]; then
+        s3m_aws s3 cp "s3://${B_BUCKET}/${PLAN_KEY}" "${WORK}/dump.tar.gz" --only-show-errors 2>/dev/null || true
+        if [[ -f "${WORK}/dump.tar.gz" ]]; then
+          mkdir -p "${WORK}/dump" && tar -xzf "${WORK}/dump.tar.gz" -C "${WORK}/dump" 2>/dev/null || true
+          sql="$(find "${WORK}/dump" -maxdepth 1 \( -name 'dump_*.sql.gz' -o -name 'postgres_dump.sql.gz' \) | head -n1)"
+          if [[ -n "$sql" ]]; then
+            gzip -dc "$sql" | docker exec -i "$DB_C" psql -q -U "$DB_USER" -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>&1 || true
+            msg OK "[${PROJECT}] база залита из $(basename "$PLAN_KEY")"
+            DB_MODE_DESC="логический дамп $(basename "$PLAN_KEY")"
           else
-            msg OK "[${PROJECT}] проверка данных пройдена (профиль ${INST_KIND_REMOTE:-panel})"
+            DB_PROFILE_FAIL+=" в архиве нет SQL-дампа"
           fi
+        else
+          DB_PROFILE_FAIL+=" дамп не скачался"
+        fi
+      else
+        msg WARN "[${PROJECT}] логический дамп в S3 не найден — база пустая"
+      fi
+      check_db_profile "$DB_C" "$DB_USER"
+      ;;
+    base|pitr)
+      if [[ -z "${PLAN_META:-}" ]]; then
+        msg WARN "[${PROJECT}] базовых бэкапов в S3 нет — стек поднимется с пустой базой"
+        DB_MODE_DESC="без БД"
+      else
+        DB_MODE_DESC="базовый бэкап${PLAN_TARGET:+ + WAL до ${PLAN_TARGET}}${PLAN_SLOT:+ (слот ${PLAN_SLOT})}"
+        msg INFO "[${PROJECT}] поднимаю БД из базового бэкапа + WAL${PLAN_TARGET:+ (PITR на ${PLAN_TARGET})}..."
+        if restore_db_from_wal "$PLAN_META" "${PLAN_TARGET:-}"; then
+          check_db_profile "$DB_C" "$DB_USER"
+        else
+          DB_PROFILE_FAIL+=" восстановление из WAL не удалось"
         fi
       fi
-    else
-      msg WARN "[${PROJECT}] логический дамп в S3 не найден — стек поднимется с пустой базой"
-    fi
-  fi
+      ;;
+    *)
+      msg WARN "[${PROJECT}] нечего восстанавливать — стек поднимется без БД"
+      DB_MODE_DESC="без БД"
+      ;;
+  esac
 fi
 
 # --------------------------------------------------------------------------
@@ -397,6 +563,61 @@ while IFS= read -r c; do
   fi
 done < <(docker compose -p "$CPROJ" -f "${WORK}/stack.json" ps -q 2>/dev/null)
 
+# --------------------------------------------------------------------------
+# Функциональная проверка сервисов: мало того, что процесс запущен — важно,
+# что приложение реально обслуживает запросы и достучалось до БД.
+# Для remnawave это HTTP-порт панели (3000/3001 из compose): любой валидный
+# HTTP-ответ, включая 401/404, доказывает, что сервер поднялся и отвечает,
+# — конкретные эндпоинты панели намеренно не зашиваются, чтобы проверка не
+# ломалась от версии к версии.
+# --------------------------------------------------------------------------
+svc_problems=""
+svc_checked=0
+
+# Порты приложений берём из ОРИГИНАЛЬНОГО compose (в изолированном стеке
+# published-порты вырезаны, но target-порты сервисов остались прежними).
+while IFS='|' read -r svc port; do
+  [[ -n "$svc" && -n "$port" ]] || continue
+  [[ "$svc" == "$DB_SERVICE" ]] && continue
+  svc_checked=$((svc_checked + 1))
+
+  # Проверяем ИЗ изолированной сети, обращаясь к сервису по его имени —
+  # ровно так, как это делают соседние контейнеры стека.
+  probe="$(docker run --rm --network "$NET" --label "rw-sandbox-stack=${SID}" \
+    busybox:stable sh -c "wget -q -S -T 8 -O /dev/null http://${svc}:${port}/ 2>&1 | head -1" 2>/dev/null || true)"
+
+  if grep -qE 'HTTP/[0-9.]+ [0-9]{3}' <<<"$probe"; then
+    code="$(grep -oE 'HTTP/[0-9.]+ [0-9]{3}' <<<"$probe" | grep -oE '[0-9]{3}$')"
+    msg OK "[${PROJECT}] сервис ${svc}:${port} отвечает по HTTP (код ${code})"
+  else
+    # HTTP не ответил — проверяем хотя бы TCP, чтобы отличить "порт закрыт"
+    # от "порт открыт, но это не HTTP" (например, gRPC или сырой протокол).
+    if docker run --rm --network "$NET" --label "rw-sandbox-stack=${SID}" \
+         busybox:stable sh -c "nc -z -w 5 ${svc} ${port}" >/dev/null 2>&1; then
+      msg OK "[${PROJECT}] сервис ${svc}:${port} слушает TCP (не HTTP — это нормально для не-HTTP сервисов)"
+    else
+      svc_problems+=" ${svc}:${port}:не отвечает"
+    fi
+  fi
+done < <(jq -r --arg db "$DB_SERVICE" '
+  .services | to_entries[]
+  | select(.key != $db)
+  | .key as $k
+  | (.value.ports // [])[]?
+  | "\($k)|\(.target)"' "$RESOLVED" 2>/dev/null | sort -u)
+
+# Фатальные ошибки в логах приложений — например, приложение стартовало,
+# но не смогло подключиться к БД и крутится в цикле ретраев.
+while IFS= read -r c; do
+  [[ -n "$c" ]] || continue
+  cname="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c" 2>/dev/null || echo "$c")"
+  if docker logs "$c" --tail 200 2>&1 | grep -qiE 'ECONNREFUSED|connection refused|FATAL:|password authentication failed|could not connect to server'; then
+    svc_problems+=" ${cname}:ошибки-подключения-в-логах"
+  fi
+done < <(docker compose -p "$CPROJ" -f "${WORK}/stack.json" ps -q 2>/dev/null)
+
+(( svc_checked == 0 )) && msg INFO "[${PROJECT}] в compose нет сервисов с портами — функциональная проверка пропущена"
+
 # Контрольная проверка изоляции: из контейнера стека наружу хода быть не должно.
 leak=""
 first_c="$(docker compose -p "$CPROJ" -f "${WORK}/stack.json" ps -q 2>/dev/null | head -n1)"
@@ -408,20 +629,20 @@ fi
 
 if (( total == 0 )); then
   fail "ни одного контейнера не запущено"
-elif [[ -n "$problems" ]] || [[ -n "$leak" ]] || [[ -n "$DB_PROFILE_FAIL" ]]; then
-  msg ERR "[${PROJECT}] стек ${running}/${total}:${problems}${leak}${DB_PROFILE_FAIL:+ данные:${DB_PROFILE_FAIL}}"
+elif [[ -n "$problems" ]] || [[ -n "$leak" ]] || [[ -n "$DB_PROFILE_FAIL" ]] || [[ -n "$svc_problems" ]]; then
+  msg ERR "[${PROJECT}] стек ${running}/${total}:${problems}${svc_problems}${leak}${DB_PROFILE_FAIL:+ данные:${DB_PROFILE_FAIL}}"
   write_metric 0
   wal_notify "🔴 Проверка полного стека ${PROJECT} (изолированно)
 Хост: $(wal_hostname)
 Контейнеров живо: ${running}/${total}
-${problems}${leak}${DB_PROFILE_FAIL:+
+${problems}${svc_problems}${leak}${DB_PROFILE_FAIL:+
 Данные: ${DB_PROFILE_FAIL}}"
   exit 1
 else
-  msg OK "[${PROJECT}] стек поднялся полностью: ${running}/${total} контейнеров, данные проверены, изоляция подтверждена"
+  msg OK "[${PROJECT}] стек поднялся полностью: ${running}/${total} контейнеров, сервисов проверено ${svc_checked}, данные проверены, изоляция подтверждена"
   msg INFO "Контейнеры и сеть уже убраны (без --keep убирается всегда, включая успешный прогон) — для ручного разбора: --keep"
   write_metric 1
   wal_notify "🟢 Полное восстановление ${PROJECT} проверено (изолированно)
 Хост: $(wal_hostname)
-Каталог из трекера + база из бэкапа (данные проверены) + ${running}/${total} контейнеров"
+Каталог из трекера + БД (${DB_MODE_DESC:-?}) + ${running}/${total} контейнеров, сервисов отвечает ${svc_checked}"
 fi
