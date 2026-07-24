@@ -43,6 +43,9 @@ FULL_SCHEDULE_JITTER_SEC="900"
 FULL_INCLUDE_EXTRA_CONFIGS="true"
 FULL_PANEL_EXTERNAL_S3_ENABLED="true"
 FULL_CUSTOM_EXTERNAL_S3_ENABLED="true"
+# Строгий режим выгрузки: задача неуспешна (+алерт), если копия ушла НЕ во все
+# настроенные S3-хранилища категории. По умолчанию выключен (успех при ≥1).
+FULL_S3_STRICT="false"
 FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD="true"
 FULL_TELEGRAM_IMPORT_FROM_ORIGINAL="true"
 FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL="false"
@@ -1291,6 +1294,7 @@ show_config_summary() {
   echo "FULL_TIMER_TIMES:                   ${FULL_TIMER_TIMES:-(интервал)}"
   echo "FULL_TIMER_INTERVAL_HOURS:          ${FULL_TIMER_INTERVAL_HOURS}"
   echo "FULL_SCHEDULE_JITTER_SEC:           ${FULL_SCHEDULE_JITTER_SEC:-900}"
+  echo "FULL_S3_STRICT:                     ${FULL_S3_STRICT:-false}"
   echo "FULL_LOCAL_RETENTION_DAYS:          ${FULL_LOCAL_RETENTION_DAYS}"
   echo "FULL_EXTERNAL_S3_RETENTION_DAYS:    ${FULL_EXTERNAL_S3_RETENTION_DAYS}"
   echo
