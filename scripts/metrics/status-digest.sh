@@ -101,6 +101,34 @@ if [[ -d "$METRICS_DIR" ]]; then
   [[ -n "$prom_notes" ]] && BODY+=$'\nПроверки:\n'"$prom_notes"
 fi
 
+# Объём, занятый бэкапами этого хоста в каждом S3-хранилище. Метрики собирает
+# metrics-exporter (rw_exporter.prom, если FULL_METRICS_S3_SIZES=true) — парсим
+# их без обращения к сети. Портируемый разбор на bash (без gawk-расширений).
+EXPORTER_PROM="${METRICS_DIR}/rw_exporter.prom"
+if [[ -f "$EXPORTER_PROM" ]]; then
+  declare -A _s3_bytes _s3_objs _s3_reach
+  while IFS= read -r line; do
+    case "$line" in
+      'rw_s3_category_bytes{'*)
+        b="${line#*backend=\"}"; b="${b%%\"*}"; v="${line##* }"
+        [[ "$v" =~ ^[0-9]+$ ]] && _s3_bytes["$b"]=$(( ${_s3_bytes["$b"]:-0} + v )) ;;
+      'rw_s3_category_objects{'*)
+        b="${line#*backend=\"}"; b="${b%%\"*}"; v="${line##* }"
+        [[ "$v" =~ ^[0-9]+$ ]] && _s3_objs["$b"]=$(( ${_s3_objs["$b"]:-0} + v )) ;;
+      'rw_s3_backend_reachable{'*)
+        b="${line#*backend=\"}"; b="${b%%\"*}"; v="${line##* }"
+        _s3_reach["$b"]="$v" ;;
+    esac
+  done < "$EXPORTER_PROM"
+  if (( ${#_s3_bytes[@]} > 0 || ${#_s3_reach[@]} > 0 )); then
+    BODY+=$'\nS3-хранилища (объём этого хоста):\n'
+    for b in "${!_s3_reach[@]}"; do
+      warn=""; [[ "${_s3_reach[$b]}" == "0" ]] && warn=" ⚠ недоступен"
+      BODY+="  ${b}: занято $(human_bytes "${_s3_bytes[$b]:-0}") (${_s3_objs[$b]:-0} объектов)${warn}"$'\n'
+    done
+  fi
+fi
+
 echo "$BODY"
 wal_notify "$BODY"
 
