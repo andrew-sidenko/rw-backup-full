@@ -1,6 +1,6 @@
 # Changelog
 
-## v5.6.2 (2026-07-25)
+## v5.6.3 (2026-07-25)
 
 ### Исправлено
 - **Ложный FAIL `строк=0<10` после PITR/base в verify-stack/fleet**: после physical restore PostgreSQL сбрасывает `pg_stat_*`, и `sum(n_live_tup)` давал 0 при живых данных (симптом: `таблиц=36, строк ≈ 0`, при этом `public.users` непустой). Перед замером выполняется `ANALYZE`; в stack целевая БД ищется по user-tables; подключены `PROFILE_CHECK_QUERIES` профиля.
