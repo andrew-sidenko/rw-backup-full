@@ -108,7 +108,7 @@ fi
 # Дополнительный предохранитель: если локальный архив всё ещё больше лимита
 # по объёму, сообщаем — но НЕ удаляем WAL сверх границы.
 if [[ -n "${INST_LOCAL_WAL_MAX_GB:-}" ]]; then
-  local _wal_bytes
+  # Не local: этот блок на верхнем уровне скрипта, не в функции.
   _wal_bytes="$(du -sb "$INST_ARCHIVE_DIR" 2>/dev/null | awk '{print $1}' || true)"
   [[ "$_wal_bytes" =~ ^[0-9]+$ ]] || _wal_bytes=0
   cur_gb=$(( _wal_bytes / 1073741824 ))
