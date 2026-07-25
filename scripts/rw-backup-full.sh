@@ -1810,6 +1810,51 @@ pick_fleet_server() {
   ask_choice "Сервер-источник:" "${ids[@]}"
 }
 
+# Выбор PROJECT для verify-stack / плана ротации.
+# Это каноническое имя в S3 (.../config/<host>/<проект>, .../wal/<host>/<проект>),
+# НЕ id карточки веба и НЕ «красивый» ярлык. Панель Remnawave всегда = panel.
+# В меню показываем «<карточка>-<проект>», в команду уходит только <проект>.
+# Уникальность в общей панели — за счёт подписи карточка-инстанс, а не
+# переименования instances.d/*.env / INST_KIND.
+pick_verify_project() { # <server_id>
+  local sid="$1"
+  local cache="${INSTALL_DIR}/web-data/manifest-cache.json"
+  local -a names=() kinds=()
+  local n k i pick
+  names+=(panel)
+  kinds+=(panel)
+  if [[ -n "$sid" && -f "$cache" ]] && command -v jq >/dev/null 2>&1; then
+    while IFS=$'\t' read -r n k; do
+      [[ -n "$n" ]] || continue
+      [[ "$n" == "panel" ]] && continue
+      names+=("$n")
+      kinds+=("${k:-bot}")
+    done < <(jq -r --arg id "$sid" '
+      .servers[]? | select(.id == $id) | (.instances // [])[]? |
+      [(.name // empty), (.kind // "bot")] | @tsv
+    ' "$cache" 2>/dev/null || true)
+  fi
+  echo "  Проект = имя в S3 (config/…/<проект>). Панель всегда «panel»." >&2
+  echo "  Не подставляйте id карточки и не переименовывайте инстанс:" >&2
+  echo "  в вебе уже показывается «${sid:-сервер}-<инстанс>»." >&2
+  if (( ${#names[@]} == 1 )); then
+    msg INFO "Проект: ${sid:-?}-${names[0]}  → в команде: ${names[0]} (kind=${kinds[0]})"
+    printf '%s' "${names[0]}"
+    return 0
+  fi
+  i=1
+  for n in "${names[@]}"; do
+    echo "    ${i}) ${sid}-${n}  → проект «${n}» (kind=${kinds[$((i-1))]})" >&2
+    i=$((i + 1))
+  done
+  read -r -p "  Выбор [1]: " pick >&2 || true
+  pick="${pick:-1}"
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#names[@]} )); then
+    pick=1
+  fi
+  printf '%s' "${names[$((pick - 1))]}"
+}
+
 # Выбор инстанса из instances.d (вместо ручного ввода имени)
 pick_instance() {
   local -a insts=()
@@ -1985,12 +2030,13 @@ menu_verify() {
         "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" ${fargs[@]+"${fargs[@]}"} || true
         pause ;;
       stack)
-        read -r -p "  Проект [panel]: " pr; pr="${pr:-panel}"
-        local sid mode keep
+        local sid pr mode keep
         sid="$(pick_fleet_server)" || {
           read -r -p "  ID сервера-источника вручную: " sid
           [[ -n "$sid" ]] || { msg ERR "Без --source на песочнице стек не из чего собирать"; pause; continue; }
         }
+        pr="$(pick_verify_project "$sid")" || pr="panel"
+        pr="${pr:-panel}"
         mode="$(ask_choice "Способ подъёма БД:" \
           "автоматически по ротации" "логический дамп" "базовый бэкап" "базовый бэкап + WAL (PITR)")"
         keep="$(ask_choice "После проверки:" "убрать всё" "оставить контейнеры для разбора")"
@@ -2001,16 +2047,17 @@ menu_verify() {
           *WAL*|*"PITR"*) sargs+=(--db-mode pitr) ;;
         esac
         [[ "$keep" == оставить* ]] && sargs+=(--keep)
-        msg INFO "Запуск: verify-stack.sh ${sargs[*]}"
+        msg INFO "Запуск: verify-stack.sh ${sargs[*]}  (подпись в вебе: ${sid}-${pr})"
         "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
         "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "${sargs[@]}" || true
         pause ;;
       local) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
       plan)
-        read -r -p "  Проект [panel]: " pr; pr="${pr:-panel}"
-        local sid bn
+        local sid pr bn
         sid="$(pick_fleet_server 2>/dev/null)" || sid="$(rw_source_id)"
         read -r -p "  ID сервера [${sid}]: " sid_in; sid="${sid_in:-$sid}"
+        pr="$(pick_verify_project "$sid")" || pr="panel"
+        pr="${pr:-panel}"
         bn="$(s3m_backends | head -n1)"
         if [[ -n "$bn" ]] && s3m_load "$bn"; then
           msg INFO "Следующий прогон проверит:"
