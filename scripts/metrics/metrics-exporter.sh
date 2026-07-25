@@ -25,7 +25,6 @@ require_component metrics
 wal_lock "metrics-exporter" || exit 0
 
 BACKUP_DIR="${BACKUP_DIR:-${INSTALL_DIR}/backup}"
-HOST="$(wal_hostname)"
 SRC="$(rw_source_id)"
 
 out=""
