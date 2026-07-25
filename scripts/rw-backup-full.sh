@@ -1840,65 +1840,156 @@ fleet_server_ids() {
   fi
 }
 
-pick_fleet_server() {
-  local -a ids=()
-  local id
-  while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done < <(fleet_server_ids)
-  if (( ${#ids[@]} == 0 )); then
-    msg WARN "В парке нет серверов (fleet.json). Добавьте через веб-интерфейс."
-    return 1
+# Подпись карточки для меню: id · host · note (что есть).
+fleet_server_label() { # <id>
+  local sid="$1" f="${RW_FLEET_FILE:-${INSTALL_DIR}/fleet.json}" host note
+  host=""; note=""
+  if [[ -f "$f" ]] && command -v jq >/dev/null 2>&1; then
+    host="$(jq -r --arg id "$sid" '.servers[]? | select(.id==$id) | .host // empty' "$f" 2>/dev/null || true)"
+    note="$(jq -r --arg id "$sid" '.servers[]? | select(.id==$id) | .note // empty' "$f" 2>/dev/null || true)"
   fi
-  if (( ${#ids[@]} == 1 )); then
-    printf '%s\n' "${ids[0]}"
-    return 0
+  if [[ -n "$host" && -n "$note" ]]; then
+    printf '%s  (%s — %s)' "$sid" "$host" "$note"
+  elif [[ -n "$host" ]]; then
+    printf '%s  (%s)' "$sid" "$host"
+  elif [[ -n "$note" ]]; then
+    printf '%s  (%s)' "$sid" "$note"
+  else
+    printf '%s' "$sid"
   fi
-  ask_choice "Сервер-источник:" "${ids[@]}"
 }
 
-# Выбор PROJECT для verify-stack / плана ротации.
-# Это каноническое имя в S3 (.../config/<host>/<проект>, .../wal/<host>/<проект>),
-# НЕ id карточки веба и НЕ «красивый» ярлык. Панель Remnawave всегда = panel.
-# В меню показываем «<карточка>-<проект>», в команду уходит только <проект>.
-# Уникальность в общей панели — за счёт подписи карточка-инстанс, а не
-# переименования instances.d/*.env / INST_KIND.
-pick_verify_project() { # <server_id>
+# Выбор сервера из панели управления. Всегда показывает нумерованный список
+# (даже из одного пункта) — без «тихого» автовыбора.
+pick_fleet_server() {
+  local -a ids=() labels=()
+  local id pick i
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    ids+=("$id")
+    labels+=("$(fleet_server_label "$id")")
+  done < <(fleet_server_ids)
+  if (( ${#ids[@]} == 0 )); then
+    msg WARN "В парке нет серверов. Добавьте карточку в веб-панели управления."
+    return 1
+  fi
+  echo "  Серверы из панели управления (${#ids[@]}):" >&2
+  i=1
+  for id in "${ids[@]}"; do
+    echo "    ${i}) ${labels[$((i-1))]}" >&2
+    i=$((i + 1))
+  done
+  read -r -p "  Выбор сервера [1]: " pick >&2 || true
+  pick="${pick:-1}"
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#ids[@]} )); then
+    pick=1
+  fi
+  printf '%s\n' "${ids[$((pick - 1))]}"
+}
+
+# Инстансы сервера для verify-stack: manifest-cache, иначе живой /api/fleet/manifest.
+# Всегда есть как минимум panel. Имя в S3/CLI каноническое; в UI — «карточка-инстанс».
+fleet_refresh_manifest_cache() {
+  local cache="${INSTALL_DIR}/web-data/manifest-cache.json"
+  local web_env="${WEB_ENV:-/etc/rw-backup-web.env}"
+  local url="${RW_WEB_URL:-http://127.0.0.1:8787}"
+  local token="${WEB_TOKEN:-}" body
+  [[ -z "$token" && -f "$web_env" ]] && token="$(grep -E '^WEB_TOKEN=' "$web_env" | head -n1 | cut -d= -f2- || true)"
+  [[ -n "$token" ]] && command -v curl >/dev/null 2>&1 || return 0
+  body="$(curl -fsS -m 20 -H "x-token: ${token}" "${url}/api/fleet/manifest?force=1" 2>/dev/null || true)"
+  [[ -n "$body" ]] || return 0
+  mkdir -p "$(dirname "$cache")"
+  printf '%s\n' "$body" > "$cache"
+  chmod 600 "$cache" 2>/dev/null || true
+}
+
+fleet_server_instances() { # <server_id> → stdout: name<TAB>kind по строке
   local sid="$1"
   local cache="${INSTALL_DIR}/web-data/manifest-cache.json"
-  local -a names=() kinds=()
-  local n k i pick
-  names+=(panel)
-  kinds+=(panel)
+  local seen_panel=0 n k
+  # Подтянуть свежий манифест, если кэш пуст/стар — чтобы в меню были реальные инстансы.
+  if [[ ! -f "$cache" ]] || [[ -n "${FLEET_FORCE_MANIFEST:-}" ]]; then
+    fleet_refresh_manifest_cache || true
+  fi
   if [[ -n "$sid" && -f "$cache" ]] && command -v jq >/dev/null 2>&1; then
     while IFS=$'\t' read -r n k; do
       [[ -n "$n" ]] || continue
-      [[ "$n" == "panel" ]] && continue
-      names+=("$n")
-      kinds+=("${k:-bot}")
+      [[ "$n" == "panel" ]] && seen_panel=1
+      printf '%s\t%s\n' "$n" "${k:-bot}"
     done < <(jq -r --arg id "$sid" '
       .servers[]? | select(.id == $id) | (.instances // [])[]? |
       [(.name // empty), (.kind // "bot")] | @tsv
     ' "$cache" 2>/dev/null || true)
   fi
-  echo "  Проект = имя в S3 (config/…/<проект>). Панель всегда «panel»." >&2
-  echo "  Не подставляйте id карточки и не переименовывайте инстанс:" >&2
-  echo "  в вебе уже показывается «${sid:-сервер}-<инстанс>»." >&2
-  if (( ${#names[@]} == 1 )); then
-    echo "  Проект: ${sid:-?}-${names[0]}  → в команде: ${names[0]} (kind=${kinds[0]})" >&2
-    # stdout — ТОЛЬКО каноническое имя проекта (для $()); подписи — в stderr.
-    printf '%s\n' "${names[0]}"
-    return 0
+  (( seen_panel )) || printf 'panel\tpanel\n'
+}
+
+# Выбор инстанса сервера. Всегда нумерованный список (даже из одного).
+# stdout — ТОЛЬКО каноническое имя проекта (panel / bot_…), не id карточки.
+pick_verify_project() { # <server_id>
+  local sid="$1"
+  local -a names=() kinds=()
+  local n k i pick
+  while IFS=$'\t' read -r n k; do
+    [[ -n "$n" ]] || continue
+    names+=("$n")
+    kinds+=("${k:-bot}")
+  done < <(fleet_server_instances "$sid")
+  if (( ${#names[@]} == 0 )); then
+    names+=(panel); kinds+=(panel)
   fi
+  echo "  Инстансы сервера «${sid}» (${#names[@]})." >&2
+  echo "  В команду уходит каноническое имя (S3: …/config|wal/<source>/<имя>)." >&2
+  echo "  В вебе подпись: «${sid}-<имя>» — id карточки в имя инстанса не подставляйте." >&2
   i=1
   for n in "${names[@]}"; do
-    echo "    ${i}) ${sid}-${n}  → проект «${n}» (kind=${kinds[$((i-1))]})" >&2
+    echo "    ${i}) ${sid}-${n}   → инстанс «${n}» (kind=${kinds[$((i-1))]})" >&2
     i=$((i + 1))
   done
-  read -r -p "  Выбор [1]: " pick >&2 || true
+  read -r -p "  Выбор инстанса [1]: " pick >&2 || true
   pick="${pick:-1}"
   if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#names[@]} )); then
     pick=1
   fi
   printf '%s\n' "${names[$((pick - 1))]}"
+}
+
+# Полный стек по всему парку: сервер₁→инстанс₁…инстансₙ → сервер₂→…
+# Тот же порядок, что и у ручного выбора. db-mode/keep — общие флаги CLI.
+run_verify_stack_all() { # [--db-mode …] [--keep]
+  local -a extra=("$@")
+  local -a ids=()
+  local id n k total=0 done_n=0 rc_all=0
+  while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done < <(fleet_server_ids)
+  if (( ${#ids[@]} == 0 )); then
+    msg ERR "В парке нет серверов — нечего проверять"
+    return 1
+  fi
+  "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
+  # Считаем пары заранее для прогресса.
+  for id in "${ids[@]}"; do
+    while IFS=$'\t' read -r n k; do
+      [[ -n "$n" ]] || continue
+      total=$((total + 1))
+    done < <(fleet_server_instances "$id")
+  done
+  (( total > 0 )) || total=1
+  msg INFO "Полный стек по парку: ${#ids[@]} сервер(ов), ${total} инстанс(ов), подряд"
+  for id in "${ids[@]}"; do
+    msg INFO "═══ сервер ${id} ═══"
+    while IFS=$'\t' read -r n k; do
+      [[ -n "$n" ]] || continue
+      done_n=$((done_n + 1))
+      msg INFO "[${done_n}/${total}] ${id}-${n}  → verify-stack ${n} --source ${id} ${extra[*]-}"
+      if ! "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "$n" --source "$id" ${extra[@]+"${extra[@]}"}; then
+        msg ERR "[${done_n}/${total}] ${id}-${n}: ошибка"
+        rc_all=1
+      else
+        msg OK "[${done_n}/${total}] ${id}-${n}: ok"
+      fi
+    done < <(fleet_server_instances "$id")
+  done
+  return "$rc_all"
 }
 
 # Выбор инстанса из instances.d (вместо ручного ввода имени)
@@ -2054,17 +2145,19 @@ menu_verify() {
     echo -e " ${BOLD}Проверка восстановимости${RESET}  (на сервере-песочнице)"
     local c
     c="$(menu_pick \
-      fleet "Проверка парка        все серверы × все хранилища × все категории" \
-      stack "Полный стек           каталог + БД + подъём контейнеров в изоляции" \
+      fleet "Проверка парка        сервер → инстансы → хранилища (матрица)" \
+      stack "Полный стек           сервер → инстанс → каталог+БД+контейнеры" \
       local "Локальная проверка    PITR-цепочки и архивы этого сервера" \
       plan "План ротации          что будет проверяться в следующий прогон" \
       sync "Обновить S3/TG креды  скопировать с подключённых серверов")"
     case "$c" in
       fleet)
         local scope depth
-        scope="$(ask_choice "Охват:" "весь парк" "один сервер")"
+        scope="$(ask_choice "Охват:" \
+          "весь парк (сервер за сервером, инстанс за инстансом)" \
+          "один сервер (его инстансы по очереди)")"
         depth="$(ask_choice "Глубина:" "стандартная" "быстрая (quick)" "глубокая (deep: pg_dumpall + amcheck)")"
-        local -a fargs=()
+        local -a fargs=(--ordered)
         case "$depth" in быстр*) fargs+=(--depth quick) ;; глубок*) fargs+=(--depth deep) ;; esac
         if [[ "$scope" == один* ]]; then
           local sid
@@ -2072,41 +2165,45 @@ menu_verify() {
           fargs+=(--server "$sid")
         fi
         msg INFO "Запуск: verify-fleet.sh ${fargs[*]-}"
-        # Актуализируем креды перед прогоном (S3/TG с серверов).
         "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
         "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" ${fargs[@]+"${fargs[@]}"} || true
         pause ;;
       stack)
-        local sid pr mode keep
-        sid="$(pick_fleet_server)" || {
-          read -r -p "  ID сервера-источника вручную: " sid
-          [[ -n "$sid" ]] || { msg ERR "Без --source на песочнице стек не из чего собирать"; pause; continue; }
-        }
-        pr="$(pick_verify_project "$sid")" || pr="panel"
-        # На случай старого msg→stdout: берём последнюю строку и валидируем имя.
-        pr="$(printf '%s\n' "${pr:-panel}" | tail -n1 | tr -d '\r')"
-        [[ "$pr" =~ ^[A-Za-z0-9_.-]+$ ]] || pr="panel"
+        local scope sid pr mode keep
+        local -a s_extra=()
+        # Свежие креды + манифест до меню — чтобы список инстансов был актуальным.
+        "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
+        FLEET_FORCE_MANIFEST=1 fleet_refresh_manifest_cache || true
+        scope="$(ask_choice "Охват:" \
+          "один сервер → один инстанс" \
+          "весь парк подряд (каждый сервер × каждый инстанс)")"
         mode="$(ask_choice "Способ подъёма БД:" \
           "автоматически по ротации" "логический дамп" "базовый бэкап" "базовый бэкап + WAL (PITR)")"
         keep="$(ask_choice "После проверки:" "убрать всё" "оставить контейнеры для разбора")"
-        local -a sargs=("$pr" --source "$sid")
         case "$mode" in
-          логический*) sargs+=(--db-mode dump) ;;
-          "базовый бэкап") sargs+=(--db-mode base) ;;
-          *WAL*|*"PITR"*) sargs+=(--db-mode pitr) ;;
+          логический*) s_extra+=(--db-mode dump) ;;
+          "базовый бэкап") s_extra+=(--db-mode base) ;;
+          *WAL*|*"PITR"*) s_extra+=(--db-mode pitr) ;;
         esac
-        [[ "$keep" == оставить* ]] && sargs+=(--keep)
-        msg INFO "Запуск: verify-stack.sh ${sargs[*]}  (подпись в вебе: ${sid}-${pr})"
-        "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
-        "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "${sargs[@]}" || true
+        [[ "$keep" == оставить* ]] && s_extra+=(--keep)
+        if [[ "$scope" == весь* ]]; then
+          run_verify_stack_all ${s_extra[@]+"${s_extra[@]}"} || true
+          pause; continue
+        fi
+        sid="$(pick_fleet_server)" || {
+          msg ERR "Нет серверов в панели управления — добавьте карточку в вебе"
+          pause; continue
+        }
+        pr="$(pick_verify_project "$sid")" || pr="panel"
+        pr="$(printf '%s\n' "${pr:-panel}" | tail -n1 | tr -d '\r')"
+        [[ "$pr" =~ ^[A-Za-z0-9_.-]+$ ]] || pr="panel"
+        msg INFO "Запуск: verify-stack.sh ${pr} --source ${sid} ${s_extra[*]-}  (в вебе: ${sid}-${pr})"
+        "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "$pr" --source "$sid" ${s_extra[@]+"${s_extra[@]}"} || true
         pause ;;
       local) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
       plan)
         local sid pr bn
-        sid="$(pick_fleet_server 2>/dev/null)" || sid="$(rw_source_id)"
-        local sid_in=""
-        read -r -p "  ID сервера [${sid}]: " sid_in || true
-        sid="${sid_in:-$sid}"
+        sid="$(pick_fleet_server)" || sid="$(rw_source_id)"
         pr="$(pick_verify_project "$sid")" || pr="panel"
         pr="$(printf '%s\n' "${pr:-panel}" | tail -n1 | tr -d '\r')"
         [[ "$pr" =~ ^[A-Za-z0-9_.-]+$ ]] || pr="panel"

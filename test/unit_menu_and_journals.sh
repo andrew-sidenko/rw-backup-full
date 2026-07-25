@@ -46,13 +46,36 @@ msg() {
 }
 pick_verify_project_sim() {
   local sid="$1" name=panel
-  echo "  Проект: ${sid}-${name}  → в команде: ${name}" >&2
+  echo "  Инстансы сервера «${sid}» (1)." >&2
+  echo "    1) ${sid}-${name}   → инстанс «${name}» (kind=panel)" >&2
   printf '%s\n' "$name"
 }
 _pr_out="$(pick_verify_project_sim tyler-panel-1 2>/tmp/pick_err.$$)"
 _pr_err="$(cat /tmp/pick_err.$$ 2>/dev/null || true)"; rm -f /tmp/pick_err.$$
 check "pick_verify stdout is project" "$_pr_out" "panel"
 [[ "$_pr_err" == *"tyler-panel-1-panel"* ]] && pass "pick_verify stderr has label" || fail "pick_verify stderr" "$_pr_err"
+
+# Порядок обхода парка: сервер → инстансы (как в меню / --ordered)
+Tfi="$(mktemp -d)"
+cat > "$Tfi/m.json" <<'JSON'
+{"servers":[
+  {"id":"s1","instances":[{"name":"panel","kind":"panel"},{"name":"bot_a","kind":"bot"}]},
+  {"id":"s2","instances":[{"name":"panel","kind":"panel"}]}
+]}
+JSON
+: > "$Tfi/order"
+while IFS= read -r sid; do
+  while IFS=$'\t' read -r n _; do
+    printf '%s/%s\n' "$sid" "$n" >> "$Tfi/order"
+  done < <(jq -r --arg id "$sid" '
+    .servers[]? | select(.id==$id) | (.instances // [])[]? |
+    [(.name // empty), (.kind // "bot")] | @tsv
+  ' "$Tfi/m.json")
+done < <(jq -r '.servers[]?.id' "$Tfi/m.json")
+check "ordered s1/panel" "$(sed -n '1p' "$Tfi/order")" "s1/panel"
+check "ordered s1/bot" "$(sed -n '2p' "$Tfi/order")" "s1/bot_a"
+check "ordered s2/panel" "$(sed -n '3p' "$Tfi/order")" "s2/panel"
+rm -rf "$Tfi"
 # Регрессия старого msg→stdout: tail -n1 + валидация спасают
 _pr_polluted=$'[INFO] Проект: x-panel → panel\npanel'
 _pr_fix="$(printf '%s\n' "$_pr_polluted" | tail -n1 | tr -d '\r')"
