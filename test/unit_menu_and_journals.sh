@@ -166,10 +166,11 @@ grep -q 'FULL_TG_BOT_TOKEN="tok1"' "$FLEET_CREDS_DIR/prod1/telegram.env" && pass
 grep -q 'B_BUCKET="b"' "$FLEET_CREDS_DIR/prod1/s3.d/cold.env" && pass "bucket" || fail "bucket" "bad"
 
 # --- web history helper (python) ---
-python3 - <<'PY'
+# venv с fastapi (как в AGENTS.md); иначе системный python3.
+PYBIN="${RW_WEB_PYTHON:-$HOME/.venvs/rw-backup-web/bin/python}"
+[[ -x "$PYBIN" ]] || PYBIN="$(command -v python3)"
+ROOT="$ROOT" "$PYBIN" - <<'PY'
 import json, os, tempfile, sys
-sys.path.insert(0, os.environ.get("ROOT","."))
-# minimal inline test of history filter logic
 from pathlib import Path
 td = Path(tempfile.mkdtemp())
 (td/"fleet_1.json").write_text(json.dumps({
@@ -195,6 +196,41 @@ for f in files:
 assert len(hist)==2, hist
 assert hist[0]["type"] in ("fleet","stack")
 print("PASS web history filter")
+
+# sandbox summary: fallback на fleet_*.json когда .prom пуст
+root = os.environ["ROOT"]
+inst = Path(tempfile.mkdtemp())
+metrics = Path(tempfile.mkdtemp())
+hist_dir = inst / "web-data" / "verify-history"
+hist_dir.mkdir(parents=True)
+(hist_dir / "fleet_20260725_120000.json").write_text(json.dumps({
+  "type": "fleet", "ts": 1721900000, "total": 4, "passed": 3, "depth": "deep",
+  "results": [
+    {"ok": True, "source": "v567005",
+     "detail": "[v567005 × cold] panel ok"},
+    {"ok": False, "source": "v567005",
+     "detail": "[v567005 × cold] pitr(panel) fail"},
+    {"ok": True, "source": "v567005", "detail": "[v567005] reachable"},
+  ],
+}))
+os.environ["WEB_TOKEN"] = "t"
+os.environ["RW_INSTALL_DIR"] = str(inst)
+os.environ["RW_METRICS_DIR"] = str(metrics)
+os.environ["VERIFY_HISTORY_DIR"] = str(hist_dir)
+# сброс уже импортированного модуля при повторном прогоне
+sys.modules.pop("app", None)
+sys.path.insert(0, str(Path(root) / "web"))
+import app as webapp  # noqa: E402
+m = webapp._fleet_metrics_from_history()
+assert m["rw_fleet_verify_checks_total"] == 4.0, m
+assert m["rw_fleet_verify_checks_passed"] == 3.0, m
+assert m["rw_fleet_verify_last_run_timestamp_seconds"] == 1721900000.0, m
+assert any(k.startswith("rw_fleet_verify_ok{") and "pitr" in k and m[k] == 0.0
+           for k in m), m
+# summary без .prom → history
+s = webapp.api_sandbox_summary()
+assert s["metrics"]["rw_fleet_verify_checks_total"] == 4.0, s
+print("PASS sandbox summary history fallback")
 PY
 
 echo

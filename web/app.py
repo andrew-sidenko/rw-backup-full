@@ -371,17 +371,86 @@ def api_fleet_manifest(force: int = 0):
     return out
 
 
-@app.get("/api/sandbox/summary", dependencies=[Depends(auth)])
-def api_sandbox_summary():
-    """Последние результаты песочницы из локальных .prom-файлов."""
+def _metrics_from_prom() -> dict:
+    """Читает rw_sandbox_*.prom / rw_fleet_*.prom из METRICS_DIR."""
     result = {}
-    for f in glob.glob(f"{METRICS_DIR}/rw_sandbox_*.prom") + glob.glob(f"{METRICS_DIR}/rw_fleet_*.prom"):
-        for line in Path(f).read_text().splitlines():
+    for f in glob.glob(f"{METRICS_DIR}/rw_sandbox_*.prom") + glob.glob(
+            f"{METRICS_DIR}/rw_fleet_*.prom"):
+        try:
+            lines = Path(f).read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
             if line.startswith("#") or not line.strip():
                 continue
             m = re.match(r"^(\w+)(\{[^}]*\})?\s+([-\d.]+)", line)
             if m:
                 result[m.group(1) + (m.group(2) or "")] = float(m.group(3))
+    return result
+
+
+def _fleet_metrics_from_history() -> dict:
+    """Fallback: последний fleet_*.json → те же ключи, что пишет verify-fleet.prom.
+
+    Нужен когда textfile-каталог отсутствовал на момент прогона (wal_metric_write
+    раньше молча no-op'ил) или метрики ещё не появились, а история уже есть.
+    """
+    hist_dir = Path(os.environ.get(
+        "VERIFY_HISTORY_DIR", f"{INSTALL_DIR}/web-data/verify-history"))
+    if not hist_dir.is_dir():
+        return {}
+    files = sorted(hist_dir.glob("fleet_*.json"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    for f in files:
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        if data.get("type") != "fleet":
+            continue
+        total = data.get("total")
+        passed = data.get("passed")
+        if total is None or passed is None:
+            continue
+        out = {
+            "rw_fleet_verify_checks_total": float(total),
+            "rw_fleet_verify_checks_passed": float(passed),
+        }
+        ts = data.get("ts")
+        if ts is not None:
+            out["rw_fleet_verify_last_run_timestamp_seconds"] = float(ts)
+        for r in data.get("results") or []:
+            detail = r.get("detail") or ""
+            src = r.get("source") or "?"
+            ok = 1.0 if r.get("ok") else 0.0
+            # detail вида: "[src × backend] category …" или "[src] reachable…"
+            m = re.match(
+                r"^\[([^ ×]+) × ([^\]]+)\]\s+([a-z-]+)", detail)
+            if m:
+                cat = m.group(3)
+                inst = ""
+                mi = re.search(r"pitr\(([^)]+)\)", detail)
+                if cat == "pitr" and mi:
+                    inst = mi.group(1)
+                key = (f'rw_fleet_verify_ok{{source="{m.group(1)}",'
+                       f'backend="{m.group(2)}",category="{cat}",'
+                       f'instance="{inst}"}}')
+                out[key] = ok
+            else:
+                out[f'rw_fleet_server_reachable{{server="{src}"}}'] = ok
+        return out
+    return {}
+
+
+@app.get("/api/sandbox/summary", dependencies=[Depends(auth)])
+def api_sandbox_summary():
+    """Последние результаты песочницы: .prom, иначе история verify-history."""
+    result = _metrics_from_prom()
+    # Если сводных счётчиков fleet нет — подтянем из JSON-истории прогона.
+    if "rw_fleet_verify_checks_total" not in result:
+        hist = _fleet_metrics_from_history()
+        for k, v in hist.items():
+            result.setdefault(k, v)
     # Кэш кредов: когда последний раз синхронизировали
     creds_root = Path(INSTALL_DIR) / "fleet-creds"
     creds = {}
@@ -671,12 +740,20 @@ async function loadServerVerdict(sid){
 async function loadSandbox(){
   const r = await api('GET','/api/sandbox/summary');
   const m = r.metrics||{};
-  const tot = m['rw_fleet_verify_checks_total']?? m['rw_sandbox_checks_total']??'—';
-  const pass = m['rw_fleet_verify_checks_passed']?? m['rw_sandbox_checks_passed']??'—';
+  const tot = m['rw_fleet_verify_checks_total']?? m['rw_sandbox_checks_total'];
+  const pass = m['rw_fleet_verify_checks_passed']?? m['rw_sandbox_checks_passed'];
   const ts = m['rw_fleet_verify_last_run_timestamp_seconds']?? m['rw_sandbox_last_run_timestamp_seconds'];
   const fails = Object.entries(m).filter(([k,v])=>k.includes('verify_ok')&&v===0).length;
   const synced = Object.keys(r.creds_synced||{}).length;
-  $('sandbox').innerHTML = `проверок: <b class="${pass===tot?'ok':'bad'}">${pass}/${tot}</b>`+
+  let checks;
+  if(tot==null && pass==null){
+    checks = `<span class="mut">проверок: нет данных</span>`+
+      ` <span class="mut">(запустите «Проверка парка» — метрики пишутся в textfile + история)</span>`;
+  }else{
+    const t = tot??'—', p = pass??'—';
+    checks = `проверок: <b class="${p===t?'ok':'bad'}">${p}/${t}</b>`;
+  }
+  $('sandbox').innerHTML = checks+
     (fails?` · ошибок матрицы: <b class="bad">${fails}</b>`:'')+
     (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'')+
     ` · кредов синхр.: ${synced}`;

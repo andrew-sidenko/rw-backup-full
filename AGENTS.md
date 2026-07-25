@@ -71,6 +71,10 @@ bash -n scripts/rw-backup-full.sh                    # syntax check
 
 ### Sandbox / verify-stack notes
 
+- **Sandbox UI «проверок»** comes from `RW_METRICS_DIR` (`rw_fleet_*.prom`) with fallback to
+  latest `web-data/verify-history/fleet_*.json`. Creds count (`fleet-creds/*/synced_at`) is
+  independent — synced creds do not imply a completed fleet verify wrote metrics. After
+  deploy, one «Проверка парка» (or any verify-fleet) refreshes both `.prom` and history.
 - **`verify-stack --db-mode pitr` is long-running by design** (download basebackup + WAL sync +
   Postgres recovery, up to ~10 min). After v5.5.2 it emits step progress and a recovery
   heartbeat every 30s; silence after `поднимаю БД из базового бэкапа + WAL` means an older
