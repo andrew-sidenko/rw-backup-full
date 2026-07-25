@@ -112,10 +112,24 @@ size_h="$(du -h "${BACKUP_DIR}/${FINAL}" | awk '{print $1}')"
 size_b="$(stat -c %s "${BACKUP_DIR}/${FINAL}")"
 msg OK "Panel backup готов: ${BACKUP_DIR}/${FINAL} (${size_h})"
 
+# Текстовый журнал рядом с архивом (то же stem-имя, .txt) — удобный поиск в S3.
+JOURNAL="${BACKUP_DIR}/$(s3m_journal_name "$FINAL")"
+{
+  echo "rw-backup-full panel backup journal"
+  echo "host=$(wal_hostname) source=$(rw_source_id)"
+  echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "file=${FINAL}"
+  echo "size=${size_h} (${size_b} bytes)"
+  echo "panel_version=${panel_version:-?}"
+  echo "result=ok"
+  echo "--- members ---"
+  cat "${WORK}/members.txt" 2>/dev/null || true
+} > "$JOURNAL"
+
 # --------------------------------------------------------------------------
 # 5. Выгрузки: все S3-бэкенды категории panel + Telegram-документ
 # --------------------------------------------------------------------------
-s3m_upload_all "panel" "${BACKUP_DIR}/${FINAL}" "remnawave-panel" \
+s3m_upload_all "panel" "${BACKUP_DIR}/${FINAL}" "remnawave-panel" "$JOURNAL" \
   || msg WARN "Ни один S3-бэкенд не принял panel backup"
 
 # Telegram-документ (лимит Bot API 50 МБ — как в оригинале: при превышении

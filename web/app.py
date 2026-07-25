@@ -221,6 +221,34 @@ def api_status(sid: str):
                             status_code=502)
 
 
+@app.get("/api/servers/{sid}/journals", dependencies=[Depends(auth)])
+def api_journals(sid: str):
+    """Список .txt-журналов в S3 сервера (по SSH: rw-backup-full journals)."""
+    srv = get_server(sid)
+    rc, out, err = ssh_run(srv, ["rw-backup-full", "journals"])
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": err.strip() or f"rc={rc}"}, status_code=502)
+    try:
+        return {"ok": True, "journals": json.loads(out.strip().splitlines()[-1])}
+    except Exception:
+        return JSONResponse({"ok": False, "error": "невалидный JSON от сервера", "raw": out[-2000:]},
+                            status_code=502)
+
+
+@app.get("/api/servers/{sid}/journal", dependencies=[Depends(auth)])
+def api_journal(sid: str, backend: str, key: str):
+    """Содержимое одного журнала из S3. Ключ валидируется и здесь, и в CLI."""
+    if not re.match(r"^[a-zA-Z0-9_-]+$", backend):
+        raise HTTPException(400, "bad backend")
+    if not key.endswith(".txt") or ".." in key or "/" not in key:
+        raise HTTPException(400, "bad key")
+    srv = get_server(sid)
+    rc, out, err = ssh_run(srv, ["rw-backup-full", "journal-show", backend, key])
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": err.strip() or f"rc={rc}"}, status_code=502)
+    return {"ok": True, "content": out[-20000:]}
+
+
 @app.post("/api/servers/{sid}/action/{action}", dependencies=[Depends(auth)])
 def api_action(sid: str, action: str):
     if action not in ALLOWED_ACTIONS:
@@ -344,14 +372,132 @@ def api_fleet_manifest(force: int = 0):
 def api_sandbox_summary():
     """Последние результаты песочницы из локальных .prom-файлов."""
     result = {}
-    for f in glob.glob(f"{METRICS_DIR}/rw_sandbox_*.prom"):
+    for f in glob.glob(f"{METRICS_DIR}/rw_sandbox_*.prom") + glob.glob(f"{METRICS_DIR}/rw_fleet_*.prom"):
         for line in Path(f).read_text().splitlines():
             if line.startswith("#") or not line.strip():
                 continue
             m = re.match(r"^(\w+)(\{[^}]*\})?\s+([-\d.]+)", line)
             if m:
                 result[m.group(1) + (m.group(2) or "")] = float(m.group(3))
-    return {"ok": True, "metrics": result}
+    # Кэш кредов: когда последний раз синхронизировали
+    creds_root = Path(INSTALL_DIR) / "fleet-creds"
+    creds = {}
+    if creds_root.is_dir():
+        for d in creds_root.iterdir():
+            if d.is_dir() and (d / "synced_at").exists():
+                try:
+                    creds[d.name] = int((d / "synced_at").read_text().strip())
+                except Exception:
+                    creds[d.name] = 0
+    return {"ok": True, "metrics": result, "creds_synced": creds}
+
+
+@app.get("/api/fleet/overview", dependencies=[Depends(auth)])
+def api_fleet_overview():
+    """Сводка парка для панели управления: серверы, проверки, ошибки."""
+    fleet = load_fleet()
+    summary = api_sandbox_summary()
+    metrics = summary.get("metrics", {})
+    servers_out = []
+    for srv in fleet["servers"]:
+        entry = {"id": srv["id"], "host": srv.get("host"), "note": srv.get("note", ""),
+                 "type": srv.get("type", "ssh")}
+        # Статус по SSH (короткий таймаут)
+        try:
+            rc, out, err = ssh_run(srv, ALLOWED_ACTIONS["status"], timeout=20)
+            if rc == 0:
+                entry["status"] = json.loads(out.strip().splitlines()[-1])
+                entry["reachable"] = True
+            else:
+                entry["reachable"] = False
+                entry["error"] = (err or f"rc={rc}")[-200:]
+        except Exception as e:
+            entry["reachable"] = False
+            entry["error"] = str(e)[:200]
+        # Метрики проверок по этому source
+        src = (entry.get("status") or {}).get("host") or srv["id"]
+        fails = [k for k, v in metrics.items()
+                 if k.startswith("rw_fleet_verify_ok{") and f'source="{src}"' in k and v == 0.0]
+        entry["verify_fails"] = len(fails)
+        entry["creds_synced_at"] = summary.get("creds_synced", {}).get(srv["id"])
+        servers_out.append(entry)
+    return {
+        "ok": True,
+        "settings": fleet["settings"],
+        "servers": servers_out,
+        "fleet_checks_total": metrics.get("rw_fleet_verify_checks_total"),
+        "fleet_checks_passed": metrics.get("rw_fleet_verify_checks_passed"),
+        "fleet_last_run": metrics.get("rw_fleet_verify_last_run_timestamp_seconds"),
+    }
+
+
+HISTORY_DIR = Path(os.environ.get(
+    "VERIFY_HISTORY_DIR", f"{INSTALL_DIR}/web-data/verify-history"))
+
+
+def _load_history(limit: int = 20, server: str | None = None) -> list[dict]:
+    """Читает JSON-историю прогонов fleet/stack (новые сверху)."""
+    if not HISTORY_DIR.is_dir():
+        return []
+    files = sorted(
+        list(HISTORY_DIR.glob("fleet_*.json")) + list(HISTORY_DIR.glob("stack_*.json")),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    out = []
+    for f in files:
+        if len(out) >= limit:
+            break
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        if server:
+            # fleet: фильтр по results[].source; stack: по source
+            if data.get("type") == "fleet":
+                filtered = [r for r in data.get("results", [])
+                            if r.get("source") == server]
+                if not filtered:
+                    continue
+                data = dict(data)
+                data["results"] = filtered
+                data["total"] = len(filtered)
+                data["passed"] = sum(1 for r in filtered if r.get("ok"))
+            elif data.get("source") != server and data.get("project") != server:
+                continue
+        data["_file"] = f.name
+        out.append(data)
+    return out
+
+
+@app.get("/api/verify/history", dependencies=[Depends(auth)])
+def api_verify_history(limit: int = 20, server: str | None = None):
+    """История проверок восстановимости (fleet + stack) для панели."""
+    limit = max(1, min(limit, 100))
+    return {"ok": True, "history": _load_history(limit, server)}
+
+
+@app.get("/api/servers/{sid}/verify", dependencies=[Depends(auth)])
+def api_server_verify(sid: str, limit: int = 10):
+    """История проверок, относящихся к конкретному серверу."""
+    get_server(sid)  # 404 если нет
+    limit = max(1, min(limit, 50))
+    # Ищем и по id карточки, и по hostname из статуса (source в S3).
+    hist = _load_history(limit * 3, server=sid)
+    # Дополнительно — по source из последнего статуса / манифеста
+    try:
+        rc, out, _ = ssh_run(get_server(sid), ALLOWED_ACTIONS["status"], timeout=15)
+        if rc == 0:
+            st = json.loads(out.strip().splitlines()[-1])
+            src = st.get("host")
+            if src and src != sid:
+                extra = _load_history(limit * 3, server=src)
+                seen = {h.get("_file") for h in hist}
+                for h in extra:
+                    if h.get("_file") not in seen:
+                        hist.append(h)
+    except Exception:
+        pass
+    hist.sort(key=lambda h: h.get("ts", 0), reverse=True)
+    return {"ok": True, "server": sid, "history": hist[:limit]}
 
 
 @app.get("/api/pubkey", dependencies=[Depends(auth)])
@@ -391,6 +537,10 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 <button onclick="addDlg.showModal()">+ Добавить сервер</button>
 </div></div>
 <div class="card"><b>Песочница (этот сервер):</b> <span id="sandbox" class="mut">…</span></div>
+<div class="card"><b>Парк (сводно):</b> <span id="fleet" class="mut">…</span></div>
+<div class="card"><b>История проверок:</b>
+<button onclick="loadHistory()">⟳</button>
+<div id="history" class="mut">…</div></div>
 <div id="servers" class="grid"></div>
 <pre id="log" class="mut">Журнал операций…</pre>
 
@@ -411,6 +561,15 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 сервере не изменяются. Перед записью на сервере создаётся резервная копия файла.</p>
 <div class="row"><button class="pri" onclick="saveCfg()">Сохранить на сервер</button>
 <button onclick="cfgDlg.close()">Закрыть</button></div></dialog>
+
+<dialog id="histDlg"><h3 id="histTitle">Проверки</h3>
+<pre id="histBody" style="max-height:420px"></pre>
+<div class="row"><button onclick="histDlg.close()">Закрыть</button></div></dialog>
+
+<dialog id="jrnDlg"><h3 id="jrnTitle">Журналы</h3>
+<div id="jrnList" class="mut" style="max-height:200px;overflow:auto"></div>
+<pre id="jrnBody" style="max-height:340px">выберите журнал…</pre>
+<div class="row"><button onclick="jrnDlg.close()">Закрыть</button></div></dialog>
 
 <script>
 let TOK = localStorage.getItem('rwtok')||''; if(TOK) document.getElementById('tok').value = TOK;
@@ -438,6 +597,8 @@ async function refreshAll(){
       <button onclick="act('${s.id}','custom-backup')">Бэкап ботов</button>
       <button onclick="act('${s.id}','wal-status')">WAL-статус</button>
       <button onclick="act('${s.id}','verify-local')">Verify</button>
+      <button onclick="showServerVerify('${s.id}')">История проверок</button>
+      <button onclick="openJournals('${s.id}')">Журналы</button>
       <button onclick="openCfg('${s.id}')">⚙ Конфиги</button>
       <button onclick="delServer('${s.id}')" class="bad">✕</button>
       </div>`;
@@ -445,19 +606,132 @@ async function refreshAll(){
     loadStatus(s.id);
   });
   loadSandbox();
+  loadHistory();
+}
+function fmtB(n){ if(n==null) return '—'; const u=['Б','КБ','МБ','ГБ','ТБ']; let i=0; n=+n; while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(i?1:0)+u[i]; }
+function ago(ts,now){ if(!ts) return 'нет'; const s=now-ts; if(s<3600) return Math.round(s/60)+'м назад'; if(s<86400) return Math.round(s/3600)+'ч назад'; return Math.round(s/86400)+'д назад'; }
+window._fleet = {};
+function renderFleetTotals(){
+  const v=Object.values(window._fleet); const el=$('fleet'); if(!el||!v.length) return;
+  const online=v.filter(x=>x.online).length;
+  const errs=v.reduce((a,x)=>a+(x.errors||0),0);
+  const s3=v.reduce((a,x)=>a+(x.s3bytes||0),0);
+  el.innerHTML = `серверов online: <b class="${online===v.length?'ok':'bad'}">${online}/${v.length}</b>`+
+    ` · суммарно в S3: <b>${fmtB(s3)}</b>`+
+    (errs?` · <b class="bad">ошибок: ${errs}</b>`:` · <span class="ok">ошибок нет</span>`);
 }
 async function loadStatus(sid){
   try{
     const r = await api('GET',`/api/servers/${sid}/status`);
     const b = $('st-'+sid), i = $('info-'+sid);
-    if(!r.ok){ b.textContent='offline'; b.className='badge bad'; i.textContent=r.error||''; return; }
-    const st = r.status;
+    if(!r.ok){ b.textContent='offline'; b.className='badge bad'; i.textContent=r.error||''; window._fleet[sid]={online:false}; renderFleetTotals(); return; }
+    const st = r.status; const now = st.time||Math.floor(Date.now()/1000);
     b.textContent='online'; b.className='badge ok';
-    const age = st.panel.last_backup_ts? Math.round((st.time-st.panel.last_backup_ts)/3600)+'ч назад':'нет';
-    const wal = st.wal_instances.map(w=>`${w.name}:${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups}`).join('  ')||'—';
-    i.innerHTML = `панель: ${st.panel.detected?'да':'нет'}, бэкап: ${age} · ботов-архивов: ${st.custom_archives}
-      · диск: ${(st.disk_free_bytes/2**30).toFixed(1)} ГБ своб.<br>S3: ${st.s3_backends.map(b=>b.name+(b.enabled?'':'(off)')).join(', ')||'—'}<br>WAL: ${wal}`;
+    const page = ago(st.panel.last_backup_ts, now);
+    const comps = st.components || '—';
+    const disk = st.disk_free_bytes!=null ? fmtB(st.disk_free_bytes)+' своб.' : '—';
+    const locsz = st.local_backup_bytes!=null ? fmtB(st.local_backup_bytes) : '—';
+    const errs = st.errors||0;
+    const s3 = (st.s3_backends||[]).map(x=>{
+      const warn = x.reachable===false?' <span class="bad">⚠ недоступен</span>':'';
+      const off = x.enabled?'':'(off)';
+      return `&nbsp;&nbsp;${x.name}${off}: <b>${fmtB(x.bytes)}</b> / ${x.objects||0} об.${warn}`;
+    }).join('<br>') || '&nbsp;&nbsp;—';
+    // Подпись инстанса в парке: <id карточки>-<имя инстанса>.
+    // Само имя в S3/CLI остаётся каноническим (panel, bot_…), без переименования.
+    const wal = (st.wal_instances||[]).map(w=>
+      `&nbsp;&nbsp;<b>${sid}-${w.name}</b>: ${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups} · база ${ago(w.last_basebackup_ts,now)} · WAL ${ago(w.last_wal_ts,now)}`
+    ).join('<br>') || '&nbsp;&nbsp;—';
+    i.innerHTML = `компоненты: <code>${comps}</code>`+
+      (errs?` · <b class="bad">ошибок: ${errs}</b>`:` · <span class="ok">ошибок нет</span>`)+`<br>`+
+      `панель: ${st.panel.detected?'да':'нет'}, бэкап: ${page} · ботов-архивов: ${st.custom_archives}<br>`+
+      `место: занято локально <b>${locsz}</b> · диск ${disk}<br>`+
+      `S3-хранилища:<br>${s3}<br>`+
+      `WAL <span class="mut">(подписи: id_карточки-инстанс)</span>:<br>${wal}`;
+    const s3sum = (st.s3_backends||[]).reduce((a,x)=>a+(+x.bytes||0),0);
+    window._fleet[sid]={online:true, errors:errs, s3bytes:s3sum};
+    renderFleetTotals();
+    loadServerVerdict(sid);
   }catch(e){ if(e!=='auth'){ $('st-'+sid).textContent='err'; $('st-'+sid).className='badge bad'; } }
+}
+async function loadServerVerdict(sid){
+  try{
+    const r = await api('GET',`/api/servers/${sid}/verify?limit=1`);
+    const i = $('info-'+sid); if(!i||!r.history||!r.history.length) return;
+    const h=r.history[0];
+    const ok = h.type==='fleet' ? (h.passed===h.total) : h.ok;
+    const when = h.ts? new Date(h.ts*1000).toLocaleString():'';
+    i.innerHTML += `<br>последняя проверка: <b class="${ok?'ok':'bad'}">${ok?'ПРОЙДЕНА':'ОШИБКА'}</b> <span class="mut">${when}</span>`;
+  }catch(e){}
+}
+async function loadSandbox(){
+  const r = await api('GET','/api/sandbox/summary');
+  const m = r.metrics||{};
+  const tot = m['rw_fleet_verify_checks_total']?? m['rw_sandbox_checks_total']??'—';
+  const pass = m['rw_fleet_verify_checks_passed']?? m['rw_sandbox_checks_passed']??'—';
+  const ts = m['rw_fleet_verify_last_run_timestamp_seconds']?? m['rw_sandbox_last_run_timestamp_seconds'];
+  const fails = Object.entries(m).filter(([k,v])=>k.includes('verify_ok')&&v===0).length;
+  const synced = Object.keys(r.creds_synced||{}).length;
+  $('sandbox').innerHTML = `проверок: <b class="${pass===tot?'ok':'bad'}">${pass}/${tot}</b>`+
+    (fails?` · ошибок матрицы: <b class="bad">${fails}</b>`:'')+
+    (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'')+
+    ` · кредов синхр.: ${synced}`;
+}
+function fmtHist(h){
+  const when = h.ts? new Date(h.ts*1000).toLocaleString() : h._file;
+  if(h.type==='fleet'){
+    const cls = h.passed===h.total?'ok':'bad';
+    return `<div><span class="${cls}">fleet</span> ${when} — <b class="${cls}">${h.passed}/${h.total}</b> (depth=${h.depth||'?'})`+
+      (h.results||[]).slice(0,8).map(r=>`<div class="mut" style="margin-left:12px">${r.ok?'✅':'❌'} ${r.source}: ${(r.detail||'').slice(0,120)}</div>`).join('')+
+      `</div>`;
+  }
+  const cls = h.ok?'ok':'bad';
+  const label = (h.fleet_id || h.source || '?') + '-' + (h.project || '?');
+  return `<div><span class="${cls}">stack</span> ${when} — <b>${label}</b> <span class="mut">проект=${h.project||'?'} src=${h.source||'?'}</span> <span class="${cls}">${h.ok?'ok':'fail'}</span> <span class="mut">${h.detail||''}</span></div>`;
+}
+async function loadHistory(){
+  try{
+    const r = await api('GET','/api/verify/history?limit=12');
+    const box = $('history');
+    if(!r.history || !r.history.length){ box.innerHTML='<span class="mut">пока нет прогонов</span>'; return; }
+    box.innerHTML = r.history.map(fmtHist).join('');
+  }catch(e){ if(e!=='auth') $('history').textContent='ошибка загрузки истории'; }
+}
+async function showServerVerify(sid){
+  $('histTitle').textContent = 'Проверки: '+sid;
+  $('histBody').textContent = 'загрузка…';
+  histDlg.showModal();
+  const r = await api('GET',`/api/servers/${sid}/verify?limit=15`);
+  if(!r.history || !r.history.length){ $('histBody').textContent='нет записей для этого сервера'; return; }
+  $('histBody').textContent = r.history.map(h=>{
+    if(h.type==='fleet'){
+      return new Date((h.ts||0)*1000).toLocaleString()+' fleet '+h.passed+'/'+h.total+'\\n'+
+        (h.results||[]).map(x=>'  '+(x.ok?'OK':'FAIL')+' '+(x.detail||'')).join('\\n');
+    }
+    const label = (h.fleet_id || sid) + '-' + (h.project || '?');
+    return new Date((h.ts||0)*1000).toLocaleString()+' stack '+(h.ok?'OK':'FAIL')+' '+label+' '+(h.detail||'');
+  }).join('\\n\\n');
+}
+async function openJournals(sid){
+  $('jrnTitle').textContent = 'Журналы (S3): '+sid;
+  $('jrnList').textContent = 'загрузка списка…';
+  $('jrnBody').textContent = 'выберите журнал…';
+  jrnDlg.showModal();
+  const r = await api('GET',`/api/servers/${sid}/journals`);
+  if(!r.ok){ $('jrnList').textContent = 'ошибка: '+(r.error||''); return; }
+  const js = r.journals||[];
+  if(!js.length){ $('jrnList').textContent = 'журналов в S3 не найдено'; return; }
+  $('jrnList').innerHTML = js.map(j=>{
+    const kb = j.size? (j.size/1024).toFixed(1)+'КБ' : '';
+    return `<div><button onclick="showJournal('${sid}','${j.backend}','${encodeURIComponent(j.key)}')">${j.name}</button> `+
+      `<span class="mut">[${j.category}] ${j.backend} · ${j.date} · ${kb}</span></div>`;
+  }).join('');
+}
+async function showJournal(sid,backend,keyEnc){
+  const key = decodeURIComponent(keyEnc);
+  $('jrnBody').textContent = 'загрузка…';
+  const r = await api('GET',`/api/servers/${sid}/journal?backend=${encodeURIComponent(backend)}&key=${encodeURIComponent(key)}`);
+  $('jrnBody').textContent = r.ok ? (r.content||'(пусто)') : ('ошибка: '+(r.error||''));
 }
 async function act(sid,a){
   log(`▶ ${sid}: ${a}…`);
@@ -491,14 +765,6 @@ async function saveCfg(){
   const r = await api('PUT',`/api/servers/${curSid}/config?path=`+encodeURIComponent($('cfgFile').value),
     {content: $('cfgBody').value});
   log((r.ok?'✅ Сохранено: ':'❌ Ошибка: ')+$('cfgFile').value+' @ '+curSid+(r.note?' — '+r.note:''));
-}
-async function loadSandbox(){
-  const r = await api('GET','/api/sandbox/summary');
-  const m = r.metrics||{};
-  const tot = m['rw_sandbox_checks_total']??'—', pass = m['rw_sandbox_checks_passed']??'—';
-  const ts = m['rw_sandbox_last_run_timestamp_seconds'];
-  $('sandbox').innerHTML = `проверок: <b class="${pass===tot?'ok':'bad'}">${pass}/${tot}</b>`+
-    (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'');
 }
 async function showPubkey(){
   const r = await api('GET','/api/pubkey');

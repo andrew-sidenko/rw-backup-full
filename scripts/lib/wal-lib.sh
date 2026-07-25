@@ -57,6 +57,26 @@ wal_hostname() {
 
 wal_ts() { date -u +%Y-%m-%d_%H_%M_%S; }
 
+# Джиттер расписания: случайная пауза 0..N секунд ПЕРЕД тяжёлой операцией, чтобы
+# разные серверы парка не начинали выгрузку в S3 в одну и ту же секунду (иначе
+# одно хранилище получает пачку параллельных потоков от всех серверов сразу).
+# Значение N — FULL_SCHEDULE_JITTER_SEC (сек), либо аргумент.
+# Пропускается, если:
+#   - запуск под systemd (INVOCATION_ID задан) — там джиттер уже даёт
+#     RandomizedDelaySec у таймера, иначе задержка удвоилась бы;
+#   - RW_NO_JITTER=1 — ручной/срочный запуск без ожидания;
+#   - N<=0 или не число.
+wal_jitter_sleep() {
+  local max="${1:-${FULL_SCHEDULE_JITTER_SEC:-0}}" d
+  [[ "$max" =~ ^[0-9]+$ ]] || return 0
+  (( max > 0 )) || return 0
+  [[ -n "${INVOCATION_ID:-}" ]] && return 0
+  [[ -n "${RW_NO_JITTER:-}" ]] && return 0
+  d=$(( RANDOM % (max + 1) ))
+  msg INFO "Джиттер расписания: пауза ${d}s из ${max}s (разнос нагрузки на S3; отключить: RW_NO_JITTER=1)"
+  sleep "$d"
+}
+
 # --------------------------------------------------------------------------
 # Конфигурация инстансов
 # --------------------------------------------------------------------------
@@ -291,6 +311,22 @@ wal_notify() {
   for attempt in 1 2 3; do
     curl -sS -m 25 "${proxy[@]}" \
       "https://api.telegram.org/bot${FULL_TG_BOT_TOKEN}/sendMessage" \
+      "${form[@]}" >/dev/null 2>&1 && return 0
+    sleep $((attempt * 3))
+  done
+  return 0
+}
+
+# Отправка в конкретный чат (токен/чат сервера-источника события).
+wal_notify_to() { # <token> <chat_id> <text> [thread_id]
+  local token="$1" chat="$2" text="$3" thread="${4:-}"
+  [[ -n "$token" && -n "$chat" ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local -a form=(-F "chat_id=${chat}" -F "text=${text}")
+  [[ -n "$thread" ]] && form+=(-F "message_thread_id=${thread}")
+  local attempt
+  for attempt in 1 2 3; do
+    curl -sS -m 25 "https://api.telegram.org/bot${token}/sendMessage" \
       "${form[@]}" >/dev/null 2>&1 && return 0
     sleep $((attempt * 3))
   done

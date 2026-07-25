@@ -2,51 +2,78 @@
 
 ## Cursor Cloud specific instructions
 
-`rw-backup-full` is a Bash-based backup/restore toolkit (wrapper around
-`distillium/remnawave-backup-restore`) plus a Python FastAPI fleet-management web
-service. Most user-facing text is in Russian; `README.md` is the English summary,
-`README-RU.md` / `docs/*-RU.md` the detailed docs.
+**Communication language:** always communicate with the user in Russian (per their explicit
+preference).
 
-### Components & how to run them
+`rw-backup-full` is a single product: a Bash CLI backup/restore toolkit for Remnawave panels
+and Telegram-bot Docker-Compose projects, plus a small FastAPI **web console** (`web/app.py`).
+Authoritative docs are in Russian (`README-RU.md`); short overview in `README.md`.
+In production it is deployed via `install.sh` (systemd) or the container image
+(`container/Dockerfile`); for local development none of that is needed.
 
-- Bash CLI — `scripts/rw-backup-full.sh` (core product). Sub-scripts live in
-  `scripts/{wal,panel,metrics,sandbox,track,host,lib}`. Commands are dispatched in
-  the `case` block at the bottom of the file; run `bash scripts/rw-backup-full.sh help`.
-- Web service — `web/app.py` (FastAPI + uvicorn). Fleet control panel that SSHes to
-  prod hosts and invokes the CLI remotely. Serves an HTML UI + JSON API.
+### Services
 
-### Lint / test / build / run
+- **Web console (FastAPI, `web/app.py`)** — the only long-running service and the main thing
+  to run/interact with in dev. It is a fleet-management UI on `127.0.0.1:8787`. Production
+  install is `web/install-web.sh` (root-only, systemd); for dev, run `app.py` directly.
+- The CLI (`scripts/rw-backup-full.sh`) and its per-component scripts operate on Docker, live
+  PostgreSQL containers and S3 — those are only meaningful on a real fleet host and are not
+  required for local dev/testing.
 
-- Lint (Bash): `shellcheck scripts/rw-backup-full.sh` (the scripts already carry
-  `# shellcheck disable=` directives, so shellcheck is the intended linter). Add
-  `-S error` to gate only on errors.
-- Syntax check everything: `bash -n <file>` over `*.sh`; `python3 -m py_compile web/app.py`.
-- Run the CLI (dev, no root): most commands require `docker`, EXCEPT `status --json`
-  and `fleet-manifest`, which are the machine interfaces the web service consumes and
-  run without docker. Override install paths via env vars, e.g.:
-  `INSTALL_DIR=/tmp/rw-dev FULL_CONFIG_FILE=/tmp/rw-dev/rw-backup-full.env BACKUP_DIR=/tmp/rw-dev/backup bash scripts/rw-backup-full.sh status --json`
-- Run the web service (dev): the venv lives at `$HOME/rw-web-venv` (created by the
-  update script). It refuses to start without `WEB_TOKEN`. Point it at scratch dirs
-  so it does not need the production `/opt/rw-backup-restore` layout:
-  `WEB_TOKEN=devtoken123 RW_INSTALL_DIR=/tmp/rw-dev RW_WEB_DATA=/tmp/rw-dev/web-data RW_FLEET_FILE=/tmp/rw-dev/fleet.json RW_WEB_HOST=127.0.0.1 RW_WEB_PORT=8787 "$HOME/rw-web-venv/bin/python" web/app.py`
-  Then the UI is at http://127.0.0.1:8787/ (send the token in the `x-token` header or
-  the token field in the UI).
+### Running the web console in dev
 
-### Non-obvious caveats
+Run the app directly with the project venv (do NOT run `install.sh`/`install-web.sh`, which are
+root/systemd installers):
 
-- The e2e test `test/full_e2e_test.sh` is STALE: it was written for v4 and references
-  functions that no longer exist in the current v5.4 script (`verify_custom_archive`,
-  `maybe_encrypt_for_upload`, `primary_s3_upload`, `s3_list_custom_backups`). It fails
-  with rc=127 / unbound-variable partway through. This is a pre-existing test/code
-  mismatch, not an environment problem — do not treat its failure as a broken setup.
-  The parts that reference still-existing functions (backup/restore/s3 upload/retention)
-  do exercise real logic using mock `docker`/`aws` on `PATH` (real `age`/`tar`/`gzip`).
-- `docker`, `awscli`, and a reachable S3/SSH host are only needed for real backups and
-  for the web service to actually reach prod hosts. They are intentionally mocked in the
-  test suite; the CLI's non-docker paths and the web service both run without them.
-- The web service's remote-status calls will show servers as `offline` unless the
-  service SSH key (`$RW_WEB_DATA/id_ed25519`) exists and the target host is reachable —
-  expected in a dev/demo environment.
-- System tools `age`, `shellcheck`, and `python3-venv` are installed at the OS level and
-  persist via the VM snapshot; they are intentionally NOT in the update script (which
-  only refreshes the Python web-service venv).
+```bash
+mkdir -p "$HOME/rw-install"   # RW_INSTALL_DIR must already exist (see gotcha below)
+WEB_TOKEN=devtoken123 RW_WEB_HOST=127.0.0.1 RW_WEB_PORT=8787 \
+  RW_WEB_DATA="$HOME/rw-web-data" RW_INSTALL_DIR="$HOME/rw-install" \
+  ~/.venvs/rw-backup-web/bin/python web/app.py
+```
+
+Non-obvious gotchas:
+- **`WEB_TOKEN` is mandatory** — the app calls `raise SystemExit(...)` on startup if it is unset,
+  so it will refuse to start with no token.
+- **`RW_INSTALL_DIR` must exist before you add/edit any fleet data.** The fleet state file
+  (`$RW_INSTALL_DIR/fleet.json`) is written via a sibling temp file, so writes fail with a
+  `FileNotFoundError` if the directory is missing (endpoints like `POST /api/servers` 500).
+  Create it once (`mkdir -p`) before use.
+- All API endpoints require the token via `?token=...` or an `x-token` header; requests without
+  it return `401`.
+- Server "status" and most actions SSH into real fleet hosts, so they show offline/errors for
+  fake IPs — that is expected in a dev environment with no reachable fleet.
+
+### Tests
+
+No test framework; tests are plain Bash scripts under `test/`, run directly (they mock
+Docker/AWS/Postgres, so no live services are needed):
+
+```bash
+bash test/unit_menu_and_journals.sh   # fast unit checks — all pass
+bash test/full_e2e_test.sh            # full backup→verify→s3 cycle
+```
+
+Note: `test/full_e2e_test.sh` has **pre-existing failures at this commit** — it references
+functions that no longer exist in `scripts/rw-backup-full.sh` (e.g. `verify_custom_archive`,
+`maybe_encrypt_for_upload`), so parts fail with `rc=127` / `unbound variable`. This is a
+test/code mismatch, not an environment problem; do not "fix" it as part of env setup.
+`test/unit_menu_and_journals.sh` passes fully.
+
+### Lint
+
+Shell scripts are ShellCheck-aware (inline `# shellcheck` directives) but there is no committed
+lint config or CI. Lint/syntax-check manually:
+
+```bash
+shellcheck scripts/**/*.sh scripts/*.sh install.sh   # warnings (e.g. SC2034) are expected
+bash -n scripts/rw-backup-full.sh                    # syntax check
+```
+
+### Environment notes
+
+- System tools `shellcheck`, `age`/`age-keygen`, `zstd`, `jq`, and `python3.12-venv` are part of
+  the dev environment (tests need `age`; lint needs `shellcheck`).
+- Python deps for the web console (`fastapi`, `uvicorn`, `pydantic`) live in the venv at
+  `~/.venvs/rw-backup-web`. There is no `requirements.txt`; the startup update script keeps this
+  venv current.

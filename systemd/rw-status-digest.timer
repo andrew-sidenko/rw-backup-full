@@ -1,0 +1,11 @@
+[Unit]
+Description=rw-backup-full: status digest at 09:00 and 21:00
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+OnCalendar=*-*-* 21:00:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
