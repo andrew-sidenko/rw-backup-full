@@ -1,6 +1,6 @@
 # Changelog
 
-## v5.6.2 (2026-07-25)
+## v5.6.4 (2026-07-25)
 
 ### Исправлено
 - **Веб «S3: 0Б / 0 об.»** на хостах без компонента `metrics`: `status --json` брал объёмы только из `rw_exporter.prom`, которого нет → всегда ноль при живом WAL. Теперь fallback — live `s3 ls --summarize` по префиксам `rw_source_id` (panel/custom-bot/wal/config); в JSON есть `size_source: prom|live`.
