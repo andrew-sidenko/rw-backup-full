@@ -1,5 +1,18 @@
 # Changelog
 
+## v5.6.2 (2026-07-25)
+
+### Исправлено
+- **`verify-stack` PITR «зависал» без вывода**: прогресс по шагам, WAL через `s3 sync`, heartbeat recovery, таймауты AWS, `hot_standby=on`.
+- **Ложный FAIL `строк=0<10` после PITR**: после physical restore `n_live_tup` обнулён — перед замером `ANALYZE`; поиск БД с user-tables; `PROFILE_CHECK_QUERIES` в stack.
+- **Веб «S3: 0Б / 0 об.»** без компонента `metrics`: `status --json` делает live `s3m_host_usage` (panel/custom-bot/wal/config), поле `size_source`.
+- **e2e / restore**: починка теста, `trap RETURN` при source, `safe_project_name` без хвоста `_`.
+
+### Добавлено
+- **`FULL_S3_STRICT`**: строгий режим выгрузки в S3.
+- **Сводка 09:00/21:00**: объём, занятый в каждом S3-хранилище.
+- Все `.sh` снова **исполняемые** в git (`chmod +x`).
+
 ## v5.6.1 (2026-07-25)
 
 ### Изменено

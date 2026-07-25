@@ -43,6 +43,9 @@ FULL_SCHEDULE_JITTER_SEC="900"
 FULL_INCLUDE_EXTRA_CONFIGS="true"
 FULL_PANEL_EXTERNAL_S3_ENABLED="true"
 FULL_CUSTOM_EXTERNAL_S3_ENABLED="true"
+# Строгий режим выгрузки: задача неуспешна (+алерт), если копия ушла НЕ во все
+# настроенные S3-хранилища категории. По умолчанию выключен (успех при ≥1).
+FULL_S3_STRICT="false"
 FULL_NOTIFY_EACH_EXTERNAL_S3_UPLOAD="true"
 FULL_TELEGRAM_IMPORT_FROM_ORIGINAL="true"
 FULL_EXTERNAL_S3_IMPORT_FROM_ORIGINAL="false"
@@ -155,7 +158,9 @@ truthy() {
 }
 
 safe_project_name() {
-  echo "$1" | tr -c 'A-Za-z0-9_.-' '_'
+  # printf, а не echo: echo добавляет \n, который tr превращает в '_' —
+  # получалось лишнее подчёркивание в конце имени (custom_bot_name__timestamp).
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
 }
 
 full_s3_prefix_normalized() {
@@ -839,6 +844,18 @@ select_restore_archive() {
 }
 
 restore_custom_archive() {
+  # Обёртка: временный каталог чистим ПОСЛЕ возврата рабочей функции.
+  # trap ... RETURN здесь применять нельзя: при source (тесты/интеграции) он
+  # срабатывает и на возврат из вложенного `source PROFILE.env`, снося tmp
+  # прямо посреди восстановления (известная проблема v3, ср. wal-lib.sh).
+  RW_RESTORE_TMP_ROOT=""
+  local __rc=0
+  _restore_custom_archive_impl "$@" || __rc=$?
+  [[ -n "${RW_RESTORE_TMP_ROOT:-}" ]] && rm -rf "$RW_RESTORE_TMP_ROOT"
+  return "$__rc"
+}
+
+_restore_custom_archive_impl() {
   local archive="$1"
   local assume_yes="${2:-no}"
 
@@ -847,18 +864,14 @@ restore_custom_archive() {
     return 1
   }
 
-  local restore_ts="$(date +%Y%m%d_%H%M%S)"
+  # _$$ в имени — чтобы параллельные/повторные запуски не делили один tmp.
+  local restore_ts="$(date +%Y%m%d_%H%M%S)_$$"
   local tmp_root="/tmp/rw-custom-restore-${restore_ts}"
+  RW_RESTORE_TMP_ROOT="$tmp_root"
   local extract_dir="${tmp_root}/outer"
   local project_extract_dir="${tmp_root}/project"
 
   mkdir -p "$extract_dir" "$project_extract_dir"
-
-  cleanup_restore_tmp() {
-    rm -rf "$tmp_root"
-  }
-
-  trap cleanup_restore_tmp RETURN
 
   msg INFO "Распаковываю архив: ${archive}"
 
@@ -1291,6 +1304,7 @@ show_config_summary() {
   echo "FULL_TIMER_TIMES:                   ${FULL_TIMER_TIMES:-(интервал)}"
   echo "FULL_TIMER_INTERVAL_HOURS:          ${FULL_TIMER_INTERVAL_HOURS}"
   echo "FULL_SCHEDULE_JITTER_SEC:           ${FULL_SCHEDULE_JITTER_SEC:-900}"
+  echo "FULL_S3_STRICT:                     ${FULL_S3_STRICT:-false}"
   echo "FULL_LOCAL_RETENTION_DAYS:          ${FULL_LOCAL_RETENTION_DAYS}"
   echo "FULL_EXTERNAL_S3_RETENTION_DAYS:    ${FULL_EXTERNAL_S3_RETENTION_DAYS}"
   echo
@@ -1399,17 +1413,18 @@ status_json() {
   [[ -n "$panel_last" ]] && panel_ts="$(stat -c %Y "$panel_last" 2>/dev/null || echo 0)"
   custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ' || true)"
 
-  # S3-объёмы/доступность и число ошибок берём из ЛОКАЛЬНЫХ метрик
-  # (rw_exporter.prom пишет metrics-exporter), чтобы status --json не ходил в сеть.
+  # S3-объёмы: сначала из rw_exporter.prom (если крутится metrics), иначе
+  # live-листинг. Без fallback UI врал «0Б / 0 об.» на хостах без компонента
+  # metrics (типичный prod: panel-backup wal config-track).
   local _mdir="${WAL_METRICS_DIR:-/var/lib/node_exporter/textfile_collector}"
-  declare -A _s3b _s3o _s3r
+  declare -A _s3b _s3o _s3r _s3seen
   if [[ -f "${_mdir}/rw_exporter.prom" ]]; then
     local _l _bk _v
     while IFS= read -r _l; do
       case "$_l" in
-        'rw_s3_category_bytes{'*)   _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3b["$_bk"]=$(( ${_s3b["$_bk"]:-0} + _v )) ;;
-        'rw_s3_category_objects{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3o["$_bk"]=$(( ${_s3o["$_bk"]:-0} + _v )) ;;
-        'rw_s3_backend_reachable{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; _s3r["$_bk"]="$_v" ;;
+        'rw_s3_category_bytes{'*)   _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3b["$_bk"]=$(( ${_s3b["$_bk"]:-0} + _v )); _s3seen["$_bk"]=1 ;;
+        'rw_s3_category_objects{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3o["$_bk"]=$(( ${_s3o["$_bk"]:-0} + _v )); _s3seen["$_bk"]=1 ;;
+        'rw_s3_backend_reachable{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; _s3r["$_bk"]="$_v"; _s3seen["$_bk"]=1 ;;
       esac
     done < "${_mdir}/rw_exporter.prom"
   fi
@@ -1430,17 +1445,31 @@ status_json() {
   printf '"disk_free_bytes":%s,' "$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ')"
   printf '"local_backup_bytes":%s,' "$lb_bytes"
   printf '"errors":%s,' "$err_cnt"
-  # S3-бэкенды (с объёмом/доступностью из локальных метрик)
+  # S3-бэкенды (объём из метрик или live s3m_host_usage)
   printf '"s3_backends":['
-  local n first=1 _reach
+  local n first=1 _reach _bytes _objs _rv _src_note
   for n in $(s3m_backends 2>/dev/null); do
     (( first )) || printf ','
     first=0
-    _reach="$([[ "${_s3r[$n]:-1}" == "0" ]] && echo false || echo true)"
+    _bytes=0; _objs=0; _reach=true; _src_note="none"
     if s3m_load "$n" 2>/dev/null; then
-      printf '{"name":"%s","enabled":%s,"bucket":"%s","bytes":%s,"objects":%s,"reachable":%s}' "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
+      if [[ -n "${_s3seen[$n]:-}" ]]; then
+        _bytes="${_s3b[$n]:-0}"
+        _objs="${_s3o[$n]:-0}"
+        _reach="$([[ "${_s3r[$n]:-1}" == "0" ]] && echo false || echo true)"
+        _src_note="prom"
+      else
+        # Нет строк по этому бэкенду в prom (metrics выключен / ещё не бегал).
+        read -r _bytes _objs _rv < <(s3m_host_usage 2>/dev/null || echo "0 0 0")
+        [[ "$_bytes" =~ ^[0-9]+$ ]] || _bytes=0
+        [[ "$_objs" =~ ^[0-9]+$ ]] || _objs=0
+        _reach="$([[ "${_rv:-0}" == "1" ]] && echo true || echo false)"
+        _src_note="live"
+      fi
+      printf '{"name":"%s","enabled":%s,"bucket":"%s","bytes":%s,"objects":%s,"reachable":%s,"size_source":"%s"}' \
+        "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET" "$_bytes" "$_objs" "$_reach" "$_src_note"
     else
-      printf '{"name":"%s","enabled":false,"bucket":"","bytes":%s,"objects":%s,"reachable":%s}' "$n" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
+      printf '{"name":"%s","enabled":false,"bucket":"","bytes":0,"objects":0,"reachable":false,"size_source":"none"}' "$n"
     fi
   done
   printf '],'
