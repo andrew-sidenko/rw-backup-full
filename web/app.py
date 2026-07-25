@@ -635,7 +635,8 @@ async function loadStatus(sid){
     const s3 = (st.s3_backends||[]).map(x=>{
       const warn = x.reachable===false?' <span class="bad">⚠ недоступен</span>':'';
       const off = x.enabled?'':'(off)';
-      return `&nbsp;&nbsp;${x.name}${off}: <b>${fmtB(x.bytes)}</b> / ${x.objects||0} об.${warn}`;
+      const src = x.size_source && x.size_source!=='prom' ? ` <span class="mut">[${x.size_source}]</span>` : '';
+      return `&nbsp;&nbsp;${x.name}${off}: <b>${fmtB(x.bytes)}</b> / ${x.objects||0} об.${warn}${src}`;
     }).join('<br>') || '&nbsp;&nbsp;—';
     // Подпись инстанса в парке: <id карточки>-<имя инстанса>.
     // Само имя в S3/CLI остаётся каноническим (panel, bot_…), без переименования.

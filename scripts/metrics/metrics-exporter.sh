@@ -116,14 +116,18 @@ if truthy "${FULL_METRICS_S3_SIZES:-true}" && command -v aws >/dev/null 2>&1; th
     s3m_load "$n" 2>/dev/null || continue
     truthy "$B_ENABLED" || continue
     reachable=0
-    for pair in "panel:${B_PREFIX}/panel/${HOST}/" "custom-bot:${B_PREFIX}/custom-bot/${HOST}/" "wal:${B_PREFIX}/wal/${HOST}/"; do
-      cat="${pair%%:*}"; pfx="${pair#*:}"
-      s3m_category_enabled "$cat" || continue
+    # Префиксы через s3m_host_prefixes: rw_source_id (как при upload) + config/.
+    # Раньше тут был HOST=wal_hostname в путях — при расхождении с source
+    # листинг «успешно» возвращал 0 объектов, и веб/дашборд врали 0Б.
+    cat=""; pfx=""; summ=""; objs=""; bytes=""
+    while IFS=$'\t' read -r cat pfx; do
+      [[ -n "$pfx" ]] || continue
       # Тот же риск, что и с find/du выше: если aws упадёт (сеть, ключи),
       # tail всё равно завершится успешно, но под pipefail неудача aws
       # убьёт весь экспортер — один недоступный бэкенд остановил бы сбор
       # метрик по ВСЕМ бэкендам и категориям. `|| true` — намеренно.
-      summ="$(s3m_aws s3 ls "s3://${B_BUCKET}/${pfx}" --recursive --summarize 2>/dev/null | tail -n2 || true)"
+      summ="$(s3m_aws --cli-connect-timeout 10 --cli-read-timeout 60 \
+        s3 ls "s3://${B_BUCKET}/${pfx}" --recursive --summarize 2>/dev/null | tail -n2 || true)"
       if [[ -n "$summ" ]]; then
         reachable=1
         objs="$(grep -oE 'Total Objects: [0-9]+' <<<"$summ" | grep -oE '[0-9]+' || echo 0)"
@@ -131,7 +135,7 @@ if truthy "${FULL_METRICS_S3_SIZES:-true}" && command -v aws >/dev/null 2>&1; th
         emit "rw_s3_category_bytes{backend=\"${n}\",category=\"${cat}\"} ${bytes:-0}"
         emit "rw_s3_category_objects{backend=\"${n}\",category=\"${cat}\"} ${objs:-0}"
       fi
-    done
+    done < <(s3m_host_prefixes)
     emit "rw_s3_backend_reachable{backend=\"${n}\"} ${reachable}"
   done
 fi

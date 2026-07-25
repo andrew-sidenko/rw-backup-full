@@ -106,6 +106,50 @@ s3m_logical_key() { printf '%s/%s/%s/%s' "$B_PREFIX" "$1" "$(rw_source_id)" "$2"
 # База WAL-слоя: <prefix>/wal/<host>/<instance>
 s3m_wal_base()    { printf '%s/wal/%s/%s' "$B_PREFIX" "$(rw_source_id)" "$1"; }
 
+# Префиксы ЭТОГО хоста в уже загруженном бэкенде (B_*), по одному на строку:
+#   category<TAB>prefix/
+# Использует rw_source_id() — тот же сегмент, что и при upload (не hostname,
+# если задан RW_SOURCE_ID). config/ — трекер каталогов (не s3m_category_enabled).
+s3m_host_prefixes() {
+  local src; src="$(rw_source_id)"
+  local cat pfx
+  for pair in \
+      "panel:${B_PREFIX}/panel/${src}/" \
+      "custom-bot:${B_PREFIX}/custom-bot/${src}/" \
+      "wal:${B_PREFIX}/wal/${src}/" \
+      "config:${B_PREFIX}/config/${src}/"; do
+    cat="${pair%%:*}"; pfx="${pair#*:}"
+    if [[ "$cat" != "config" ]]; then
+      s3m_category_enabled "$cat" || continue
+    fi
+    printf '%s\t%s\n' "$cat" "$pfx"
+  done
+}
+
+# Суммарный объём объектов этого хоста в текущем бэкенде (B_*).
+# Печатает в stdout: "<bytes> <objects> <reachable:0|1>".
+# Нужен веб-статусу, когда компонент metrics выключен и rw_exporter.prom
+# не содержит rw_s3_category_* (иначе UI врёт «0Б / 0 об.»).
+s3m_host_usage() {
+  local bytes=0 objs=0 reachable=0 summ b o cat pfx
+  if ! command -v aws >/dev/null 2>&1; then
+    printf '0 0 0'
+    return 1
+  fi
+  while IFS=$'\t' read -r cat pfx; do
+    [[ -n "$pfx" ]] || continue
+    summ="$(s3m_aws --cli-connect-timeout 10 --cli-read-timeout 60 \
+      s3 ls "s3://${B_BUCKET}/${pfx}" --recursive --summarize 2>/dev/null | tail -n2 || true)"
+    [[ -n "$summ" ]] || continue
+    reachable=1
+    o="$(grep -oE 'Total Objects: [0-9]+' <<<"$summ" | grep -oE '[0-9]+' || echo 0)"
+    b="$(grep -oE 'Total Size: [0-9]+' <<<"$summ" | grep -oE '[0-9]+' || echo 0)"
+    objs=$((objs + ${o:-0}))
+    bytes=$((bytes + ${b:-0}))
+  done < <(s3m_host_prefixes)
+  printf '%s %s %s' "$bytes" "$objs" "$reachable"
+}
+
 # Имя текстового журнала рядом с архивом: foo.tar.gz -> foo.txt, foo.age -> foo.txt
 s3m_journal_name() {
   local base="$1"

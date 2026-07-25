@@ -1413,17 +1413,18 @@ status_json() {
   [[ -n "$panel_last" ]] && panel_ts="$(stat -c %Y "$panel_last" 2>/dev/null || echo 0)"
   custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ' || true)"
 
-  # S3-объёмы/доступность и число ошибок берём из ЛОКАЛЬНЫХ метрик
-  # (rw_exporter.prom пишет metrics-exporter), чтобы status --json не ходил в сеть.
+  # S3-объёмы: сначала из rw_exporter.prom (если крутится metrics), иначе
+  # live-листинг. Без fallback UI врал «0Б / 0 об.» на хостах без компонента
+  # metrics (типичный prod: panel-backup wal config-track).
   local _mdir="${WAL_METRICS_DIR:-/var/lib/node_exporter/textfile_collector}"
-  declare -A _s3b _s3o _s3r
+  declare -A _s3b _s3o _s3r _s3seen
   if [[ -f "${_mdir}/rw_exporter.prom" ]]; then
     local _l _bk _v
     while IFS= read -r _l; do
       case "$_l" in
-        'rw_s3_category_bytes{'*)   _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3b["$_bk"]=$(( ${_s3b["$_bk"]:-0} + _v )) ;;
-        'rw_s3_category_objects{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3o["$_bk"]=$(( ${_s3o["$_bk"]:-0} + _v )) ;;
-        'rw_s3_backend_reachable{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; _s3r["$_bk"]="$_v" ;;
+        'rw_s3_category_bytes{'*)   _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3b["$_bk"]=$(( ${_s3b["$_bk"]:-0} + _v )); _s3seen["$_bk"]=1 ;;
+        'rw_s3_category_objects{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3o["$_bk"]=$(( ${_s3o["$_bk"]:-0} + _v )); _s3seen["$_bk"]=1 ;;
+        'rw_s3_backend_reachable{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; _s3r["$_bk"]="$_v"; _s3seen["$_bk"]=1 ;;
       esac
     done < "${_mdir}/rw_exporter.prom"
   fi
@@ -1444,17 +1445,31 @@ status_json() {
   printf '"disk_free_bytes":%s,' "$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ')"
   printf '"local_backup_bytes":%s,' "$lb_bytes"
   printf '"errors":%s,' "$err_cnt"
-  # S3-бэкенды (с объёмом/доступностью из локальных метрик)
+  # S3-бэкенды (объём из метрик или live s3m_host_usage)
   printf '"s3_backends":['
-  local n first=1 _reach
+  local n first=1 _reach _bytes _objs _rv _src_note
   for n in $(s3m_backends 2>/dev/null); do
     (( first )) || printf ','
     first=0
-    _reach="$([[ "${_s3r[$n]:-1}" == "0" ]] && echo false || echo true)"
+    _bytes=0; _objs=0; _reach=true; _src_note="none"
     if s3m_load "$n" 2>/dev/null; then
-      printf '{"name":"%s","enabled":%s,"bucket":"%s","bytes":%s,"objects":%s,"reachable":%s}' "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
+      if [[ -n "${_s3seen[$n]:-}" ]]; then
+        _bytes="${_s3b[$n]:-0}"
+        _objs="${_s3o[$n]:-0}"
+        _reach="$([[ "${_s3r[$n]:-1}" == "0" ]] && echo false || echo true)"
+        _src_note="prom"
+      else
+        # Нет строк по этому бэкенду в prom (metrics выключен / ещё не бегал).
+        read -r _bytes _objs _rv < <(s3m_host_usage 2>/dev/null || echo "0 0 0")
+        [[ "$_bytes" =~ ^[0-9]+$ ]] || _bytes=0
+        [[ "$_objs" =~ ^[0-9]+$ ]] || _objs=0
+        _reach="$([[ "${_rv:-0}" == "1" ]] && echo true || echo false)"
+        _src_note="live"
+      fi
+      printf '{"name":"%s","enabled":%s,"bucket":"%s","bytes":%s,"objects":%s,"reachable":%s,"size_source":"%s"}' \
+        "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET" "$_bytes" "$_objs" "$_reach" "$_src_note"
     else
-      printf '{"name":"%s","enabled":false,"bucket":"","bytes":%s,"objects":%s,"reachable":%s}' "$n" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
+      printf '{"name":"%s","enabled":false,"bucket":"","bytes":0,"objects":0,"reachable":false,"size_source":"none"}' "$n"
     fi
   done
   printf '],'
