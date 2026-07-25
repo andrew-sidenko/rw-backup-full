@@ -1,9 +1,9 @@
 # Changelog
 
-## v5.5.2 (2026-07-24)
+## v5.5.2 (2026-07-25)
 
 ### Исправлено
-- **`verify-stack` PITR «зависал» без вывода** после `поднимаю БД из базового бэкапа + WAL...`: скачивание basebackup, сотни отдельных `aws s3 cp` для WAL, pull образа и ожидание recovery шли молча (до ~10 мин). Теперь каждый этап пишет прогресс; WAL берётся одним `s3 sync` + локальная распаковка; heartbeat recovery каждые 30с с хвостом логов; таймауты AWS CLI; `hot_standby=on` как в `pitr-restore`.
+- **Ложный FAIL `строк=0<10` после PITR/base в verify-stack/fleet**: после physical restore PostgreSQL сбрасывает `pg_stat_*`, и `sum(n_live_tup)` давал 0 при живых данных (симптом: `таблиц=36, строк ≈ 0`, при этом `public.users` непустой). Перед замером выполняется `ANALYZE`; в stack целевая БД ищется по user-tables; подключены `PROFILE_CHECK_QUERIES` профиля.
 
 ## v5.5.1 (2026-07-24)
 

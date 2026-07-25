@@ -369,9 +369,12 @@ check_pitr_instance() { # <src> <backend_json> <instance> <kind> <pguser> <pgdb>
   fi
 
   # ---- Профиль типа (те же проверки, что в PROFILE_* verify-profiles.d) ----
+  # После basebackup+WAL pg_stat_* обнулены — без ANALYZE sum(n_live_tup)=0
+  # при живых данных (ложный FAIL «строк=0»).
   load_profile "$kind"
   local prof_fail="" tbl cnt db="$pgdb"
   local tables rows
+  docker exec "$c" psql -q -U "$pguser" -d "$db" -c 'ANALYZE;' >/dev/null 2>&1 || true
   tables="$(docker exec "$c" psql -qtAX -U "$pguser" -d "$db" -c "SELECT count(*) FROM pg_stat_user_tables" 2>/dev/null || echo 0)"
   rows="$(docker exec "$c" psql -qtAX -U "$pguser" -d "$db" -c "SELECT coalesce(sum(n_live_tup),0)::bigint FROM pg_stat_user_tables" 2>/dev/null || echo 0)"
   (( ${tables:-0} < ${PROFILE_MIN_TABLES:-1} )) && prof_fail+=" таблиц=${tables}<${PROFILE_MIN_TABLES}"
