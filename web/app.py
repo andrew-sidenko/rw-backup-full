@@ -221,6 +221,34 @@ def api_status(sid: str):
                             status_code=502)
 
 
+@app.get("/api/servers/{sid}/journals", dependencies=[Depends(auth)])
+def api_journals(sid: str):
+    """Список .txt-журналов в S3 сервера (по SSH: rw-backup-full journals)."""
+    srv = get_server(sid)
+    rc, out, err = ssh_run(srv, ["rw-backup-full", "journals"])
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": err.strip() or f"rc={rc}"}, status_code=502)
+    try:
+        return {"ok": True, "journals": json.loads(out.strip().splitlines()[-1])}
+    except Exception:
+        return JSONResponse({"ok": False, "error": "невалидный JSON от сервера", "raw": out[-2000:]},
+                            status_code=502)
+
+
+@app.get("/api/servers/{sid}/journal", dependencies=[Depends(auth)])
+def api_journal(sid: str, backend: str, key: str):
+    """Содержимое одного журнала из S3. Ключ валидируется и здесь, и в CLI."""
+    if not re.match(r"^[a-zA-Z0-9_-]+$", backend):
+        raise HTTPException(400, "bad backend")
+    if not key.endswith(".txt") or ".." in key or "/" not in key:
+        raise HTTPException(400, "bad key")
+    srv = get_server(sid)
+    rc, out, err = ssh_run(srv, ["rw-backup-full", "journal-show", backend, key])
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": err.strip() or f"rc={rc}"}, status_code=502)
+    return {"ok": True, "content": out[-20000:]}
+
+
 @app.post("/api/servers/{sid}/action/{action}", dependencies=[Depends(auth)])
 def api_action(sid: str, action: str):
     if action not in ALLOWED_ACTIONS:
@@ -509,6 +537,7 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 <button onclick="addDlg.showModal()">+ Добавить сервер</button>
 </div></div>
 <div class="card"><b>Песочница (этот сервер):</b> <span id="sandbox" class="mut">…</span></div>
+<div class="card"><b>Парк (сводно):</b> <span id="fleet" class="mut">…</span></div>
 <div class="card"><b>История проверок:</b>
 <button onclick="loadHistory()">⟳</button>
 <div id="history" class="mut">…</div></div>
@@ -537,6 +566,11 @@ dialog{background:var(--card);color:var(--tx);border:1px solid #35434f;border-ra
 <pre id="histBody" style="max-height:420px"></pre>
 <div class="row"><button onclick="histDlg.close()">Закрыть</button></div></dialog>
 
+<dialog id="jrnDlg"><h3 id="jrnTitle">Журналы</h3>
+<div id="jrnList" class="mut" style="max-height:200px;overflow:auto"></div>
+<pre id="jrnBody" style="max-height:340px">выберите журнал…</pre>
+<div class="row"><button onclick="jrnDlg.close()">Закрыть</button></div></dialog>
+
 <script>
 let TOK = localStorage.getItem('rwtok')||''; if(TOK) document.getElementById('tok').value = TOK;
 let curSid = null;
@@ -564,6 +598,7 @@ async function refreshAll(){
       <button onclick="act('${s.id}','wal-status')">WAL-статус</button>
       <button onclick="act('${s.id}','verify-local')">Verify</button>
       <button onclick="showServerVerify('${s.id}')">История проверок</button>
+      <button onclick="openJournals('${s.id}')">Журналы</button>
       <button onclick="openCfg('${s.id}')">⚙ Конфиги</button>
       <button onclick="delServer('${s.id}')" class="bad">✕</button>
       </div>`;
@@ -573,21 +608,61 @@ async function refreshAll(){
   loadSandbox();
   loadHistory();
 }
+function fmtB(n){ if(n==null) return '—'; const u=['Б','КБ','МБ','ГБ','ТБ']; let i=0; n=+n; while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(i?1:0)+u[i]; }
+function ago(ts,now){ if(!ts) return 'нет'; const s=now-ts; if(s<3600) return Math.round(s/60)+'м назад'; if(s<86400) return Math.round(s/3600)+'ч назад'; return Math.round(s/86400)+'д назад'; }
+window._fleet = {};
+function renderFleetTotals(){
+  const v=Object.values(window._fleet); const el=$('fleet'); if(!el||!v.length) return;
+  const online=v.filter(x=>x.online).length;
+  const errs=v.reduce((a,x)=>a+(x.errors||0),0);
+  const s3=v.reduce((a,x)=>a+(x.s3bytes||0),0);
+  el.innerHTML = `серверов online: <b class="${online===v.length?'ok':'bad'}">${online}/${v.length}</b>`+
+    ` · суммарно в S3: <b>${fmtB(s3)}</b>`+
+    (errs?` · <b class="bad">ошибок: ${errs}</b>`:` · <span class="ok">ошибок нет</span>`);
+}
 async function loadStatus(sid){
   try{
     const r = await api('GET',`/api/servers/${sid}/status`);
     const b = $('st-'+sid), i = $('info-'+sid);
-    if(!r.ok){ b.textContent='offline'; b.className='badge bad'; i.textContent=r.error||''; return; }
-    const st = r.status;
+    if(!r.ok){ b.textContent='offline'; b.className='badge bad'; i.textContent=r.error||''; window._fleet[sid]={online:false}; renderFleetTotals(); return; }
+    const st = r.status; const now = st.time||Math.floor(Date.now()/1000);
     b.textContent='online'; b.className='badge ok';
-    const age = st.panel.last_backup_ts? Math.round((st.time-st.panel.last_backup_ts)/3600)+'ч назад':'нет';
-    const wal = (st.wal_instances||[]).map(w=>`${w.name}:${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups}`).join('  ')||'—';
+    const page = ago(st.panel.last_backup_ts, now);
     const comps = st.components || '—';
-    const disk = st.disk_free_bytes!=null ? (st.disk_free_bytes/2**30).toFixed(1)+' ГБ своб.' : '—';
-    i.innerHTML = `компоненты: <code>${comps}</code><br>
-      панель: ${st.panel.detected?'да':'нет'}, бэкап: ${age} · ботов-архивов: ${st.custom_archives}
-      · диск: ${disk}<br>S3: ${(st.s3_backends||[]).map(b=>b.name+(b.enabled?'':'(off)')).join(', ')||'—'}<br>WAL: ${wal}`;
+    const disk = st.disk_free_bytes!=null ? fmtB(st.disk_free_bytes)+' своб.' : '—';
+    const locsz = st.local_backup_bytes!=null ? fmtB(st.local_backup_bytes) : '—';
+    const errs = st.errors||0;
+    const s3 = (st.s3_backends||[]).map(x=>{
+      const warn = x.reachable===false?' <span class="bad">⚠ недоступен</span>':'';
+      const off = x.enabled?'':'(off)';
+      return `&nbsp;&nbsp;${x.name}${off}: <b>${fmtB(x.bytes)}</b> / ${x.objects||0} об.${warn}`;
+    }).join('<br>') || '&nbsp;&nbsp;—';
+    // Подпись инстанса в парке: <id карточки>-<имя инстанса>.
+    // Само имя в S3/CLI остаётся каноническим (panel, bot_…), без переименования.
+    const wal = (st.wal_instances||[]).map(w=>
+      `&nbsp;&nbsp;<b>${sid}-${w.name}</b>: ${w.running?'▲':'▼'} spool=${w.spool} bb=${w.basebackups} · база ${ago(w.last_basebackup_ts,now)} · WAL ${ago(w.last_wal_ts,now)}`
+    ).join('<br>') || '&nbsp;&nbsp;—';
+    i.innerHTML = `компоненты: <code>${comps}</code>`+
+      (errs?` · <b class="bad">ошибок: ${errs}</b>`:` · <span class="ok">ошибок нет</span>`)+`<br>`+
+      `панель: ${st.panel.detected?'да':'нет'}, бэкап: ${page} · ботов-архивов: ${st.custom_archives}<br>`+
+      `место: занято локально <b>${locsz}</b> · диск ${disk}<br>`+
+      `S3-хранилища:<br>${s3}<br>`+
+      `WAL <span class="mut">(подписи: id_карточки-инстанс)</span>:<br>${wal}`;
+    const s3sum = (st.s3_backends||[]).reduce((a,x)=>a+(+x.bytes||0),0);
+    window._fleet[sid]={online:true, errors:errs, s3bytes:s3sum};
+    renderFleetTotals();
+    loadServerVerdict(sid);
   }catch(e){ if(e!=='auth'){ $('st-'+sid).textContent='err'; $('st-'+sid).className='badge bad'; } }
+}
+async function loadServerVerdict(sid){
+  try{
+    const r = await api('GET',`/api/servers/${sid}/verify?limit=1`);
+    const i = $('info-'+sid); if(!i||!r.history||!r.history.length) return;
+    const h=r.history[0];
+    const ok = h.type==='fleet' ? (h.passed===h.total) : h.ok;
+    const when = h.ts? new Date(h.ts*1000).toLocaleString():'';
+    i.innerHTML += `<br>последняя проверка: <b class="${ok?'ok':'bad'}">${ok?'ПРОЙДЕНА':'ОШИБКА'}</b> <span class="mut">${when}</span>`;
+  }catch(e){}
 }
 async function loadSandbox(){
   const r = await api('GET','/api/sandbox/summary');
@@ -611,7 +686,8 @@ function fmtHist(h){
       `</div>`;
   }
   const cls = h.ok?'ok':'bad';
-  return `<div><span class="${cls}">stack</span> ${when} — <b>${h.project||'?'}</b> src=${h.source||'?'} <span class="${cls}">${h.ok?'ok':'fail'}</span> <span class="mut">${h.detail||''}</span></div>`;
+  const label = (h.fleet_id || h.source || '?') + '-' + (h.project || '?');
+  return `<div><span class="${cls}">stack</span> ${when} — <b>${label}</b> <span class="mut">проект=${h.project||'?'} src=${h.source||'?'}</span> <span class="${cls}">${h.ok?'ok':'fail'}</span> <span class="mut">${h.detail||''}</span></div>`;
 }
 async function loadHistory(){
   try{
@@ -632,8 +708,30 @@ async function showServerVerify(sid){
       return new Date((h.ts||0)*1000).toLocaleString()+' fleet '+h.passed+'/'+h.total+'\\n'+
         (h.results||[]).map(x=>'  '+(x.ok?'OK':'FAIL')+' '+(x.detail||'')).join('\\n');
     }
-    return new Date((h.ts||0)*1000).toLocaleString()+' stack '+(h.ok?'OK':'FAIL')+' '+(h.project||'')+' '+(h.detail||'');
+    const label = (h.fleet_id || sid) + '-' + (h.project || '?');
+    return new Date((h.ts||0)*1000).toLocaleString()+' stack '+(h.ok?'OK':'FAIL')+' '+label+' '+(h.detail||'');
   }).join('\\n\\n');
+}
+async function openJournals(sid){
+  $('jrnTitle').textContent = 'Журналы (S3): '+sid;
+  $('jrnList').textContent = 'загрузка списка…';
+  $('jrnBody').textContent = 'выберите журнал…';
+  jrnDlg.showModal();
+  const r = await api('GET',`/api/servers/${sid}/journals`);
+  if(!r.ok){ $('jrnList').textContent = 'ошибка: '+(r.error||''); return; }
+  const js = r.journals||[];
+  if(!js.length){ $('jrnList').textContent = 'журналов в S3 не найдено'; return; }
+  $('jrnList').innerHTML = js.map(j=>{
+    const kb = j.size? (j.size/1024).toFixed(1)+'КБ' : '';
+    return `<div><button onclick="showJournal('${sid}','${j.backend}','${encodeURIComponent(j.key)}')">${j.name}</button> `+
+      `<span class="mut">[${j.category}] ${j.backend} · ${j.date} · ${kb}</span></div>`;
+  }).join('');
+}
+async function showJournal(sid,backend,keyEnc){
+  const key = decodeURIComponent(keyEnc);
+  $('jrnBody').textContent = 'загрузка…';
+  const r = await api('GET',`/api/servers/${sid}/journal?backend=${encodeURIComponent(backend)}&key=${encodeURIComponent(key)}`);
+  $('jrnBody').textContent = r.ok ? (r.content||'(пусто)') : ('ошибка: '+(r.error||''));
 }
 async function act(sid,a){
   log(`▶ ${sid}: ${a}…`);
