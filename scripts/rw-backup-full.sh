@@ -1399,29 +1399,55 @@ status_json() {
   [[ -n "$panel_last" ]] && panel_ts="$(stat -c %Y "$panel_last" 2>/dev/null || echo 0)"
   custom_cnt="$(find "$BACKUP_DIR" -maxdepth 1 -name 'custom_bot_*.tar.gz' 2>/dev/null | wc -l | tr -d ' ' || true)"
 
+  # S3-объёмы/доступность и число ошибок берём из ЛОКАЛЬНЫХ метрик
+  # (rw_exporter.prom пишет metrics-exporter), чтобы status --json не ходил в сеть.
+  local _mdir="${WAL_METRICS_DIR:-/var/lib/node_exporter/textfile_collector}"
+  declare -A _s3b _s3o _s3r
+  if [[ -f "${_mdir}/rw_exporter.prom" ]]; then
+    local _l _bk _v
+    while IFS= read -r _l; do
+      case "$_l" in
+        'rw_s3_category_bytes{'*)   _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3b["$_bk"]=$(( ${_s3b["$_bk"]:-0} + _v )) ;;
+        'rw_s3_category_objects{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; [[ "$_v" =~ ^[0-9]+$ ]] && _s3o["$_bk"]=$(( ${_s3o["$_bk"]:-0} + _v )) ;;
+        'rw_s3_backend_reachable{'*) _bk="${_l#*backend=\"}"; _bk="${_bk%%\"*}"; _v="${_l##* }"; _s3r["$_bk"]="$_v" ;;
+      esac
+    done < "${_mdir}/rw_exporter.prom"
+  fi
+  local err_cnt=0
+  [[ -d "$_mdir" ]] && err_cnt="$(grep -hE 'rw_.*_last_result 0$|rw_fleet_verify_ok\{.*\} 0$' "$_mdir"/rw_*.prom 2>/dev/null | wc -l | tr -d ' ' || echo 0)"
+  [[ "$err_cnt" =~ ^[0-9]+$ ]] || err_cnt=0
+  local wr="${WAL_ROOT:-/var/lib/rw-wal}"
+  # Занятый локально объём (каталог бэкапов + WAL).
+  local lb_bytes
+  lb_bytes="$(du -sb "$BACKUP_DIR" "$wr" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  [[ "$lb_bytes" =~ ^[0-9]+$ ]] || lb_bytes=0
+
   printf '{'
   printf '"host":"%s","version":"5.5.0","time":%s,' "$host" "$ts"
   printf '"components":"%s",' "${FULL_COMPONENTS:-panel-backup custom-backup wal config-track metrics}"
   printf '"panel":{"detected":%s,"last_backup":"%s","last_backup_ts":%s},'     "$( (command -v docker >/dev/null 2>&1 && local_panel_detected) && echo true || echo false)"     "$(basename "${panel_last:-}" 2>/dev/null)" "$panel_ts"
   printf '"custom_archives":%s,' "$custom_cnt"
   printf '"disk_free_bytes":%s,' "$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ')"
-  # S3-бэкенды
+  printf '"local_backup_bytes":%s,' "$lb_bytes"
+  printf '"errors":%s,' "$err_cnt"
+  # S3-бэкенды (с объёмом/доступностью из локальных метрик)
   printf '"s3_backends":['
-  local n first=1
+  local n first=1 _reach
   for n in $(s3m_backends 2>/dev/null); do
     (( first )) || printf ','
     first=0
+    _reach="$([[ "${_s3r[$n]:-1}" == "0" ]] && echo false || echo true)"
     if s3m_load "$n" 2>/dev/null; then
-      printf '{"name":"%s","enabled":%s,"bucket":"%s"}' "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET"
+      printf '{"name":"%s","enabled":%s,"bucket":"%s","bytes":%s,"objects":%s,"reachable":%s}' "$n" "$(truthy "$B_ENABLED" && echo true || echo false)" "$B_BUCKET" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
     else
-      printf '{"name":"%s","enabled":false,"bucket":""}' "$n"
+      printf '{"name":"%s","enabled":false,"bucket":"","bytes":%s,"objects":%s,"reachable":%s}' "$n" "${_s3b[$n]:-0}" "${_s3o[$n]:-0}" "$_reach"
     fi
   done
   printf '],'
   # WAL-инстансы
   printf '"wal_instances":['
   first=1
-  local f name c spool bb bbts wr="/var/lib/rw-wal"
+  local f name c spool bb bbts walts
   if [[ -d "$INSTANCES_DIR" ]]; then
     for f in "$INSTANCES_DIR"/*.env; do
       [[ -e "$f" ]] || continue
@@ -1434,13 +1460,60 @@ status_json() {
       bb="$(find "${wr}/${name}/basebackup" -maxdepth 1 -name 'base_*.meta' 2>/dev/null | wc -l | tr -d ' ' || true)"
       spool="${spool:-0}"; bb="${bb:-0}"
       bbts="$(cat "${wr}/${name}/state/last_success" 2>/dev/null || echo 0)"
+      # Свежесть WAL: mtime новейшего заархивированного сегмента (для UI —
+      # видно, что поток WAL живой, а не только базовые бэкапы).
+      walts="$(find "${wr}/${name}/archive" -maxdepth 1 -type f -name '0*' -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1 || echo 0)"
+      walts="${walts:-0}"
       (( first )) || printf ','
       first=0
-      printf '{"name":"%s","container":"%s","running":%s,"spool":%s,"basebackups":%s,"last_basebackup_ts":%s,"timer_active":%s}'         "$name" "$c"         "$( (command -v docker >/dev/null 2>&1 && docker ps -q -f "name=^${c}$" 2>/dev/null | grep -q .) && echo true || echo false)"         "$spool" "$bb" "$bbts"         "$(systemctl is-active "rw-wal-ship@${name}.timer" >/dev/null 2>&1 && echo true || echo false)"
+      printf '{"name":"%s","container":"%s","running":%s,"spool":%s,"basebackups":%s,"last_basebackup_ts":%s,"last_wal_ts":%s,"timer_active":%s}'         "$name" "$c"         "$( (command -v docker >/dev/null 2>&1 && docker ps -q -f "name=^${c}$" 2>/dev/null | grep -q .) && echo true || echo false)"         "$spool" "$bb" "$bbts" "$walts"         "$(systemctl is-active "rw-wal-ship@${name}.timer" >/dev/null 2>&1 && echo true || echo false)"
     done
   fi
   printf ']}'
   printf '\n'
+}
+
+# Список .txt-журналов (пишутся рядом с каждым архивом/бэкапом) во ВСЕХ
+# настроенных S3-бэкендах этого сервера. JSON для веб-вьювера. Только stdout.
+journals_list() {
+  local n first=1 line d t size key name cat
+  printf '['
+  for n in $(s3m_backends 2>/dev/null); do
+    s3m_load "$n" 2>/dev/null || continue
+    truthy "$B_ENABLED" || continue
+    while IFS= read -r line; do
+      d="$(awk '{print $1}' <<<"$line")"
+      t="$(awk '{print $2}' <<<"$line")"
+      size="$(awk '{print $3}' <<<"$line")"
+      key="$(awk '{print $4}' <<<"$line")"
+      [[ "$key" == *.txt ]] || continue
+      [[ "$size" =~ ^[0-9]+$ ]] || size=0
+      name="${key##*/}"
+      case "$key" in
+        */wal/*)        cat="basebackup" ;;
+        */panel/*)      cat="panel" ;;
+        */custom-bot/*) cat="custom-bot" ;;
+        *)              cat="other" ;;
+      esac
+      (( first )) || printf ','
+      first=0
+      printf '{"backend":"%s","key":"%s","name":"%s","category":"%s","size":%s,"date":"%s %s"}' \
+        "$n" "$key" "$name" "$cat" "$size" "$d" "$t"
+    done < <(s3m_aws s3 ls "s3://${B_BUCKET}/${B_PREFIX}/" --recursive 2>/dev/null | grep '\.txt$' | sort -r | head -n 60)
+  done
+  printf ']\n'
+}
+
+# Печать содержимого одного журнала из S3. Аргументы: <backend> <key>.
+# Ключ строго валидируется (только .txt, только внутри префикса бэкенда) —
+# веб-вьювер передаёт key из journals_list, но проверяем и здесь.
+journal_show() {
+  local backend="${1:-}" key="${2:-}"
+  [[ "$backend" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "bad backend" >&2; return 1; }
+  [[ "$key" == *.txt && "$key" != *..* && "$key" == */* ]] || { echo "bad key" >&2; return 1; }
+  s3m_load "$backend" 2>/dev/null || { echo "backend not found: $backend" >&2; return 1; }
+  [[ "$key" == "${B_PREFIX}/"* ]] || { echo "key outside backend prefix" >&2; return 1; }
+  s3m_aws s3 cp "s3://${B_BUCKET}/${key}" - 2>/dev/null
 }
 
 # Манифест сервера для fleet-verify (песочница забирает его через веб-сервис
@@ -1737,6 +1810,51 @@ pick_fleet_server() {
   ask_choice "Сервер-источник:" "${ids[@]}"
 }
 
+# Выбор PROJECT для verify-stack / плана ротации.
+# Это каноническое имя в S3 (.../config/<host>/<проект>, .../wal/<host>/<проект>),
+# НЕ id карточки веба и НЕ «красивый» ярлык. Панель Remnawave всегда = panel.
+# В меню показываем «<карточка>-<проект>», в команду уходит только <проект>.
+# Уникальность в общей панели — за счёт подписи карточка-инстанс, а не
+# переименования instances.d/*.env / INST_KIND.
+pick_verify_project() { # <server_id>
+  local sid="$1"
+  local cache="${INSTALL_DIR}/web-data/manifest-cache.json"
+  local -a names=() kinds=()
+  local n k i pick
+  names+=(panel)
+  kinds+=(panel)
+  if [[ -n "$sid" && -f "$cache" ]] && command -v jq >/dev/null 2>&1; then
+    while IFS=$'\t' read -r n k; do
+      [[ -n "$n" ]] || continue
+      [[ "$n" == "panel" ]] && continue
+      names+=("$n")
+      kinds+=("${k:-bot}")
+    done < <(jq -r --arg id "$sid" '
+      .servers[]? | select(.id == $id) | (.instances // [])[]? |
+      [(.name // empty), (.kind // "bot")] | @tsv
+    ' "$cache" 2>/dev/null || true)
+  fi
+  echo "  Проект = имя в S3 (config/…/<проект>). Панель всегда «panel»." >&2
+  echo "  Не подставляйте id карточки и не переименовывайте инстанс:" >&2
+  echo "  в вебе уже показывается «${sid:-сервер}-<инстанс>»." >&2
+  if (( ${#names[@]} == 1 )); then
+    msg INFO "Проект: ${sid:-?}-${names[0]}  → в команде: ${names[0]} (kind=${kinds[0]})"
+    printf '%s' "${names[0]}"
+    return 0
+  fi
+  i=1
+  for n in "${names[@]}"; do
+    echo "    ${i}) ${sid}-${n}  → проект «${n}» (kind=${kinds[$((i-1))]})" >&2
+    i=$((i + 1))
+  done
+  read -r -p "  Выбор [1]: " pick >&2 || true
+  pick="${pick:-1}"
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#names[@]} )); then
+    pick=1
+  fi
+  printf '%s' "${names[$((pick - 1))]}"
+}
+
 # Выбор инстанса из instances.d (вместо ручного ввода имени)
 pick_instance() {
   local -a insts=()
@@ -1912,12 +2030,13 @@ menu_verify() {
         "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" ${fargs[@]+"${fargs[@]}"} || true
         pause ;;
       stack)
-        read -r -p "  Проект [panel]: " pr; pr="${pr:-panel}"
-        local sid mode keep
+        local sid pr mode keep
         sid="$(pick_fleet_server)" || {
           read -r -p "  ID сервера-источника вручную: " sid
           [[ -n "$sid" ]] || { msg ERR "Без --source на песочнице стек не из чего собирать"; pause; continue; }
         }
+        pr="$(pick_verify_project "$sid")" || pr="panel"
+        pr="${pr:-panel}"
         mode="$(ask_choice "Способ подъёма БД:" \
           "автоматически по ротации" "логический дамп" "базовый бэкап" "базовый бэкап + WAL (PITR)")"
         keep="$(ask_choice "После проверки:" "убрать всё" "оставить контейнеры для разбора")"
@@ -1928,16 +2047,17 @@ menu_verify() {
           *WAL*|*"PITR"*) sargs+=(--db-mode pitr) ;;
         esac
         [[ "$keep" == оставить* ]] && sargs+=(--keep)
-        msg INFO "Запуск: verify-stack.sh ${sargs[*]}"
+        msg INFO "Запуск: verify-stack.sh ${sargs[*]}  (подпись в вебе: ${sid}-${pr})"
         "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
         "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "${sargs[@]}" || true
         pause ;;
       local) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
       plan)
-        read -r -p "  Проект [panel]: " pr; pr="${pr:-panel}"
-        local sid bn
+        local sid pr bn
         sid="$(pick_fleet_server 2>/dev/null)" || sid="$(rw_source_id)"
         read -r -p "  ID сервера [${sid}]: " sid_in; sid="${sid_in:-$sid}"
+        pr="$(pick_verify_project "$sid")" || pr="panel"
+        pr="${pr:-panel}"
         bn="$(s3m_backends | head -n1)"
         if [[ -n "$bn" ]] && s3m_load "$bn"; then
           msg INFO "Следующий прогон проверит:"
@@ -2205,6 +2325,10 @@ case "$cmd" in
     exec "${METRICS_SCRIPTS_DIR}/metrics-exporter.sh" ;;
   fleet-manifest)
     fleet_manifest ;;
+  journals)
+    journals_list ;;
+  journal-show)
+    shift; journal_show "$@" ;;
   config-track)
     shift; exec "${TRACK_SCRIPTS_DIR}/config-track.sh" "$@" ;;
   config-restore)

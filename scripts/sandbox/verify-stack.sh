@@ -724,8 +724,8 @@ elif [[ -n "$problems" ]] || [[ -n "$leak" ]] || [[ -n "$DB_PROFILE_FAIL" ]] || 
   # История для веб-панели
   HISTORY_DIR="${VERIFY_HISTORY_DIR:-${INSTALL_DIR}/web-data/verify-history}"
   mkdir -p "$HISTORY_DIR"
-  printf '{"type":"stack","ts":%s,"host":"%s","project":"%s","source":"%s","ok":false,"detail":%s}\n' \
-    "$(date +%s)" "$(wal_hostname)" "$PROJECT" "${RW_SOURCE_ID:-$(wal_hostname)}" \
+  printf '{"type":"stack","ts":%s,"host":"%s","project":"%s","source":"%s","fleet_id":"%s","ok":false,"detail":%s}\n' \
+    "$(date +%s)" "$(wal_hostname)" "$PROJECT" "${RW_SOURCE_ID:-$(wal_hostname)}" "${REMOTE_SOURCE:-}" \
     "$(jq -Rn --arg s "containers ${running}/${total}${problems}${svc_problems}${DB_PROFILE_FAIL:+ data:${DB_PROFILE_FAIL}}" '$s' 2>/dev/null || echo "\"fail\"")" \
     > "${HISTORY_DIR}/stack_$(date -u +%Y%m%d_%H%M%S).json" 2>/dev/null || true
   wal_notify "🔴 Проверка полного стека ${PROJECT} (изолированно)
@@ -740,8 +740,8 @@ else
   write_metric 1
   HISTORY_DIR="${VERIFY_HISTORY_DIR:-${INSTALL_DIR}/web-data/verify-history}"
   mkdir -p "$HISTORY_DIR"
-  printf '{"type":"stack","ts":%s,"host":"%s","project":"%s","source":"%s","ok":true,"detail":"containers %s/%s services %s"}\n' \
-    "$(date +%s)" "$(wal_hostname)" "$PROJECT" "${RW_SOURCE_ID:-$(wal_hostname)}" \
+  printf '{"type":"stack","ts":%s,"host":"%s","project":"%s","source":"%s","fleet_id":"%s","ok":true,"detail":"containers %s/%s services %s"}\n' \
+    "$(date +%s)" "$(wal_hostname)" "$PROJECT" "${RW_SOURCE_ID:-$(wal_hostname)}" "${REMOTE_SOURCE:-}" \
     "$running" "$total" "$svc_checked" \
     > "${HISTORY_DIR}/stack_$(date -u +%Y%m%d_%H%M%S).json" 2>/dev/null || true
   ls -1t "$HISTORY_DIR"/stack_*.json 2>/dev/null | tail -n +41 | xargs -r rm -f --

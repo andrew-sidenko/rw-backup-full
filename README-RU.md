@@ -90,7 +90,11 @@ sudo rw-backup-full install-timer       # периодичность логич�
 
 ### 2. Описание инстансов WAL
 
-Инстанс — одна PostgreSQL-база (панель или бот). На каждый — файл в `/opt/rw-backup-restore/instances.d/<имя>.env`:
+Инстанс — одна PostgreSQL-база (панель или бот). На каждый — файл в `/opt/rw-backup-restore/instances.d/<имя>.env`.
+Имя файла (= имя инстанса) для панели **всегда `panel`**: от него зависят пути в S3
+(`…/config/<host>/panel`, `…/wal/<host>/panel`). `INST_KIND` — тип профиля (`panel`/`bot`/`site`),
+не ярлык для веба. Уникальность в общей панели парка — подпись **`<id карточки>-<инстанс>`**
+(например карточка `tyler` + инстанс `panel` → `tyler-panel`), а не переименование файла.
 
 ```bash
 cp /opt/rw-backup-restore/config-examples/instances.d/panel.env.example \
@@ -242,27 +246,30 @@ sudo rw-backup-full pitr-restore panel --target latest --age-identity /root/age-
 
 ### Настройка песочницы
 
+На песочнице с парком (`FULL_COMPONENTS` включает `sandbox` + `web`) **не копируйте**
+`instances.d/*.env` с продов в одну общую папку. У каждого боевого сервера свой
+`/opt/rw-backup-restore/instances.d/panel.env` с каноническим именем `panel` —
+конфликта нет, это разные хосты. Песочница читает описания инстансов по SSH
+(`fleet-manifest` → `web-data/manifest-cache.json`), а S3/TG кэширует в
+`fleet-creds/<id карточки>/`. Локальный `instances.d/` на песочнице для
+проверки парка / полного стека **не используется**.
+
 ```bash
-sudo ./install.sh --sandbox
-nano /opt/rw-backup-restore/rw-backup-full.env
-#   FULL_EXTERNAL_S3_* — доступ на ЧТЕНИЕ того же бакета
-#   FULL_TG_*          — куда слать отчёты
-#   SANDBOX_AGE_IDENTITY — приватный ключ age (если бэкапы шифруются)
-scp prod:/opt/rw-backup-restore/instances.d/*.env /opt/rw-backup-restore/instances.d/
-sudo rw-backup-full verify        # пробный прогон вручную
+sudo ./install.sh --sandbox          # поднимет web + sandbox + metrics
+# добавьте серверы в веб-интерфейсе (SSH-ключ сервиса → authorized_keys на хостах)
+# SANDBOX_AGE_IDENTITY — если бэкапы шифруются age
+sudo rw-backup-full sync-creds       # или пункт меню «Обновить S3/TG креды»
+sudo rw-backup-full verify           # → verify-fleet по манифесту парка
 ```
 
 Расписание — `rw-sandbox-verify.timer`: по умолчанию ежедневно ~05:30; задайте свои времена (`SANDBOX_VERIFY_TIMES="05:30 17:30"`) или интервал (`SANDBOX_VERIFY_INTERVAL_HOURS`) в конфиге и примените `rw-backup-full sandbox-timer`.
 
-Ручные варианты:
+Legacy (без `fleet.json`, одна песочница на один бакет) — тогда да, копировали
+`instances.d` и S3 на чтение локально; для современного парка это не нужно и
+провоцирует переименования вроде `tyler-panel.env`. Подробно: **docs/FLEET-VERIFY-RU.md**.
 
-```bash
-sudo rw-backup-full verify --instance panel   # один инстанс
-sudo rw-backup-full verify --skip-logical     # только PITR-цепочки
-sudo rw-backup-full verify --local            # на проде, из локального архива
-```
-
-Рекомендация по правам S3: прод — ключ с записью, песочница — отдельный ключ **только на чтение**. Тогда компрометация песочницы не угрожает бэкапам, а компрометация прода не отменяет уже сделанных проверок.
+Рекомендация по правам S3: прод — ключ с записью; на песочнице реквизиты
+подтягиваются с серверов в `fleet-creds/` (лучше отдельный read-only ключ на проде).
 
 ## Трекер каталогов и полное восстановление (v5.3)
 
