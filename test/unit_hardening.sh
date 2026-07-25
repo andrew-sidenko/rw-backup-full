@@ -151,6 +151,22 @@ rc=$?
 set -e
 check "digest empty prom" "$rc:$(cat /tmp/digest_sim.out)" "0:NO"
 
+# 9) wal_metric_write создаёт каталог (раньше молча no-op → UI «—/—»)
+MDIR="$T/metrics-create-me"
+rm -rf "$MDIR"
+set +e
+bash -c '
+set -euo pipefail
+source "'"$ROOT"'/scripts/lib/wal-lib.sh"
+WAL_METRICS_DIR="'"$MDIR"'"
+printf "rw_fleet_verify_checks_total 3\nrw_fleet_verify_checks_passed 2\n" | wal_metric_write "rw_fleet_verify"
+[[ -f "'"$MDIR"'/rw_fleet_verify.prom" ]]
+grep -q "rw_fleet_verify_checks_total 3" "'"$MDIR"'/rw_fleet_verify.prom"
+' >/tmp/metric_write.out 2>&1
+rc=$?
+set -e
+check "wal_metric_write mkdir+write" "$rc" "0"
+
 echo
 echo "==== ${PASS} passed, ${FAIL} failed ===="
 (( FAIL == 0 ))

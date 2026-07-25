@@ -279,11 +279,14 @@ wal_s3_uri() {
 # --------------------------------------------------------------------------
 
 # wal_metric_write <файл-без-пути> <строки метрик через stdin>
+# Каталог создаём сами: на песочнице веб читает .prom даже без node_exporter,
+# а прежний [[ -d ]] || return 0 молча терял метрики fleet-verify → UI «—/—».
 wal_metric_write() {
   local name="$1" tmp
-  [[ -d "$WAL_METRICS_DIR" ]] || return 0
-  tmp="$(mktemp "${WAL_METRICS_DIR}/.${name}.XXXXXX")"
-  cat > "$tmp"
+  mkdir -p "$WAL_METRICS_DIR" 2>/dev/null || return 0
+  [[ -w "$WAL_METRICS_DIR" ]] || return 0
+  tmp="$(mktemp "${WAL_METRICS_DIR}/.${name}.XXXXXX")" || return 0
+  cat > "$tmp" || { rm -f "$tmp"; return 0; }
   chmod 0644 "$tmp"
   mv -f "$tmp" "${WAL_METRICS_DIR}/${name}.prom"
 }
