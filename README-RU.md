@@ -90,7 +90,11 @@ sudo rw-backup-full install-timer       # периодичность логич�
 
 ### 2. Описание инстансов WAL
 
-Инстанс — одна PostgreSQL-база (панель или бот). На каждый — файл в `/opt/rw-backup-restore/instances.d/<имя>.env`:
+Инстанс — одна PostgreSQL-база (панель или бот). На каждый — файл в `/opt/rw-backup-restore/instances.d/<имя>.env`.
+Имя файла (= имя инстанса) для панели **всегда `panel`**: от него зависят пути в S3
+(`…/config/<host>/panel`, `…/wal/<host>/panel`). `INST_KIND` — тип профиля (`panel`/`bot`/`site`),
+не ярлык для веба. Уникальность в общей панели парка — подпись **`<id карточки>-<инстанс>`**
+(например карточка `tyler` + инстанс `panel` → `tyler-panel`), а не переименование файла.
 
 ```bash
 cp /opt/rw-backup-restore/config-examples/instances.d/panel.env.example \
