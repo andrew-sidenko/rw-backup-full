@@ -213,7 +213,10 @@ def api_status(sid: str):
     srv = get_server(sid)
     rc, out, err = ssh_run(srv, ALLOWED_ACTIONS["status"])
     if rc != 0:
-        return JSONResponse({"ok": False, "error": err.strip() or f"rc={rc}"}, status_code=502)
+        # status --json часто падает молча (set -e): stderr пуст, зато в stdout
+        # может быть обрезанный JSON — покажем хвост, иначе UI врёт голым rc=1.
+        detail = (err or "").strip() or (out or "").strip()[-300:] or f"rc={rc}"
+        return JSONResponse({"ok": False, "error": detail, "rc": rc}, status_code=502)
     try:
         return {"ok": True, "status": json.loads(out.strip().splitlines()[-1])}
     except Exception:

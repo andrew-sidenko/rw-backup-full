@@ -131,10 +131,13 @@ s3m_host_prefixes() {
 # Нужен веб-статусу, когда компонент metrics выключен и rw_exporter.prom
 # не содержит rw_s3_category_* (иначе UI врёт «0Б / 0 об.»).
 s3m_host_usage() {
+  # Печатает "<bytes> <objects> <reachable:0|1>\n". Обязателен перевод строки:
+  # status_json читает через `read` под `set -e`, а read без \n возвращает 1
+  # (EOF) — из‑за этого веб показывал сервер offline с голым rc=1.
   local bytes=0 objs=0 reachable=0 summ b o cat pfx
   if ! command -v aws >/dev/null 2>&1; then
-    printf '0 0 0'
-    return 1
+    printf '0 0 0\n'
+    return 0
   fi
   while IFS=$'\t' read -r cat pfx; do
     [[ -n "$pfx" ]] || continue
@@ -147,7 +150,8 @@ s3m_host_usage() {
     objs=$((objs + ${o:-0}))
     bytes=$((bytes + ${b:-0}))
   done < <(s3m_host_prefixes)
-  printf '%s %s %s' "$bytes" "$objs" "$reachable"
+  printf '%s %s %s\n' "$bytes" "$objs" "$reachable"
+  return 0
 }
 
 # Имя текстового журнала рядом с архивом: foo.tar.gz -> foo.txt, foo.age -> foo.txt

@@ -17,6 +17,20 @@ check "journal tar.gz" "$(s3m_journal_name 'remnawave_backup_2026-07-24_12_00_00
 check "journal age" "$(s3m_journal_name 'custom_bot_x.tar.gz.age')" "custom_bot_x.tar.gz.txt"
 check "journal base" "$(s3m_journal_name 'base_2026-07-24_01_00_00_000000010000000000000001.tar.zst')" "base_2026-07-24_01_00_00_000000010000000000000001.txt"
 
+# --- s3m_host_usage: строка с \n, иначе read под set -e → offline в вебе ---
+B_BUCKET="b"; B_PREFIX="rw-backup-full"; B_UPLOAD_PANEL=true; B_UPLOAD_CUSTOM=true; B_UPLOAD_WAL=true
+RW_SOURCE_ID="testhost"
+PATH="/usr/bin:/bin"  # без aws → быстрый путь 0 0 0
+usage_out="$(s3m_host_usage)"
+check "host_usage line" "$usage_out" "0 0 0"
+# Регрессия: read без \n возвращал 1 и валил status --json
+set +e
+read -r _ub _uo _ur < <(s3m_host_usage)
+_read_rc=$?
+set -e
+check "host_usage read rc" "$_read_rc" "0"
+check "host_usage read bytes" "${_ub}" "0"
+
 # --- ask_choice / menu_pick (extract from main script via bash) ---
 ask_choice() {
   local title="$1"; shift
