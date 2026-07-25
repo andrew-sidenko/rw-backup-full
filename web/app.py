@@ -23,6 +23,7 @@ import os
 import time
 import re
 import shlex
+import shutil
 import subprocess
 import glob
 from pathlib import Path
@@ -205,6 +206,13 @@ def api_del_server(sid: str):
     if len(data["servers"]) == before:
         raise HTTPException(404, "not found")
     save_servers(data)
+    # Хвост кэша кредов на песочнице — иначе «кредов синхр.» раздувается.
+    stale = Path(INSTALL_DIR) / "fleet-creds" / sid
+    if stale.is_dir():
+        try:
+            shutil.rmtree(stale)
+        except OSError:
+            pass
     return {"ok": True, "note": "удалена только запись в веб-сервисе; сам сервер не изменён"}
 
 
@@ -451,17 +459,28 @@ def api_sandbox_summary():
         hist = _fleet_metrics_from_history()
         for k, v in hist.items():
             result.setdefault(k, v)
-    # Кэш кредов: когда последний раз синхронизировали
+    # Кэш кредов только по серверам из текущего fleet.json.
+    # Раньше считались ВСЕ каталоги fleet-creds/* (включая хвосты удалённых) —
+    # при 1 сервере в парке UI показывал «кредов синхр.: 2».
+    fleet_ids = {s["id"] for s in load_fleet().get("servers", []) if s.get("id")}
     creds_root = Path(INSTALL_DIR) / "fleet-creds"
     creds = {}
     if creds_root.is_dir():
-        for d in creds_root.iterdir():
-            if d.is_dir() and (d / "synced_at").exists():
-                try:
-                    creds[d.name] = int((d / "synced_at").read_text().strip())
-                except Exception:
-                    creds[d.name] = 0
-    return {"ok": True, "metrics": result, "creds_synced": creds}
+        for sid in fleet_ids:
+            marker = creds_root / sid / "synced_at"
+            if not marker.is_file():
+                continue
+            try:
+                creds[sid] = int(marker.read_text().strip())
+            except Exception:
+                creds[sid] = 0
+    return {
+        "ok": True,
+        "metrics": result,
+        "creds_synced": creds,
+        "fleet_servers": len(fleet_ids),
+        "creds_synced_count": len(creds),
+    }
 
 
 @app.get("/api/fleet/overview", dependencies=[Depends(auth)])
@@ -744,7 +763,8 @@ async function loadSandbox(){
   const pass = m['rw_fleet_verify_checks_passed']?? m['rw_sandbox_checks_passed'];
   const ts = m['rw_fleet_verify_last_run_timestamp_seconds']?? m['rw_sandbox_last_run_timestamp_seconds'];
   const fails = Object.entries(m).filter(([k,v])=>k.includes('verify_ok')&&v===0).length;
-  const synced = Object.keys(r.creds_synced||{}).length;
+  const fleetN = r.fleet_servers ?? Object.keys(window._fleet||{}).length;
+  const synced = r.creds_synced_count ?? Object.keys(r.creds_synced||{}).length;
   let checks;
   if(tot==null && pass==null){
     checks = `<span class="mut">проверок: нет данных</span>`+
@@ -753,10 +773,14 @@ async function loadSandbox(){
     const t = tot??'—', p = pass??'—';
     checks = `проверок: <b class="${p===t?'ok':'bad'}">${p}/${t}</b>`;
   }
+  const credCls = (fleetN>0 && synced===fleetN) ? 'ok' : (synced>0 ? '' : 'mut');
+  const creds = fleetN
+    ? `кредов: <b class="${credCls}">${synced}/${fleetN}</b> <span class="mut">серв.</span>`
+    : `<span class="mut">кредов: нет серверов в парке</span>`;
   $('sandbox').innerHTML = checks+
     (fails?` · ошибок матрицы: <b class="bad">${fails}</b>`:'')+
     (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'')+
-    ` · кредов синхр.: ${synced}`;
+    ` · ${creds}`;
 }
 function fmtHist(h){
   const when = h.ts? new Date(h.ts*1000).toLocaleString() : h._file;

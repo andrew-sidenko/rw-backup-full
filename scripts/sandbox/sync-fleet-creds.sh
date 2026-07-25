@@ -85,6 +85,21 @@ EOF
   msg OK "Креды ${sid}: $(jq -r '.backends|length' <<<"$srv") бэкенд(ов), TG=$(jq -r 'if (.telegram.token//"")!="" then "да" else "нет" end' <<<"$srv")"
 done < <(jq -c '.servers[]?' <<<"$MANIFEST")
 
+# Удаляем хвосты кэша серверов, которых уже нет в манифесте/парке —
+# иначе веб считал «кредов синхр.: N» по всем каталогам, включая старые.
+mapfile -t _alive < <(jq -r '.servers[]? | .id // .source // empty' <<<"$MANIFEST" | grep -v '^$' || true)
+declare -A _keep=()
+for _id in "${_alive[@]+"${_alive[@]}"}"; do _keep["$_id"]=1; done
+if [[ -d "$CREDS_ROOT" ]]; then
+  for _d in "$CREDS_ROOT"/*/; do
+    [[ -d "$_d" ]] || continue
+    _name="$(basename "$_d")"
+    [[ -n "${_keep[$_name]:-}" ]] && continue
+    rm -rf -- "$_d"
+    msg INFO "Удалён устаревший кэш кредов: ${_name}"
+  done
+fi
+
 msg OK "Синхронизировано серверов: ${synced} → ${CREDS_ROOT}"
 # Число — только в msg (stderr). Раньше `echo "$synced"` в stdout давал
 # голую «1» в интерактивном меню перед следующим [OK].
