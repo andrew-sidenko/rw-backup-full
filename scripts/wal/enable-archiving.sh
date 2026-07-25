@@ -219,12 +219,14 @@ if ! docker exec "$INST_CONTAINER" test -x "${WAL_SPOOL_MOUNT}/archive-command.s
 fi
 
 msg INFO "[${INSTANCE}] сквозная проверка: переключаю WAL-сегмент..."
-before="$(find "${INST_SPOOL_DIR}/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l)"
+before="$(find "${INST_SPOOL_DIR}/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ' || true)"
+before="${before:-0}"
 wal_psql "SELECT pg_switch_wal()" >/dev/null
 
 ok=false
 for _ in $(seq 1 30); do
-  after="$(find "${INST_SPOOL_DIR}/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l)"
+  after="$(find "${INST_SPOOL_DIR}/incoming" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  after="${after:-0}"
   if (( after > before )); then ok=true; break; fi
   sleep 1
 done

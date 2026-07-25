@@ -434,7 +434,7 @@ docker_label() {
 }
 
 detect_custom_projects() {
-  declare -A project_dirs
+  declare -A project_dirs=()
 
   while read -r container; do
     [[ -n "$container" ]] || continue
@@ -520,25 +520,27 @@ select_custom_project() {
   fi
 
   if [[ "${#projects[@]}" -eq 1 ]]; then
-    echo "${projects[0]}"
+    printf '%s\n' "${projects[0]}"
     return 0
   fi
 
-  echo
-  echo -e "${GREEN}${BOLD}Выбери custom bot project:${RESET}"
-  echo
+  # UI только в stderr: вызывается как entry="$(select_custom_project)".
+  echo >&2
+  echo -e "${GREEN}${BOLD}Выбери custom bot project:${RESET}" >&2
+  echo >&2
 
   local i=1
   local entry
 
   for entry in "${projects[@]}"; do
     IFS='|' read -r project dir pg pg_service redis redis_service apps <<< "$entry"
-    echo " ${i}. ${project} — ${dir}"
-    ((i++))
+    echo " ${i}. ${project} — ${dir}" >&2
+    ((i++)) || true
   done
 
-  echo
-  read -r -p "[?] Номер: " choice
+  echo >&2
+  local choice=""
+  read -r -p "[?] Номер: " choice >&2 || true
 
   if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
     msg ERR "Некорректный выбор"
@@ -550,7 +552,7 @@ select_custom_project() {
     return 1
   fi
 
-  echo "${projects[$((choice - 1))]}"
+  printf '%s\n' "${projects[$((choice - 1))]}"
 }
 
 write_profile_env() {
@@ -797,38 +799,41 @@ backup_custom_all() {
 select_restore_archive() {
   mapfile -t archives < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'custom_bot_*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}')
 
-  echo
-  echo -e "${GREEN}${BOLD}Выбери архив для восстановления:${RESET}"
-  echo
+  # UI только в stderr: вызывается как archive="$(select_restore_archive)".
+  echo >&2
+  echo -e "${GREEN}${BOLD}Выбери архив для восстановления:${RESET}" >&2
+  echo >&2
 
   if [[ "${#archives[@]}" -gt 0 ]]; then
     local i=1
     local a
 
     for a in "${archives[@]}"; do
-      echo " ${i}. $(basename "$a") — $(du -h "$a" | awk '{print $1}')"
-      ((i++))
+      echo " ${i}. $(basename "$a") — $(du -h "$a" 2>/dev/null | awk '{print $1}' || echo '?')" >&2
+      ((i++)) || true
     done
 
-    echo
+    echo >&2
   else
     msg WARN "Локальные custom_bot архивы не найдены в ${BACKUP_DIR}"
   fi
 
-  echo " 0. Указать путь вручную"
-  echo
+  echo " 0. Указать путь вручную" >&2
+  echo >&2
 
-  read -r -p "[?] Номер или 0: " choice
+  local choice=""
+  read -r -p "[?] Номер или 0: " choice >&2 || true
 
   if [[ "$choice" == "0" ]]; then
-    read -r -p "Путь к архиву: " manual_archive
+    local manual_archive=""
+    read -r -p "Путь к архиву: " manual_archive >&2 || true
 
     [[ -f "$manual_archive" ]] || {
       msg ERR "Файл не найден: ${manual_archive}"
       return 1
     }
 
-    echo "$manual_archive"
+    printf '%s\n' "$manual_archive"
     return 0
   fi
 
@@ -842,7 +847,7 @@ select_restore_archive() {
     return 1
   fi
 
-  echo "${archives[$((choice - 1))]}"
+  printf '%s\n' "${archives[$((choice - 1))]}"
 }
 
 restore_custom_archive() {
@@ -1447,7 +1452,10 @@ status_json() {
   printf '"components":"%s",' "${FULL_COMPONENTS:-panel-backup custom-backup wal config-track metrics}"
   printf '"panel":{"detected":%s,"last_backup":"%s","last_backup_ts":%s},'     "$( (command -v docker >/dev/null 2>&1 && local_panel_detected) && echo true || echo false)"     "$(basename "${panel_last:-}" 2>/dev/null)" "$panel_ts"
   printf '"custom_archives":%s,' "$custom_cnt"
-  printf '"disk_free_bytes":%s,' "$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ')"
+  local df_avail
+  df_avail="$(df -B1 --output=avail "${BACKUP_DIR}" 2>/dev/null | tail -n1 | tr -d ' ' || true)"
+  [[ "$df_avail" =~ ^[0-9]+$ ]] || df_avail=0
+  printf '"disk_free_bytes":%s,' "$df_avail"
   printf '"local_backup_bytes":%s,' "$lb_bytes"
   printf '"errors":%s,' "$err_cnt"
   # S3-бэкенды (объём из метрик или live s3m_host_usage)
@@ -1841,7 +1849,7 @@ pick_fleet_server() {
     return 1
   fi
   if (( ${#ids[@]} == 1 )); then
-    printf '%s' "${ids[0]}"
+    printf '%s\n' "${ids[0]}"
     return 0
   fi
   ask_choice "Сервер-источник:" "${ids[@]}"
@@ -1909,15 +1917,16 @@ pick_instance() {
     return 1
   fi
   if (( ${#insts[@]} == 1 )); then
-    printf '%s' "${insts[0]}"
+    printf '%s\n' "${insts[0]}"
     return 0
   fi
   local i=1 n
   for n in "${insts[@]}"; do echo "    ${i}) ${n}" >&2; i=$((i+1)); done
-  local pick; read -r -p "  Инстанс [1]: " pick >&2
+  local pick=""
+  read -r -p "  Инстанс [1]: " pick >&2 || true
   pick="${pick:-1}"
   [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#insts[@]} )) || pick=1
-  printf '%s' "${insts[$((pick-1))]}"
+  printf '%s\n' "${insts[$((pick-1))]}"
 }
 
 menu_backup() {
@@ -2095,7 +2104,9 @@ menu_verify() {
       plan)
         local sid pr bn
         sid="$(pick_fleet_server 2>/dev/null)" || sid="$(rw_source_id)"
-        read -r -p "  ID сервера [${sid}]: " sid_in; sid="${sid_in:-$sid}"
+        local sid_in=""
+        read -r -p "  ID сервера [${sid}]: " sid_in || true
+        sid="${sid_in:-$sid}"
         pr="$(pick_verify_project "$sid")" || pr="panel"
         pr="$(printf '%s\n' "${pr:-panel}" | tail -n1 | tr -d '\r')"
         [[ "$pr" =~ ^[A-Za-z0-9_.-]+$ ]] || pr="panel"

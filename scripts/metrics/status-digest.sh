@@ -38,7 +38,7 @@ disk_line() {
   local path="$1" label="$2"
   [[ -d "$path" ]] || { echo "  ${label}: (нет ${path})"; return; }
   local size avail usedp used
-  read -r size avail < <(df -B1 --output=size,avail "$path" 2>/dev/null | tail -n1)
+  read -r size avail < <(df -B1 --output=size,avail "$path" 2>/dev/null | tail -n1 || true) || true
   size="${size:-0}"; avail="${avail:-0}"
   used=$(( size - avail ))
   if (( size > 0 )); then usedp=$(( used * 100 / size )); else usedp=0; fi

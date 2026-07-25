@@ -50,15 +50,14 @@ No test framework; tests are plain Bash scripts under `test/`, run directly (the
 Docker/AWS/Postgres, so no live services are needed):
 
 ```bash
-bash test/unit_menu_and_journals.sh   # fast unit checks — all pass
-bash test/full_e2e_test.sh            # full backup→verify→s3 cycle
+bash test/unit_menu_and_journals.sh   # меню, journals, sync-creds
+bash test/unit_hardening.sh           # set -u / pipefail / $() capture regressions
+bash test/full_e2e_test.sh            # backup→S3→restore (mocked docker/aws)
 ```
 
-Note: `test/full_e2e_test.sh` has **pre-existing failures at this commit** — it references
-functions that no longer exist in `scripts/rw-backup-full.sh` (e.g. `verify_custom_archive`,
-`maybe_encrypt_for_upload`), so parts fail with `rc=127` / `unbound variable`. This is a
-test/code mismatch, not an environment problem; do not "fix" it as part of env setup.
-`test/unit_menu_and_journals.sh` passes fully.
+After CLI/sandbox changes that touch `status --json`, digests, pickers or verify-*:
+run **all three**. Common prod footguns: `msg`/menu UI on stdout inside `$()`,
+`declare -A x` without `=()` under `set -u`, `du`/`find`/`read` under `pipefail`.
 
 ### Lint
 

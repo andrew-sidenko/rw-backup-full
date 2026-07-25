@@ -500,13 +500,15 @@ fi
 # Итоги: per-server отчёты (в TG каждого сервера) + сводка + метрики
 # --------------------------------------------------------------------------
 TOTAL=0; PASSED=0; SUMMARY=""
-declare -A SRV_REPORT SRV_FAIL
+# =() обязателен: под set -u пустой declare -A без присвоений → unbound на ${#…[@]}
+declare -A SRV_REPORT=() SRV_FAIL=()
 
 for rf in "$RESULTS_DIR"/r*; do
   [[ -e "$rf" ]] || continue
   line="$(cat "$rf")"
   TOTAL=$((TOTAL+1))
   src_tag="$(sed -n 's/^[A-Z]* \[\([^ ×]*\).*/\1/p' <<<"$line")"
+  src_tag="${src_tag:-unknown}"
   if [[ "$line" == OK* ]]; then
     PASSED=$((PASSED+1)); SUMMARY+=$'\n'"✅ ${line#OK }"
     SRV_REPORT[$src_tag]+=$'\n'"✅ ${line#OK }"
