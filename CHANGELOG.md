@@ -1,5 +1,10 @@
 # Changelog
 
+## v5.6.10 (2026-07-25)
+
+### Исправлено
+- **WAL retention dry-run**: `local: can only be used in a function` на верхнем уровне `wal-retention.sh` (после hardening `du`).
+
 ## v5.6.9 (2026-07-25)
 
 ### Изменено
