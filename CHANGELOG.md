@@ -1,5 +1,16 @@
 # Changelog
 
+## v5.6.6 (2026-07-25)
+
+### Исправлено (hardening после серии offline/unbound/[INFO])
+- **verify-fleet**: `declare -A …=()`, пустой `src_tag` → `unknown` (иначе bad subscript / unbound).
+- **status --json**: пустой `df` больше не ломает JSON (`disk_free_bytes`).
+- **select_custom_project / select_restore_archive**: меню в stderr (как pick_*), иначе путь архива загрязнялся UI.
+- **pick_instance / pick_fleet_server**: `\n` в stdout, `read || true`.
+- **status-digest / metrics-exporter**: `read`/`du` под pipefail не валят скрипт.
+- **s3m_upload_all, verify-stack, wal-retention/enable/archive-command**: `du`/`find` + `|| true`.
+- Тест `test/unit_hardening.sh` на эти классы регрессий.
+
 ## v5.6.5 (2026-07-25)
 
 ### Исправлено

@@ -51,7 +51,7 @@ disc_panel() {
 # код, ресурсы, шаблоны, миграции: без них восстановление с нуля неполное.
 disc_bots() {
   command -v docker >/dev/null 2>&1 || return 0
-  declare -A dirs
+  declare -A dirs=()
   local c project workdir
 
   while read -r c; do

@@ -534,7 +534,8 @@ restore_db_from_wal() { # <meta-файл в S3> <target-time|"">
     return 1
   fi
   t1="$(date +%s)"
-  raw_count="$(find "$wal_raw" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  raw_count="$(find "$wal_raw" -type f 2>/dev/null | wc -l | tr -d ' ' || true)"
+  raw_count="${raw_count:-0}"
   msg OK "[${PROJECT}] WAL sync: ${raw_count} объект(ов) за $((t1 - t0))с; распаковываю с ${START_SEGMENT}..."
 
   staged=0; processed=0; failed_wal=0
@@ -687,7 +688,7 @@ if [[ -n "$DB_SERVICE" ]]; then
         s3m_aws s3 cp "s3://${B_BUCKET}/${PLAN_KEY}" "${WORK}/dump.tar.gz" --only-show-errors 2>/dev/null || true
         if [[ -f "${WORK}/dump.tar.gz" ]]; then
           mkdir -p "${WORK}/dump" && tar -xzf "${WORK}/dump.tar.gz" -C "${WORK}/dump" 2>/dev/null || true
-          sql="$(find "${WORK}/dump" -maxdepth 1 \( -name 'dump_*.sql.gz' -o -name 'postgres_dump.sql.gz' \) | head -n1)"
+          sql="$(find "${WORK}/dump" -maxdepth 1 \( -name 'dump_*.sql.gz' -o -name 'postgres_dump.sql.gz' \) 2>/dev/null | head -n1 || true)"
           if [[ -n "$sql" ]]; then
             gzip -dc "$sql" | docker exec -i "$DB_C" psql -q -U "$DB_USER" -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>&1 || true
             msg OK "[${PROJECT}] база залита из $(basename "$PLAN_KEY")"

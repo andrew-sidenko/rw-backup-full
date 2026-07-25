@@ -45,7 +45,7 @@ emit "# TYPE rw_disk_total_bytes gauge"
 for path_label in "${BACKUP_DIR}:backups" "${WAL_ROOT}:wal"; do
   path="${path_label%%:*}"; label="${path_label##*:}"
   [[ -d "$path" ]] || continue
-  read -r total avail < <(df -B1 --output=size,avail "$path" 2>/dev/null | tail -n1)
+  read -r total avail < <(df -B1 --output=size,avail "$path" 2>/dev/null | tail -n1 || true) || true
   emit "rw_disk_free_bytes{path=\"${path}\",role=\"${label}\"} ${avail:-0}"
   emit "rw_disk_total_bytes{path=\"${path}\",role=\"${label}\"} ${total:-0}"
 done
@@ -87,7 +87,8 @@ while IFS= read -r inst; do
   # валило ВЕСЬ экспортер целиком: ни диски, ни локальные архивы, ни S3
   # не публиковались из-за одного ещё не забутстрапленного инстанса.
   if [[ -d "${WAL_ROOT}/${inst}" ]]; then
-    b="$(du -sb "${WAL_ROOT}/${inst}" 2>/dev/null | awk '{print $1}')"
+    b="$(du -sb "${WAL_ROOT}/${inst}" 2>/dev/null | awk '{print $1}' || true)"
+    [[ "$b" =~ ^[0-9]+$ ]] || b=0
   fi
   emit "rw_wal_local_bytes{instance=\"${inst}\"} ${b:-0}"
 done < <(wal_list_instances)

@@ -64,7 +64,8 @@ fi
 # слишком много, лучше начать падать ЯВНО и поднять алерт, чем молча
 # копить гигабайты. Порог по умолчанию — 2000 сегментов (~32 ГБ при 16 МБ).
 MAX_SPOOL="${WAL_SPOOL_MAX_FILES:-2000}"
-count=$(find "$SPOOL_DIR" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l)
+count=$(find "$SPOOL_DIR" -maxdepth 1 -type f -name '0*' 2>/dev/null | wc -l | tr -d ' ' || true)
+count="${count:-0}"
 if [ "$count" -gt "$MAX_SPOOL" ]; then
     echo "archive-command: спул переполнен ($count > $MAX_SPOOL), шиппер не работает" >&2
     exit 1

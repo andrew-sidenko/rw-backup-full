@@ -174,7 +174,7 @@ s3m_upload_all() {
   local category="$1" file="$2" label="${3:-}" journal="${4:-}"
   local name ok=0 targeted=0 fname size jname
   fname="$(basename "$file")"
-  size="$(du -h "$file" 2>/dev/null | awk '{print $1}')"
+  size="$(du -h "$file" 2>/dev/null | awk '{print $1}' || true)"
   jname=""
   [[ -n "$journal" && -f "$journal" ]] && jname="$(s3m_journal_name "$fname")"
   command -v aws >/dev/null 2>&1 || { msg WARN "awscli не найден — S3-выгрузка пропущена"; return 0; }
