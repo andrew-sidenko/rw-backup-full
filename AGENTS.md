@@ -71,10 +71,10 @@ bash -n scripts/rw-backup-full.sh                    # syntax check
 
 ### Sandbox / verify-stack notes
 
-- **Sandbox UI «проверок»** comes from `RW_METRICS_DIR` (`rw_fleet_*.prom`) with fallback to
-  latest `web-data/verify-history/fleet_*.json`. Creds line is `N/M серв.` — servers from
-  current `fleet.json` that have `fleet-creds/<id>/synced_at` (not raw dir count; stale
-  caches are pruned by `sync-fleet-creds` / server delete). Creds ≠ completed fleet verify.
+- **Sandbox UI checks line** uses `/api/sandbox/summary` → `last_verify`: fleet prom/history
+  first, else latest `stack_*.json` / `rw_stack_*.prom` (so a green stack run is not shown as
+  «нет данных»). Creds line is `N/M серв.` for current `fleet.json` only; stale
+  `fleet-creds/` dirs are pruned by `sync-fleet-creds` / server delete.
 - **`verify-stack --db-mode pitr` is long-running by design** (download basebackup + WAL sync +
   Postgres recovery, up to ~10 min). After v5.5.2 it emits step progress and a recovery
   heartbeat every 30s; silence after `поднимаю БД из базового бэкапа + WAL` means an older
