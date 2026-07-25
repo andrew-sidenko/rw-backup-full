@@ -17,7 +17,7 @@
 #   settings.history   — сколько последних архивов на источник (deep)
 # Настройки живут в fleet.json (правятся через веб-API или напрямую).
 #
-# CLI: verify-fleet.sh [--server ID] [--backend NAME] [--depth quick|standard|deep]
+# CLI: verify-fleet.sh [--server ID] [--backend NAME] [--depth quick|standard|deep] [--ordered]
 
 set -euo pipefail
 
@@ -39,11 +39,15 @@ SANDBOX_WORK="${SANDBOX_WORK:-/var/lib/rw-wal/fleet-verify}"
 RESULTS_DIR="${SANDBOX_WORK}/results.$$"
 
 ONLY_SERVER=""; ONLY_BACKEND=""; DEPTH_OVERRIDE=""
+# --ordered: сервер за сервером, внутри — инстанс за инстансом (как в меню).
+# Параллелизм тогда только внутри одного сервера (settings.parallel).
+ORDERED="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --server)  ONLY_SERVER="$2"; shift 2 ;;
     --backend) ONLY_BACKEND="$2"; shift 2 ;;
     --depth)   DEPTH_OVERRIDE="$2"; shift 2 ;;
+    --ordered) ORDERED="true"; shift ;;
     -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) msg ERR "Неизвестный аргумент: $1"; exit 1 ;;
   esac
@@ -63,6 +67,8 @@ fi
 cleanup() {
   docker ps -aq -f "label=rw-fleet-session=$$" 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
   rm -rf "${SANDBOX_WORK:?}/work.$$" "$RESULTS_DIR" 2>/dev/null || true
+  rm -f "${SANDBOX_WORK}/jobs.$$" "${SANDBOX_WORK}/server-jobs.$$" \
+        "${SANDBOX_WORK}"/jobs.*.$$ 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -400,13 +406,16 @@ check_pitr_instance() { # <src> <backend_json> <instance> <kind> <pguser> <pgdb>
 }
 
 # --------------------------------------------------------------------------
-# Постановка задач: source × backend × category (× history)
+# Постановка задач: сервер → инстансы → бэкенды/категории
+# (тот же порядок, что ручное меню: сначала карточка, потом её инстансы)
 # --------------------------------------------------------------------------
 JOBS="${SANDBOX_WORK}/jobs.$$"; : > "$JOBS"
+# При --ordered: отдельный файл заданий на каждый сервер, выполняем по очереди.
+SERVER_JOB_LIST="${SANDBOX_WORK}/server-jobs.$$"; : > "$SERVER_JOB_LIST"
 job_id=0
 
-queue_check() { # <server_id> <src> <backend_json> <category> <kind>
-  local sid="$1" src="$2" bj="$3" category="$4" kind="$5"
+queue_check() { # <server_id> <src> <backend_json> <category> <kind> <jobs_file>
+  local sid="$1" src="$2" bj="$3" category="$4" kind="$5" jfile="${6:-$JOBS}"
   local bname bucket prefix
   bname="$(jq -r .name <<<"$bj")"; bucket="$(jq -r .bucket <<<"$bj")"
   prefix="$(jq -r '.prefix // "rw-backup-full"' <<<"$bj")"; prefix="${prefix#/}"; prefix="${prefix%/}"
@@ -421,11 +430,49 @@ queue_check() { # <server_id> <src> <backend_json> <category> <kind>
   local key
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$src" "$category" "$kind" "$key" "${RESULTS_DIR}/r$((job_id++))" "$bj" >> "$JOBS"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$src" "$category" "$kind" "$key" "${RESULTS_DIR}/r$((job_id++))" "$bj" >> "$jfile"
   done <<<"$keys"
 }
 
+queue_server_jobs() { # <srv_json> <jobs_file>
+  local srv="$1" jfile="$2"
+  local sid src bot_kind bj bname ij ikind
+  sid="$(jq -r .id <<<"$srv")"
+  src="$(jq -r .source <<<"$srv")"
+  bot_kind="$(jq -r '[.instances[] | select(.kind != "panel") | .kind] | first // "bot"' <<<"$srv")"
+
+  # 1) Сначала PITR по каждому инстансу (инстанс за инстансом), по всем WAL-бэкендам.
+  while IFS= read -r ij; do
+    [[ -n "$ij" ]] || continue
+    ikind="$(jq -r .kind <<<"$ij")"
+    if [[ "$ikind" != "panel" && -z "${_WARNED_NONPANEL_PITR:-}" ]]; then
+      msg WARN "Fleet-PITR для типа '${ikind}' (боты и др.) пока проверена только на панели — следите за первыми результатами внимательнее"
+      _WARNED_NONPANEL_PITR="true"
+    fi
+    while IFS= read -r bj; do
+      [[ -n "$bj" ]] || continue
+      bname="$(jq -r .name <<<"$bj")"
+      [[ -n "$ONLY_BACKEND" && "$bname" != "$ONLY_BACKEND" ]] && continue
+      [[ "$(jq -r .enabled <<<"$bj")" == "true" ]] || continue
+      [[ "$(jq -r .wal <<<"$bj")" == "true" ]] || continue
+      printf '%s\tpitr\t%s\t%s\t%s\t%s\n' \
+        "$src" "$ikind" "$ij" "${RESULTS_DIR}/r$((job_id++))" "$bj" >> "$jfile"
+    done < <(jq -c '.backends[]?' <<<"$srv")
+  done < <(jq -c '.instances[]?' <<<"$srv")
+
+  # 2) Затем логические архивы panel / custom-bot по бэкендам.
+  while IFS= read -r bj; do
+    [[ -n "$bj" ]] || continue
+    bname="$(jq -r .name <<<"$bj")"
+    [[ -n "$ONLY_BACKEND" && "$bname" != "$ONLY_BACKEND" ]] && continue
+    [[ "$(jq -r .enabled <<<"$bj")" == "true" ]] || continue
+    [[ "$(jq -r .panel  <<<"$bj")" == "true" ]] && queue_check "$sid" "$src" "$bj" "panel" "panel" "$jfile"
+    [[ "$(jq -r .custom <<<"$bj")" == "true" ]] && queue_check "$sid" "$src" "$bj" "custom-bot" "$bot_kind" "$jfile"
+  done < <(jq -c '.backends[]?' <<<"$srv")
+}
+
 servers_json="$(jq -c '.servers[]' <<<"$MANIFEST")"
+srv_n=0
 while IFS= read -r srv; do
   sid="$(jq -r .id <<<"$srv")"
   [[ -n "$ONLY_SERVER" && "$sid" != "$ONLY_SERVER" ]] && continue
@@ -433,41 +480,21 @@ while IFS= read -r srv; do
     echo "FAIL [${sid}] сервер недоступен: $(jq -r '.error // "?"' <<<"$srv")" > "${RESULTS_DIR}/r$((job_id++))"
     continue
   fi
-  src="$(jq -r .source <<<"$srv")"
-
-  # Типы инстансов сервера: panel-инстанс задаёт тип панельных архивов,
-  # прочие типы применяются к архивам ботов (custom-bot).
-  bot_kind="$(jq -r '[.instances[] | select(.kind != "panel") | .kind] | first // "bot"' <<<"$srv")"
-
-  while IFS= read -r bj; do
-    [[ -n "$bj" ]] || continue
-    bname="$(jq -r .name <<<"$bj")"
-    [[ -n "$ONLY_BACKEND" && "$bname" != "$ONLY_BACKEND" ]] && continue
-    [[ "$(jq -r .enabled <<<"$bj")" == "true" ]] || continue
-    [[ "$(jq -r .panel  <<<"$bj")" == "true" ]] && queue_check "$sid" "$src" "$bj" "panel" "panel"
-    [[ "$(jq -r .custom <<<"$bj")" == "true" ]] && queue_check "$sid" "$src" "$bj" "custom-bot" "$bot_kind"
-
-    # PITR: по каждому инстансу этого сервера, если бэкенд несёт WAL-категорию.
-    if [[ "$(jq -r .wal <<<"$bj")" == "true" ]]; then
-      while IFS= read -r ij; do
-        [[ -n "$ij" ]] || continue
-        ikind="$(jq -r .kind <<<"$ij")"
-        if [[ "$ikind" != "panel" && -z "${_WARNED_NONPANEL_PITR:-}" ]]; then
-          msg WARN "Fleet-PITR для типа '${ikind}' (боты и др.) пока проверена только на панели — следите за первыми результатами внимательнее, при сомнениях сверьте ручным 'pitr-restore <инстанс> --target latest' на самом сервере"
-          _WARNED_NONPANEL_PITR="true"
-        fi
-        printf '%s\tpitr\t%s\t%s\t%s\t%s\n' \
-          "$src" "$ikind" "$ij" "${RESULTS_DIR}/r$((job_id++))" "$bj" >> "$JOBS"
-      done < <(jq -c '.instances[]?' <<<"$srv")
-    fi
-  done < <(jq -c '.backends[]?' <<<"$srv")
+  srv_n=$((srv_n + 1))
+  inst_n="$(jq '[.instances[]?] | length' <<<"$srv" 2>/dev/null || echo 0)"
+  msg INFO "Очередь: сервер ${sid} (инстансов: ${inst_n:-0})"
+  if [[ "$ORDERED" == "true" ]]; then
+    sj="${SANDBOX_WORK}/jobs.${sid}.$$"
+    : > "$sj"
+    queue_server_jobs "$srv" "$sj"
+    printf '%s\t%s\n' "$sid" "$sj" >> "$SERVER_JOB_LIST"
+  else
+    queue_server_jobs "$srv" "$JOBS"
+  fi
 done <<<"$servers_json"
 
-total_jobs="$(wc -l < "$JOBS" | tr -d ' ')"
-msg INFO "Проверок в очереди: ${total_jobs} (+ $(ls "$RESULTS_DIR" 2>/dev/null | wc -l) мгновенных отказов)"
-
 # --------------------------------------------------------------------------
-# Параллельное исполнение
+# Исполнение
 # --------------------------------------------------------------------------
 export -f check_logical_archive load_profile maws truthy msg
 export SANDBOX_WORK RESULTS_DIR PROFILES_DIR DEPTH SANDBOX_PG_VERSION="${SANDBOX_PG_VERSION:-17}" \
@@ -490,11 +517,31 @@ run_one_job() {
 }
 export -f run_one_job check_pitr_instance
 
-if (( total_jobs > 0 )); then
-  # -d '\n': строка задания передаётся аргументом целиком, кавычки JSON не съедаются
+run_jobs_file() { # <file> <label>
+  local jfile="$1" label="$2" n
+  [[ -s "$jfile" ]] || return 0
+  n="$(wc -l < "$jfile" | tr -d ' ')"
+  msg INFO "Запуск проверок [${label}]: ${n} задач (parallel=${PARALLEL})"
   # shellcheck disable=SC2016
-  xargs -d '\n' -P "$PARALLEL" -I{} -a "$JOBS" bash -c 'run_one_job "$1"' _ {} || true
+  xargs -d '\n' -P "$PARALLEL" -I{} -a "$jfile" bash -c 'run_one_job "$1"' _ {} || true
+}
+
+if [[ "$ORDERED" == "true" ]]; then
+  msg INFO "Режим --ordered: сервер за сервером, внутри инстансы → архивы"
+  while IFS=$'\t' read -r sid sj; do
+    [[ -n "$sid" && -n "$sj" ]] || continue
+    msg INFO "═══ сервер ${sid} ═══"
+    run_jobs_file "$sj" "$sid"
+    rm -f "$sj" 2>/dev/null || true
+  done < "$SERVER_JOB_LIST"
+else
+  total_jobs="$(wc -l < "$JOBS" | tr -d ' ')"
+  msg INFO "Проверок в очереди: ${total_jobs} (+ $(ls "$RESULTS_DIR" 2>/dev/null | wc -l) мгновенных отказов)"
+  if (( total_jobs > 0 )); then
+    run_jobs_file "$JOBS" "парк"
+  fi
 fi
+rm -f "$SERVER_JOB_LIST" 2>/dev/null || true
 
 # --------------------------------------------------------------------------
 # Итоги: per-server отчёты (в TG каждого сервера) + сводка + метрики
