@@ -70,6 +70,16 @@ shellcheck scripts/**/*.sh scripts/*.sh install.sh   # warnings (e.g. SC2034) ar
 bash -n scripts/rw-backup-full.sh                    # syntax check
 ```
 
+### Sandbox / verify-stack notes
+
+- **`verify-stack --db-mode pitr` is long-running by design** (download basebackup + WAL sync +
+  Postgres recovery, up to ~10 min). After v5.5.2 it emits step progress and a recovery
+  heartbeat every 30s; silence after `поднимаю БД из базового бэкапа + WAL` means an older
+  build without that logging — update `scripts/sandbox/verify-stack.sh` before debugging as a
+  hang.
+- Live PITR smoke needs Docker + S3-compatible storage (MinIO is fine); unit tests under
+  `test/` mock these and do not exercise real recovery.
+
 ### Environment notes
 
 - System tools `shellcheck`, `age`/`age-keygen`, `zstd`, `jq`, and `python3.12-venv` are part of
