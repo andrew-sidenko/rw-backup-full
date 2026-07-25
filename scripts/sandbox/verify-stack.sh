@@ -367,20 +367,55 @@ DB_MODE_DESC=""
 # Общая проверка содержимого — одна и та же для любого способа восстановления
 # (логический дамп / базовый бэкап / PITR), чтобы критерий "данные на месте"
 # не зависел от того, каким путём БД подняли.
+#
+# Важно: после physical restore (basebackup+WAL) PostgreSQL сбрасывает
+# pg_stat_* — sum(n_live_tup) даёт ложный «строк ≈ 0» при живых данных
+# (симптом: таблиц=36, строк≈0, но public.users при count(*) непустой).
+# Перед замером делаем ANALYZE; целевую БД ищем по наличию user-tables
+# (не всегда это "postgres").
 check_db_profile() { # <контейнер> <пользователь>
-  local c="$1" u="$2" rows tables cnt tbl
-  tables="$(docker exec "$c" psql -qtAX -U "$u" -d postgres -c 'SELECT count(*) FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
-  rows="$(docker exec "$c" psql -qtAX -U "$u" -d postgres -c 'SELECT coalesce(sum(n_live_tup),0)::bigint FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
+  local c="$1" u="$2" rows tables cnt tbl db d
+  local line qname sql qmin val
   load_profile "${INST_KIND_REMOTE:-$([[ "$PROJECT" == "panel" ]] && echo panel || echo bot)}"
+
+  db="postgres"
+  tables=0
+  for d in postgres $(docker exec "$c" psql -qtAX -U "$u" -d postgres \
+      -c "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname<>'postgres'" 2>/dev/null); do
+    tables="$(docker exec "$c" psql -qtAX -U "$u" -d "$d" \
+      -c 'SELECT count(*) FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
+    if [[ "${tables:-0}" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
+      db="$d"
+      break
+    fi
+  done
+
+  docker exec "$c" psql -q -U "$u" -d "$db" -c 'ANALYZE;' >/dev/null 2>&1 || true
+
+  tables="$(docker exec "$c" psql -qtAX -U "$u" -d "$db" \
+    -c 'SELECT count(*) FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
+  rows="$(docker exec "$c" psql -qtAX -U "$u" -d "$db" \
+    -c 'SELECT coalesce(sum(n_live_tup),0)::bigint FROM pg_stat_user_tables' 2>/dev/null || echo 0)"
+
   (( ${tables:-0} < ${PROFILE_MIN_TABLES:-1} )) && DB_PROFILE_FAIL+=" таблиц=${tables}<${PROFILE_MIN_TABLES}"
   (( ${rows:-0} < ${PROFILE_MIN_TOTAL_ROWS:-1} )) && DB_PROFILE_FAIL+=" строк=${rows}<${PROFILE_MIN_TOTAL_ROWS}"
   for tbl in ${INST_VTABLES_REMOTE:-} ${PROFILE_REQUIRED_TABLES:-}; do
     [[ -n "$tbl" ]] || continue
-    cnt="$(docker exec "$c" psql -qtAX -U "$u" -d postgres -c "SELECT count(*) FROM ${tbl}" 2>/dev/null || echo FAIL)"
+    cnt="$(docker exec "$c" psql -qtAX -U "$u" -d "$db" -c "SELECT count(*) FROM ${tbl}" 2>/dev/null || echo FAIL)"
     if [[ "$cnt" == "FAIL" ]]; then DB_PROFILE_FAIL+=" ${tbl}:отсутствует"
     elif [[ "$cnt" == "0" ]]; then DB_PROFILE_FAIL+=" ${tbl}:пустая"; fi
   done
-  msg INFO "[${PROJECT}] данные: таблиц=${tables}, строк ≈ ${rows}"
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" ]] && continue
+    qname="${line%%::*}"; sql="${line#*::}"; qmin="${sql##*::}"; sql="${sql%::*}"
+    val="$(docker exec "$c" psql -qtAX -U "$u" -d "$db" -c "$sql" 2>/dev/null || echo FAIL)"
+    if [[ "$val" == "FAIL" ]] || ! [[ "$val" =~ ^[0-9]+$ ]] || (( val < qmin )); then
+      DB_PROFILE_FAIL+=" ${qname}:${val}<${qmin}"
+    fi
+  done <<<"${PROFILE_CHECK_QUERIES:-}"
+
+  msg INFO "[${PROJECT}] данные: БД=${db}, таблиц=${tables}, строк ≈ ${rows}"
   if [[ -n "$DB_PROFILE_FAIL" ]]; then
     msg ERR "[${PROJECT}] проверка данных не прошла:${DB_PROFILE_FAIL}"
   else
