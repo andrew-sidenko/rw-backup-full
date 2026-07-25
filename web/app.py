@@ -379,11 +379,23 @@ def api_fleet_manifest(force: int = 0):
     return out
 
 
+def _hist_dir() -> Path:
+    return Path(os.environ.get(
+        "VERIFY_HISTORY_DIR", f"{INSTALL_DIR}/web-data/verify-history"))
+
+
 def _metrics_from_prom() -> dict:
-    """Читает rw_sandbox_*.prom / rw_fleet_*.prom из METRICS_DIR."""
+    """Читает rw_{sandbox,fleet,stack}_*.prom из METRICS_DIR."""
     result = {}
-    for f in glob.glob(f"{METRICS_DIR}/rw_sandbox_*.prom") + glob.glob(
-            f"{METRICS_DIR}/rw_fleet_*.prom"):
+    patterns = (
+        f"{METRICS_DIR}/rw_sandbox_*.prom",
+        f"{METRICS_DIR}/rw_fleet_*.prom",
+        f"{METRICS_DIR}/rw_stack_*.prom",
+    )
+    files = []
+    for pat in patterns:
+        files.extend(glob.glob(pat))
+    for f in files:
         try:
             lines = Path(f).read_text().splitlines()
         except OSError:
@@ -398,13 +410,8 @@ def _metrics_from_prom() -> dict:
 
 
 def _fleet_metrics_from_history() -> dict:
-    """Fallback: последний fleet_*.json → те же ключи, что пишет verify-fleet.prom.
-
-    Нужен когда textfile-каталог отсутствовал на момент прогона (wal_metric_write
-    раньше молча no-op'ил) или метрики ещё не появились, а история уже есть.
-    """
-    hist_dir = Path(os.environ.get(
-        "VERIFY_HISTORY_DIR", f"{INSTALL_DIR}/web-data/verify-history"))
+    """Fallback: последний fleet_*.json → ключи verify-fleet.prom."""
+    hist_dir = _hist_dir()
     if not hist_dir.is_dir():
         return {}
     files = sorted(hist_dir.glob("fleet_*.json"),
@@ -431,7 +438,6 @@ def _fleet_metrics_from_history() -> dict:
             detail = r.get("detail") or ""
             src = r.get("source") or "?"
             ok = 1.0 if r.get("ok") else 0.0
-            # detail вида: "[src × backend] category …" или "[src] reachable…"
             m = re.match(
                 r"^\[([^ ×]+) × ([^\]]+)\]\s+([a-z-]+)", detail)
             if m:
@@ -450,18 +456,116 @@ def _fleet_metrics_from_history() -> dict:
     return {}
 
 
+def _last_verify_from_prom(metrics: dict) -> dict | None:
+    """Сводка последней проверки из уже прочитанных .prom."""
+    if "rw_fleet_verify_checks_total" in metrics:
+        total = int(metrics["rw_fleet_verify_checks_total"])
+        passed = int(metrics.get("rw_fleet_verify_checks_passed", 0))
+        return {
+            "kind": "fleet",
+            "ok": passed == total,
+            "passed": passed,
+            "total": total,
+            "ts": metrics.get("rw_fleet_verify_last_run_timestamp_seconds"),
+            "source": "prom",
+        }
+    # stack: берём запись с максимальным last_timestamp
+    best = None  # (ts, project, ok)
+    for k, v in metrics.items():
+        m = re.match(r'^rw_stack_verify_ok\{project="([^"]*)"\}$', k)
+        if not m:
+            continue
+        proj = m.group(1)
+        ts_key = f'rw_stack_verify_last_timestamp_seconds{{project="{proj}"}}'
+        ts = float(metrics.get(ts_key, 0))
+        cand = (ts, proj, bool(v))
+        if best is None or cand[0] >= best[0]:
+            best = cand
+    if best is not None:
+        ts, proj, ok = best
+        return {
+            "kind": "stack",
+            "ok": ok,
+            "passed": 1 if ok else 0,
+            "total": 1,
+            "ts": ts or None,
+            "label": proj,
+            "source": "prom",
+        }
+    if "rw_sandbox_checks_total" in metrics:
+        total = int(metrics["rw_sandbox_checks_total"])
+        passed = int(metrics.get("rw_sandbox_checks_passed", 0))
+        return {
+            "kind": "sandbox",
+            "ok": passed == total,
+            "passed": passed,
+            "total": total,
+            "ts": metrics.get("rw_sandbox_last_run_timestamp_seconds"),
+            "source": "prom",
+        }
+    return None
+
+
+def _last_verify_from_history() -> dict | None:
+    """Последний fleet_* или stack_* JSON (новые сверху по mtime)."""
+    hist_dir = _hist_dir()
+    if not hist_dir.is_dir():
+        return None
+    files = sorted(
+        list(hist_dir.glob("fleet_*.json")) + list(hist_dir.glob("stack_*.json")),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    for f in files:
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        kind = data.get("type")
+        if kind == "fleet":
+            total, passed = data.get("total"), data.get("passed")
+            if total is None or passed is None:
+                continue
+            return {
+                "kind": "fleet",
+                "ok": passed == total,
+                "passed": int(passed),
+                "total": int(total),
+                "ts": data.get("ts"),
+                "source": "history",
+            }
+        if kind == "stack":
+            ok = bool(data.get("ok"))
+            fid = data.get("fleet_id") or data.get("source") or "?"
+            proj = data.get("project") or "?"
+            return {
+                "kind": "stack",
+                "ok": ok,
+                "passed": 1 if ok else 0,
+                "total": 1,
+                "ts": data.get("ts"),
+                "label": f"{fid}-{proj}",
+                "detail": data.get("detail") or "",
+                "source": "history",
+            }
+    return None
+
+
 @app.get("/api/sandbox/summary", dependencies=[Depends(auth)])
 def api_sandbox_summary():
-    """Последние результаты песочницы: .prom, иначе история verify-history."""
+    """Последние результаты песочницы: .prom, иначе история verify-history.
+
+    last_verify учитывает и fleet, и stack — иначе после «полного стека»
+    строка песочницы врала «нет данных», хотя история уже зелёная.
+    """
     result = _metrics_from_prom()
-    # Если сводных счётчиков fleet нет — подтянем из JSON-истории прогона.
     if "rw_fleet_verify_checks_total" not in result:
-        hist = _fleet_metrics_from_history()
-        for k, v in hist.items():
+        for k, v in _fleet_metrics_from_history().items():
             result.setdefault(k, v)
+    # Берём свежайший по ts: иначе старый fleet из history/prom перекрывает
+    # только что прошедший stack → UI «нет данных» / устаревшая матрица.
+    _cands = [x for x in (_last_verify_from_prom(result),
+                          _last_verify_from_history()) if x]
+    last = max(_cands, key=lambda x: float(x.get("ts") or 0)) if _cands else None
     # Кэш кредов только по серверам из текущего fleet.json.
-    # Раньше считались ВСЕ каталоги fleet-creds/* (включая хвосты удалённых) —
-    # при 1 сервере в парке UI показывал «кредов синхр.: 2».
     fleet_ids = {s["id"] for s in load_fleet().get("servers", []) if s.get("id")}
     creds_root = Path(INSTALL_DIR) / "fleet-creds"
     creds = {}
@@ -477,6 +581,7 @@ def api_sandbox_summary():
     return {
         "ok": True,
         "metrics": result,
+        "last_verify": last,
         "creds_synced": creds,
         "fleet_servers": len(fleet_ids),
         "creds_synced_count": len(creds),
@@ -759,27 +864,29 @@ async function loadServerVerdict(sid){
 async function loadSandbox(){
   const r = await api('GET','/api/sandbox/summary');
   const m = r.metrics||{};
-  const tot = m['rw_fleet_verify_checks_total']?? m['rw_sandbox_checks_total'];
-  const pass = m['rw_fleet_verify_checks_passed']?? m['rw_sandbox_checks_passed'];
-  const ts = m['rw_fleet_verify_last_run_timestamp_seconds']?? m['rw_sandbox_last_run_timestamp_seconds'];
-  const fails = Object.entries(m).filter(([k,v])=>k.includes('verify_ok')&&v===0).length;
+  const lv = r.last_verify;
+  const fails = Object.entries(m).filter(([k,v])=>
+    (k.startsWith('rw_fleet_verify_ok')||k.startsWith('rw_stack_verify_ok'))&&v===0).length;
   const fleetN = r.fleet_servers ?? Object.keys(window._fleet||{}).length;
   const synced = r.creds_synced_count ?? Object.keys(r.creds_synced||{}).length;
-  let checks;
-  if(tot==null && pass==null){
-    checks = `<span class="mut">проверок: нет данных</span>`+
-      ` <span class="mut">(запустите «Проверка парка» — метрики пишутся в textfile + история)</span>`;
+  let checks, ts = lv && lv.ts;
+  if(lv && lv.kind==='fleet'){
+    checks = `проверок: <b class="${lv.ok?'ok':'bad'}">${lv.passed}/${lv.total}</b>`;
+  }else if(lv && lv.kind==='stack'){
+    checks = `стек: <b class="${lv.ok?'ok':'bad'}">${lv.ok?'ok':'fail'}</b>`+
+      (lv.label?` <span class="mut">${lv.label}</span>`:'');
+  }else if(lv){
+    checks = `проверок: <b class="${lv.ok?'ok':'bad'}">${lv.passed}/${lv.total}</b>`;
   }else{
-    const t = tot??'—', p = pass??'—';
-    checks = `проверок: <b class="${p===t?'ok':'bad'}">${p}/${t}</b>`;
+    checks = `<span class="mut">проверок: нет данных</span>`;
   }
   const credCls = (fleetN>0 && synced===fleetN) ? 'ok' : (synced>0 ? '' : 'mut');
   const creds = fleetN
     ? `кредов: <b class="${credCls}">${synced}/${fleetN}</b> <span class="mut">серв.</span>`
     : `<span class="mut">кредов: нет серверов в парке</span>`;
   $('sandbox').innerHTML = checks+
-    (fails?` · ошибок матрицы: <b class="bad">${fails}</b>`:'')+
-    (ts?` · последний прогон: ${new Date(ts*1000).toLocaleString()}`:'')+
+    (fails?` · ошибок: <b class="bad">${fails}</b>`:'')+
+    (ts?` · ${new Date(ts*1000).toLocaleString()}`:'')+
     ` · ${creds}`;
 }
 function fmtHist(h){

@@ -240,7 +240,21 @@ assert any(k.startswith("rw_fleet_verify_ok{") and "pitr" in k and m[k] == 0.0
 # summary без .prom → history
 s = webapp.api_sandbox_summary()
 assert s["metrics"]["rw_fleet_verify_checks_total"] == 4.0, s
+assert s["last_verify"]["kind"] == "fleet", s
+assert s["last_verify"]["passed"] == 3, s
 print("PASS sandbox summary history fallback")
+
+# stack новее fleet → last_verify=stack (не «нет данных» при зелёной истории)
+(hist_dir / "stack_20260725_130000.json").write_text(json.dumps({
+  "type": "stack", "ts": 1721901000, "project": "panel",
+  "source": "v567005", "fleet_id": "tyler-panel-1", "ok": True,
+  "detail": "containers 2/2 services 2",
+}))
+s_stack = webapp.api_sandbox_summary()
+assert s_stack["last_verify"]["kind"] == "stack", s_stack
+assert s_stack["last_verify"]["ok"] is True, s_stack
+assert s_stack["last_verify"]["label"] == "tyler-panel-1-panel", s_stack
+print("PASS sandbox summary stack history")
 
 # creds: только серверы из fleet, не хвосты fleet-creds/*
 fleet_file = inst / "fleet.json"
