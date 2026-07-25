@@ -2165,14 +2165,14 @@ menu_verify() {
           fargs+=(--server "$sid")
         fi
         msg INFO "Запуск: verify-fleet.sh ${fargs[*]-}"
-        "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
+        # sync-fleet-creds уже внутри verify-fleet.sh — здесь не дублируем.
         "${SANDBOX_SCRIPTS_DIR}/verify-fleet.sh" ${fargs[@]+"${fargs[@]}"} || true
         pause ;;
       stack)
         local scope sid pr mode keep
         local -a s_extra=()
-        # Свежие креды + манифест до меню — чтобы список инстансов был актуальным.
-        "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
+        # Только манифест до меню (список инстансов). Креды — один раз ниже
+        # в run_verify_stack_all / перед одиночным verify-stack, не здесь.
         FLEET_FORCE_MANIFEST=1 fleet_refresh_manifest_cache || true
         scope="$(ask_choice "Охват:" \
           "один сервер → один инстанс" \
@@ -2198,6 +2198,7 @@ menu_verify() {
         pr="$(printf '%s\n' "${pr:-panel}" | tail -n1 | tr -d '\r')"
         [[ "$pr" =~ ^[A-Za-z0-9_.-]+$ ]] || pr="panel"
         msg INFO "Запуск: verify-stack.sh ${pr} --source ${sid} ${s_extra[*]-}  (в вебе: ${sid}-${pr})"
+        "${SANDBOX_SCRIPTS_DIR}/sync-fleet-creds.sh" || true
         "${SANDBOX_SCRIPTS_DIR}/verify-stack.sh" "$pr" --source "$sid" ${s_extra[@]+"${s_extra[@]}"} || true
         pause ;;
       local) "${SANDBOX_SCRIPTS_DIR}/verify-backup.sh" || true; pause ;;
