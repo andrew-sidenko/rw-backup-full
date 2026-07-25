@@ -391,44 +391,118 @@ check_db_profile() { # <контейнер> <пользователь>
 # Восстановление БД из базового бэкапа + WAL (режимы base/pitr). Поднимается
 # в ТОЙ ЖЕ изолированной сети и с теми же сетевыми алиасами, что и при
 # логическом дампе, — приложение стека не видит разницы.
+#
+# Важно: шаги долгие (скачивание base/WAL, pull образа, recovery). Без
+# промежуточных INFO это выглядит как «зависло намертво» — поэтому каждый
+# этап пишет прогресс, а ожидание recovery — heartbeat с хвостом логов.
 restore_db_from_wal() { # <meta-файл в S3> <target-time|"">
   local meta_name="$1" target_time="$2"
   local wal_base="${B_PREFIX}/wal/$(rw_source_id)/${PROJECT}"
-  local pgdata="${WORK}/pgdata" walstage="${WORK}/walstage"
-  mkdir -p "$pgdata" "$walstage"
+  local pgdata="${WORK}/pgdata" walstage="${WORK}/walstage" wal_raw="${WORK}/wal_raw"
+  local errf t0 t1 size_h actual uid staged recovered in_rec i key seg is_hist
+  local raw_count processed failed_wal
+  mkdir -p "$pgdata" "$walstage" "$wal_raw"
+  errf="${WORK}/restore_db.err"
 
-  s3m_aws s3 cp "s3://${B_BUCKET}/${wal_base}/basebackup/${meta_name}" "${WORK}/backup.meta" \
-    --only-show-errors 2>/dev/null || { msg ERR "не скачался ${meta_name}"; return 1; }
-
-  local BACKUP_NAME FILE SHA256 START_SEGMENT PG_VERSION_NUM ENCRYPTED
-  set +u; # shellcheck disable=SC1090
-  source "${WORK}/backup.meta"; set -u
-
-  if truthy "${ENCRYPTED:-false}" && [[ -z "${SANDBOX_AGE_IDENTITY:-}" || ! -f "${SANDBOX_AGE_IDENTITY:-}" ]]; then
-    msg ERR "базовый бэкап зашифрован, SANDBOX_AGE_IDENTITY не задан"; return 1
-  fi
-
-  s3m_aws s3 cp "s3://${B_BUCKET}/${wal_base}/basebackup/${FILE}" "${WORK}/${FILE}" \
-    --only-show-errors 2>/dev/null || { msg ERR "не скачался ${FILE}"; return 1; }
-  local actual; actual="$(sha256sum "${WORK}/${FILE}" | awk '{print $1}')"
-  [[ "$actual" == "$SHA256" ]] || { msg ERR "SHA256 базового бэкапа не совпадает"; return 1; }
+  fmt_bytes() {
+    local n="${1:-0}"
+    if command -v numfmt >/dev/null 2>&1; then
+      numfmt --to=iec --suffix=B "$n" 2>/dev/null && return
+    fi
+    if (( n >= 1073741824 )); then printf '%dG' $((n / 1073741824))
+    elif (( n >= 1048576 )); then printf '%dM' $((n / 1048576))
+    elif (( n >= 1024 )); then printf '%dK' $((n / 1024))
+    else printf '%dB' "$n"; fi
+  }
 
   unpack_one() { # <имя файла>
-    local n="$1" b="$1"
+    local b="$1"
     if [[ "$b" == *.age ]]; then
-      b="${b%.age}"; age -d -i "$SANDBOX_AGE_IDENTITY" | wal_decompress_stream "$b"
+      b="${b%.age}"
+      age -d -i "$SANDBOX_AGE_IDENTITY" | wal_decompress_stream "$b"
     else
       wal_decompress_stream "$b"
     fi
   }
 
-  unpack_one "$FILE" < "${WORK}/${FILE}" | tar -xf - -C "$pgdata" 2>/dev/null
-  [[ -f "${pgdata}/PG_VERSION" ]] || { msg ERR "после распаковки нет PG_VERSION"; return 1; }
+  # Глобальные опции aws до сервиса: быстрее падать на чёрной дыре TCP,
+  # а не висеть десятки минут без вывода.
+  sbx_aws() {
+    s3m_aws --cli-connect-timeout 30 --cli-read-timeout 120 "$@"
+  }
 
-  # Стейджинг WAL. .backup-файлы исключаются явно: их первые 24 символа
-  # совпадают с именем сегмента, и без фильтра backup-label подменял бы
-  # собой настоящий 16-МБ сегмент (см. CHANGELOG v5.2.0).
-  local staged=0 key seg is_hist
+  msg INFO "[${PROJECT}] meta: ${meta_name}"
+  t0="$(date +%s)"
+  if ! sbx_aws s3 cp "s3://${B_BUCKET}/${wal_base}/basebackup/${meta_name}" \
+       "${WORK}/backup.meta" --only-show-errors 2>"$errf"; then
+    msg ERR "не скачался ${meta_name}: $(tr '\n' ' ' <"$errf" | head -c 300)"
+    return 1
+  fi
+
+  local BACKUP_NAME FILE SHA256 START_SEGMENT PG_VERSION_NUM ENCRYPTED SIZE_BYTES CREATED_AT
+  set +u; # shellcheck disable=SC1090
+  source "${WORK}/backup.meta"; set -u
+  size_h="$(fmt_bytes "${SIZE_BYTES:-0}")"
+  msg OK "[${PROJECT}] базовый бэкап: ${BACKUP_NAME:-?} (PG ${PG_VERSION_NUM:-?}, ${size_h}, создан ${CREATED_AT:-?}, WAL с ${START_SEGMENT:-?})"
+
+  if truthy "${ENCRYPTED:-false}" && [[ -z "${SANDBOX_AGE_IDENTITY:-}" || ! -f "${SANDBOX_AGE_IDENTITY:-}" ]]; then
+    msg ERR "базовый бэкап зашифрован, SANDBOX_AGE_IDENTITY не задан"; return 1
+  fi
+
+  # Образ проверяем ДО долгих скачиваний — иначе pull «втихую» в конце
+  # выглядит как зависание после уже минут ожидания.
+  if docker image inspect "$DB_IMAGE" >/dev/null 2>&1; then
+    msg INFO "[${PROJECT}] образ БД уже есть: ${DB_IMAGE}"
+  else
+    msg INFO "[${PROJECT}] образ ${DB_IMAGE} отсутствует локально — скачиваю..."
+    if ! docker pull "$DB_IMAGE"; then
+      msg ERR "не удалось скачать образ ${DB_IMAGE}"
+      return 1
+    fi
+    msg OK "[${PROJECT}] образ ${DB_IMAGE} скачан"
+  fi
+
+  msg INFO "[${PROJECT}] скачиваю ${FILE} (${size_h}) из s3://${B_BUCKET}/${wal_base}/basebackup/ ..."
+  t0="$(date +%s)"
+  if ! sbx_aws s3 cp "s3://${B_BUCKET}/${wal_base}/basebackup/${FILE}" \
+       "${WORK}/${FILE}" --only-show-errors 2>"$errf"; then
+    msg ERR "не скачался ${FILE}: $(tr '\n' ' ' <"$errf" | head -c 300)"
+    return 1
+  fi
+  t1="$(date +%s)"
+  msg OK "[${PROJECT}] ${FILE} скачан за $((t1 - t0))с ($(fmt_bytes "$(stat -c%s "${WORK}/${FILE}")"))"
+
+  msg INFO "[${PROJECT}] проверяю SHA256..."
+  actual="$(sha256sum "${WORK}/${FILE}" | awk '{print $1}')"
+  [[ "$actual" == "$SHA256" ]] || { msg ERR "SHA256 базового бэкапа не совпадает"; return 1; }
+  msg OK "[${PROJECT}] SHA256 совпадает"
+
+  msg INFO "[${PROJECT}] распаковываю PGDATA (это может занять несколько минут)..."
+  t0="$(date +%s)"
+  if ! unpack_one "$FILE" < "${WORK}/${FILE}" | tar -xf - -C "$pgdata" 2>"$errf"; then
+    msg ERR "распаковка basebackup не удалась: $(tr '\n' ' ' <"$errf" | head -c 300)"
+    return 1
+  fi
+  [[ -f "${pgdata}/PG_VERSION" ]] || { msg ERR "после распаковки нет PG_VERSION"; return 1; }
+  t1="$(date +%s)"
+  msg OK "[${PROJECT}] PGDATA развёрнут за $((t1 - t0))с"
+
+  # Стейджинг WAL: один s3 sync вместо сотен отдельных aws s3 cp (каждый
+  # холодный старт CLI + TLS). .backup-файлы исключаются — иначе backup-label
+  # подменяет сегмент (см. CHANGELOG v5.2.0).
+  msg INFO "[${PROJECT}] скачиваю WAL (s3 sync) s3://${B_BUCKET}/${wal_base}/wal/ ..."
+  t0="$(date +%s)"
+  if ! sbx_aws s3 sync "s3://${B_BUCKET}/${wal_base}/wal/" "$wal_raw/" \
+       --exclude "*.backup*" \
+       --only-show-errors 2>"$errf"; then
+    msg ERR "s3 sync WAL не удался: $(tr '\n' ' ' <"$errf" | head -c 300)"
+    return 1
+  fi
+  t1="$(date +%s)"
+  raw_count="$(find "$wal_raw" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  msg OK "[${PROJECT}] WAL sync: ${raw_count} объект(ов) за $((t1 - t0))с; распаковываю с ${START_SEGMENT}..."
+
+  staged=0; processed=0; failed_wal=0
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
     [[ "$key" == *.backup* ]] && continue
@@ -437,17 +511,30 @@ restore_db_from_wal() { # <meta-файл в S3> <target-time|"">
     # shellcheck disable=SC2071
     if [[ "$is_hist" == "true" ]] || [[ "$seg" > "$START_SEGMENT" ]] || [[ "$seg" == "$START_SEGMENT" ]]; then
       [[ -f "${walstage}/${seg}" ]] && continue
-      if s3m_aws s3 cp "s3://${B_BUCKET}/${wal_base}/wal/${key}" - --only-show-errors 2>/dev/null \
-           | unpack_one "$key" > "${walstage}/${seg}.part" 2>/dev/null; then
+      processed=$((processed + 1))
+      if unpack_one "$key" < "${wal_raw}/${key}" > "${walstage}/${seg}.part" 2>/dev/null; then
         mv -f "${walstage}/${seg}.part" "${walstage}/${seg}"
         staged=$((staged + 1))
+      else
+        rm -f "${walstage}/${seg}.part"
+        failed_wal=$((failed_wal + 1))
+      fi
+      if (( processed == 1 || processed % 25 == 0 )); then
+        msg INFO "[${PROJECT}] WAL: распаковано ${staged}/${processed} (из ${raw_count} скачанных)..."
       fi
     fi
-  done < <(s3m_aws s3 ls "s3://${B_BUCKET}/${wal_base}/wal/" 2>/dev/null | awk '{print $4}' | sort)
+  done < <(find "$wal_raw" -type f -printf '%P\n' 2>/dev/null | sort)
 
-  local uid
+  msg OK "[${PROJECT}] подготовлено WAL-сегментов: ${staged}${failed_wal:+, ошибок распаковки: ${failed_wal}}"
+  if (( staged == 0 )); then
+    msg WARN "[${PROJECT}] WAL не найден — восстановление только на момент базового бэкапа"
+  fi
+  # Сырые сжатые объекты больше не нужны (экономим место на песочнице).
+  rm -rf "$wal_raw"
+
   uid="$(docker run --rm --entrypoint id "$DB_IMAGE" -u postgres 2>/dev/null || true)"
   [[ "$uid" =~ ^[0-9]+$ ]] || uid=999
+  msg INFO "[${PROJECT}] chown PGDATA → uid=${uid}..."
   chown -R "${uid}:${uid}" "$pgdata" "$walstage" 2>/dev/null || true
   chmod 0700 "$pgdata"
 
@@ -456,34 +543,48 @@ restore_db_from_wal() { # <meta-файл в S3> <target-time|"">
     echo "archive_mode = 'off'"
     echo "archive_command = ''"
     echo "restore_command = 'cp /wal-archive/%f %p'"
+    echo "recovery_end_command = ''"
+    echo "hot_standby = on"
     echo "recovery_target_action = 'promote'"
     [[ -n "$target_time" ]] && echo "recovery_target_time = '${target_time}'"
+    [[ -n "$target_time" ]] && echo "recovery_target_inclusive = on"
   } >> "${pgdata}/postgresql.auto.conf"
   touch "${pgdata}/recovery.signal"
   rm -f "${pgdata}/postmaster.pid"
 
+  msg INFO "[${PROJECT}] запускаю контейнер БД (${DB_IMAGE}) для recovery..."
   docker run -d --name "$DB_C" --label "rw-sandbox-stack=${SID}" \
     --network "$NET" "${db_aliases[@]}" \
     -v "${pgdata}:/var/lib/postgresql/data" \
     -v "${walstage}:/wal-archive:ro" \
     -e POSTGRES_PASSWORD="$DB_PASS" \
-    "$DB_IMAGE" -c listen_addresses='*' >/dev/null 2>&1 \
-    || { msg ERR "контейнер БД не создался"; return 1; }
+    "$DB_IMAGE" -c listen_addresses='*' >/dev/null 2>"$errf" \
+    || { msg ERR "контейнер БД не создался: $(tr '\n' ' ' <"$errf" | head -c 300)"; return 1; }
 
-  local recovered=false in_rec
-  for _ in $(seq 1 300); do
+  msg INFO "[${PROJECT}] жду завершения recovery (до 600с, статус каждые 30с)..."
+  recovered=false
+  in_rec="?"
+  for i in $(seq 1 300); do
     if docker exec "$DB_C" pg_isready -h localhost -U "$DB_USER" >/dev/null 2>&1; then
       in_rec="$(docker exec "$DB_C" psql -h localhost -U "$DB_USER" -d postgres -qtAX \
         -c 'SELECT pg_is_in_recovery()' 2>/dev/null | tr -d ' ' || echo t)"
       [[ "$in_rec" == "f" ]] && { recovered=true; break; }
     fi
-    docker ps -q -f "name=${DB_C}" | grep -q . || break
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$DB_C" 2>/dev/null || echo false)" != "true" ]]; then
+      msg ERR "[${PROJECT}] контейнер БД остановился во время recovery"
+      docker logs "$DB_C" --tail 30 2>&1 | sed 's/^/    /' >&2 || true
+      return 1
+    fi
+    if (( i % 15 == 0 )); then
+      msg INFO "[${PROJECT}] recovery: $((i * 2))с / 600с (in_recovery=${in_rec})"
+      docker logs "$DB_C" --tail 4 2>&1 | sed 's/^/    /' >&2 || true
+    fi
     sleep 2
   done
 
   if [[ "$recovered" != "true" ]]; then
-    msg ERR "восстановление не завершилось. Логи БД:"
-    docker logs "$DB_C" --tail 20 2>&1 | sed 's/^/    /' >&2
+    msg ERR "восстановление не завершилось за 600с. Логи БД:"
+    docker logs "$DB_C" --tail 40 2>&1 | sed 's/^/    /' >&2
     return 1
   fi
   msg OK "[${PROJECT}] БД восстановлена: ${BACKUP_NAME} + ${staged} WAL-сегментов${target_time:+ на момент ${target_time}}"
