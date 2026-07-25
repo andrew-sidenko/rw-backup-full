@@ -106,7 +106,9 @@ fi
 # их без обращения к сети. Портируемый разбор на bash (без gawk-расширений).
 EXPORTER_PROM="${METRICS_DIR}/rw_exporter.prom"
 if [[ -f "$EXPORTER_PROM" ]]; then
-  declare -A _s3_bytes _s3_objs _s3_reach
+  # =() обязателен: под set -u пустой `declare -A x` даёт
+  # «x: unbound variable» на ${#x[@]} (сводка «сейчас» / 09:00/21:00).
+  declare -A _s3_bytes=() _s3_objs=() _s3_reach=()
   while IFS= read -r line; do
     case "$line" in
       'rw_s3_category_bytes{'*)
@@ -122,8 +124,12 @@ if [[ -f "$EXPORTER_PROM" ]]; then
   done < "$EXPORTER_PROM"
   if (( ${#_s3_bytes[@]} > 0 || ${#_s3_reach[@]} > 0 )); then
     BODY+=$'\nS3-хранилища (объём этого хоста):\n'
-    for b in "${!_s3_reach[@]}"; do
-      warn=""; [[ "${_s3_reach[$b]}" == "0" ]] && warn=" ⚠ недоступен"
+    # Ключи — объединение bytes∪reach (бэкенд мог попасть только в один тип метрик).
+    declare -A _s3_names=()
+    for b in "${!_s3_bytes[@]}"; do _s3_names["$b"]=1; done
+    for b in "${!_s3_reach[@]}"; do _s3_names["$b"]=1; done
+    for b in "${!_s3_names[@]}"; do
+      warn=""; [[ "${_s3_reach[$b]:-}" == "0" ]] && warn=" ⚠ недоступен"
       BODY+="  ${b}: занято $(human_bytes "${_s3_bytes[$b]:-0}") (${_s3_objs[$b]:-0} объектов)${warn}"$'\n'
     done
   fi

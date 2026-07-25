@@ -31,6 +31,14 @@ set -e
 check "host_usage read rc" "$_read_rc" "0"
 check "host_usage read bytes" "${_ub}" "0"
 
+# --- digest/status: пустой declare -A под set -u ---
+# Регрессия: `declare -A x` без =() → `${#x[@]}` → «x: unbound variable».
+set +e
+_digest_out="$(bash -c 'set -euo pipefail; declare -A _s3_bytes=() _s3_reach=(); echo "${#_s3_bytes[@]}:${#_s3_reach[@]}"' 2>&1)"
+_digest_rc=$?
+set -e
+check "empty assoc-array under set -u" "$_digest_rc:$_digest_out" "0:0:0"
+
 # --- ask_choice / menu_pick (extract from main script via bash) ---
 ask_choice() {
   local title="$1"; shift

@@ -1417,7 +1417,8 @@ status_json() {
   # live-листинг. Без fallback UI врал «0Б / 0 об.» на хостах без компонента
   # metrics (типичный prod: panel-backup wal config-track).
   local _mdir="${WAL_METRICS_DIR:-/var/lib/node_exporter/textfile_collector}"
-  declare -A _s3b _s3o _s3r _s3seen
+  # =() — иначе под set -u пустой assoc-array «unbound» на ${#_s3seen[@]} и т.п.
+  declare -A _s3b=() _s3o=() _s3r=() _s3seen=()
   if [[ -f "${_mdir}/rw_exporter.prom" ]]; then
     local _l _bk _v
     while IFS= read -r _l; do
