@@ -1433,8 +1433,10 @@ status_json() {
   [[ "$err_cnt" =~ ^[0-9]+$ ]] || err_cnt=0
   local wr="${WAL_ROOT:-/var/lib/rw-wal}"
   # Занятый локально объём (каталог бэкапов + WAL).
+  # du под pipefail даёт rc≠0, если каталога ещё нет — без || true
+  # весь status --json падает, и веб рисует offline.
   local lb_bytes
-  lb_bytes="$(du -sb "$BACKUP_DIR" "$wr" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  lb_bytes="$(du -sb "$BACKUP_DIR" "$wr" 2>/dev/null | awk '{s+=$1} END{print s+0}' || true)"
   [[ "$lb_bytes" =~ ^[0-9]+$ ]] || lb_bytes=0
 
   printf '{'
@@ -1460,9 +1462,12 @@ status_json() {
         _src_note="prom"
       else
         # Нет строк по этому бэкенду в prom (metrics выключен / ещё не бегал).
-        read -r _bytes _objs _rv < <(s3m_host_usage 2>/dev/null || echo "0 0 0")
+        # || true: read не должен валить status --json при пустом/битом ответе.
+        _bytes=0; _objs=0; _rv=0
+        read -r _bytes _objs _rv < <(s3m_host_usage 2>/dev/null || echo "0 0 0") || true
         [[ "$_bytes" =~ ^[0-9]+$ ]] || _bytes=0
         [[ "$_objs" =~ ^[0-9]+$ ]] || _objs=0
+        [[ "$_rv" =~ ^[0-9]+$ ]] || _rv=0
         _reach="$([[ "${_rv:-0}" == "1" ]] && echo true || echo false)"
         _src_note="live"
       fi
