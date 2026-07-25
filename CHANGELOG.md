@@ -9,6 +9,7 @@
 
 ### Документация
 - `instances.d/panel.env.example`: не переименовывать `panel` / не ставить `INST_KIND=tyler-panel` ради уникальности в парке.
+- `README-RU` §песочница: не копировать `instances.d` в одну папку на sandbox — инстансы с хостов через манифест, креды в `fleet-creds/<id>/`.
 
 ## v5.6.0 (2026-07-25)
 
