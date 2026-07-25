@@ -39,6 +39,26 @@ _digest_rc=$?
 set -e
 check "empty assoc-array under set -u" "$_digest_rc:$_digest_out" "0:0:0"
 
+# --- msg / pick_verify_project: логи не должны попадать в $() ---
+msg() {
+  local type="$1" text="$2"
+  printf '[%s] %s\n' "$type" "$text" >&2
+}
+pick_verify_project_sim() {
+  local sid="$1" name=panel
+  echo "  Проект: ${sid}-${name}  → в команде: ${name}" >&2
+  printf '%s\n' "$name"
+}
+_pr_out="$(pick_verify_project_sim tyler-panel-1 2>/tmp/pick_err.$$)"
+_pr_err="$(cat /tmp/pick_err.$$ 2>/dev/null || true)"; rm -f /tmp/pick_err.$$
+check "pick_verify stdout is project" "$_pr_out" "panel"
+[[ "$_pr_err" == *"tyler-panel-1-panel"* ]] && pass "pick_verify stderr has label" || fail "pick_verify stderr" "$_pr_err"
+# Регрессия старого msg→stdout: tail -n1 + валидация спасают
+_pr_polluted=$'[INFO] Проект: x-panel → panel\npanel'
+_pr_fix="$(printf '%s\n' "$_pr_polluted" | tail -n1 | tr -d '\r')"
+[[ "$_pr_fix" =~ ^[A-Za-z0-9_.-]+$ ]] || _pr_fix=panel
+check "sanitize polluted project" "$_pr_fix" "panel"
+
 # --- ask_choice / menu_pick (extract from main script via bash) ---
 ask_choice() {
   local title="$1"; shift

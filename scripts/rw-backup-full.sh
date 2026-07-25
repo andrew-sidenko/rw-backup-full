@@ -72,7 +72,9 @@ msg() {
     ERR) color="$RED" ;;
   esac
 
-  echo -e "${color}[${type}]${RESET} ${text}"
+  # Только stderr: иначе `pr="$(pick_…)"` / любые $() захватывают [INFO] в значение
+  # (verify-stack получал проект «[INFO] Проект: … panel» вместо panel).
+  printf '%s[%s]%s %s\n' "$color" "$type" "$RESET" "$text" >&2
 }
 
 pause() {
@@ -1873,8 +1875,9 @@ pick_verify_project() { # <server_id>
   echo "  Не подставляйте id карточки и не переименовывайте инстанс:" >&2
   echo "  в вебе уже показывается «${sid:-сервер}-<инстанс>»." >&2
   if (( ${#names[@]} == 1 )); then
-    msg INFO "Проект: ${sid:-?}-${names[0]}  → в команде: ${names[0]} (kind=${kinds[0]})"
-    printf '%s' "${names[0]}"
+    echo "  Проект: ${sid:-?}-${names[0]}  → в команде: ${names[0]} (kind=${kinds[0]})" >&2
+    # stdout — ТОЛЬКО каноническое имя проекта (для $()); подписи — в stderr.
+    printf '%s\n' "${names[0]}"
     return 0
   fi
   i=1
@@ -1887,7 +1890,7 @@ pick_verify_project() { # <server_id>
   if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#names[@]} )); then
     pick=1
   fi
-  printf '%s' "${names[$((pick - 1))]}"
+  printf '%s\n' "${names[$((pick - 1))]}"
 }
 
 # Выбор инстанса из instances.d (вместо ручного ввода имени)
@@ -2071,7 +2074,9 @@ menu_verify() {
           [[ -n "$sid" ]] || { msg ERR "Без --source на песочнице стек не из чего собирать"; pause; continue; }
         }
         pr="$(pick_verify_project "$sid")" || pr="panel"
-        pr="${pr:-panel}"
+        # На случай старого msg→stdout: берём последнюю строку и валидируем имя.
+        pr="$(printf '%s\n' "${pr:-panel}" | tail -n1 | tr -d '\r')"
+        [[ "$pr" =~ ^[A-Za-z0-9_.-]+$ ]] || pr="panel"
         mode="$(ask_choice "Способ подъёма БД:" \
           "автоматически по ротации" "логический дамп" "базовый бэкап" "базовый бэкап + WAL (PITR)")"
         keep="$(ask_choice "После проверки:" "убрать всё" "оставить контейнеры для разбора")"
@@ -2092,7 +2097,8 @@ menu_verify() {
         sid="$(pick_fleet_server 2>/dev/null)" || sid="$(rw_source_id)"
         read -r -p "  ID сервера [${sid}]: " sid_in; sid="${sid_in:-$sid}"
         pr="$(pick_verify_project "$sid")" || pr="panel"
-        pr="${pr:-panel}"
+        pr="$(printf '%s\n' "${pr:-panel}" | tail -n1 | tr -d '\r')"
+        [[ "$pr" =~ ^[A-Za-z0-9_.-]+$ ]] || pr="panel"
         bn="$(s3m_backends | head -n1)"
         if [[ -n "$bn" ]] && s3m_load "$bn"; then
           msg INFO "Следующий прогон проверит:"

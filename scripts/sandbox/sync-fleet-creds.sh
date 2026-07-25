@@ -86,4 +86,5 @@ EOF
 done < <(jq -c '.servers[]?' <<<"$MANIFEST")
 
 msg OK "Синхронизировано серверов: ${synced} → ${CREDS_ROOT}"
-echo "$synced"
+# Число — только в msg (stderr). Раньше `echo "$synced"` в stdout давал
+# голую «1» в интерактивном меню перед следующим [OK].
