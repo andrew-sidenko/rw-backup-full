@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "work_dir": "/var/lib/rw-backup-verify",
+  "pg_version": "17",
+  "settle_seconds": 25,
+  "notify_on_success": true,
+  "telegram": {
+    "token": "",
+    "chat_id": "",
+    "thread_id": ""
+  },
+  "storages": []
+}

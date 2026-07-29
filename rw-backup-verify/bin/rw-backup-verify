@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Главный CLI: rw-backup-verify <команда> ...
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+rw-backup-verify — автономная проверка логических бэкапов в S3
+
+  storage list
+  storage show <id>
+  storage add --id NAME --bucket B --access-key K --secret-key S
+              [--endpoint URL] [--prefix P] [--region R]
+              [--times HH:MM,HH:MM | --interval-hours N]
+              [--backup-hint TEXT] [--categories panel,custom-bot]
+  storage remove <id>
+
+  telegram set --token T --chat-id C [--thread-id N]
+  telegram show
+
+  discover <storage-id>
+  run [--storage ID] [--due]     # без --due: сразу в очередь выбранные/все
+  run-one <storage> <category> <source> <archive-key>
+  queue status|clear|work        # work — обработать очередь сейчас
+  tick                           # для systemd timer: due → enqueue → work
+EOF
+}
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || { usage; exit 1; }
+shift || true
+
+case "$cmd" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+# ensure config exists for most commands
+if [[ ! -f "$RBV_CONFIG" ]]; then
+  if [[ "$cmd" == "init" ]]; then
+    mkdir -p "$(dirname "$RBV_CONFIG")"
+    cp "${ROOT}/config/config.example.json" "$RBV_CONFIG"
+    chmod 600 "$RBV_CONFIG"
+    mkdir -p "$(rbv_cfg '.work_dir // "/var/lib/rw-backup-verify"' 2>/dev/null || echo /var/lib/rw-backup-verify)"
+    msg OK "Создан $RBV_CONFIG"
+    exit 0
+  fi
+  msg ERR "Нет $RBV_CONFIG — сначала: sudo rw-backup-verify init (или install.sh)"
+  exit 1
+fi
+
+rbv_load_config
+
+case "$cmd" in
+  init)
+    msg INFO "Конфиг уже есть: $RBV_CONFIG"
+    ;;
+
+  storage)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      list)
+        jq -r '.storages[] | "\(.id)\tprefix=\(.prefix)\tbucket=\(.bucket)\tverify=\(.verify|tostring)\thint=\(.backup_hint // "")"' \
+          "$RBV_CONFIG"
+        ;;
+      show)
+        id="${1:?id}"
+        jq --arg id "$id" '.storages[] | select(.id==$id)' "$RBV_CONFIG"
+        ;;
+      remove)
+        id="${1:?id}"
+        jq --arg id "$id" 'del(.storages[] | select(.id==$id))' "$RBV_CONFIG" | rbv_save_config
+        msg OK "Удалено: $id"
+        ;;
+      add)
+        ID=""; EP=""; BUCKET=""; AK=""; SK=""; REGION="us-east-1"
+        PREFIX="rw-backup-full"; TIMES=""; INTERVAL=""; HINT=""
+        CATS='["panel","custom-bot"]'
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --id) ID="$2"; shift 2 ;;
+            --endpoint) EP="$2"; shift 2 ;;
+            --bucket) BUCKET="$2"; shift 2 ;;
+            --access-key) AK="$2"; shift 2 ;;
+            --secret-key) SK="$2"; shift 2 ;;
+            --region) REGION="$2"; shift 2 ;;
+            --prefix) PREFIX="$2"; shift 2 ;;
+            --times) TIMES="$2"; shift 2 ;;
+            --interval-hours) INTERVAL="$2"; shift 2 ;;
+            --backup-hint) HINT="$2"; shift 2 ;;
+            --categories) CATS="$(jq -nc --arg s "$2" '$s|split(",")')"; shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        [[ -n "$ID" && -n "$BUCKET" && -n "$AK" && -n "$SK" ]] \
+          || { msg ERR "--id --bucket --access-key --secret-key обязательны"; exit 1; }
+        verify='{}'
+        if [[ -n "$INTERVAL" ]]; then
+          verify="$(jq -nc --argjson h "$INTERVAL" '{interval_hours:$h}')"
+        elif [[ -n "$TIMES" ]]; then
+          verify="$(jq -nc --arg s "$TIMES" '{times:($s|split(","))}')"
+        else
+          verify='{"times":["06:30"]}'
+        fi
+        entry="$(jq -nc \
+          --arg id "$ID" --arg ep "$EP" --arg b "$BUCKET" \
+          --arg ak "$AK" --arg sk "$SK" --arg r "$REGION" --arg p "$PREFIX" \
+          --arg hint "$HINT" --argjson cats "$CATS" --argjson ver "$verify" \
+          '{id:$id, endpoint:$ep, bucket:$b, access_key:$ak, secret_key:$sk,
+            region:$r, prefix:$p, backup_hint:$hint, categories:$cats,
+            verify:$ver, telegram:{}}')"
+        jq --argjson e "$entry" '
+          .storages = ([.storages[] | select(.id != $e.id)] + [$e])
+        ' "$RBV_CONFIG" | rbv_save_config
+        msg OK "Хранилище ${ID} сохранено"
+        ;;
+      *) msg ERR "storage: list|show|add|remove"; exit 1 ;;
+    esac
+    ;;
+
+  telegram)
+    sub="${1:-show}"; shift || true
+    case "$sub" in
+      show) jq '.telegram' "$RBV_CONFIG" ;;
+      set)
+        TOK=""; CHAT=""; THR=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --token) TOK="$2"; shift 2 ;;
+            --chat-id) CHAT="$2"; shift 2 ;;
+            --thread-id) THR="$2"; shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        [[ -n "$TOK" && -n "$CHAT" ]] || { msg ERR "--token и --chat-id"; exit 1; }
+        jq --arg t "$TOK" --arg c "$CHAT" --arg h "$THR" \
+          '.telegram.token=$t | .telegram.chat_id=$c | .telegram.thread_id=$h' \
+          "$RBV_CONFIG" | rbv_save_config
+        msg OK "Telegram сохранён"
+        ;;
+      *) msg ERR "telegram: show|set"; exit 1 ;;
+    esac
+    ;;
+
+  discover)
+    sid="${1:?storage-id}"
+    rbv_discover "$sid" | while IFS='|' read -r c s k; do
+      printf '%-12s %-20s %s\n' "$c" "$s" "$k"
+    done
+    ;;
+
+  run)
+    DUE=false; ONLY=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --due) DUE=true; shift ;;
+        --storage) ONLY="$2"; shift 2 ;;
+        *) msg ERR "unknown $1"; exit 1 ;;
+      esac
+    done
+    if [[ -n "$ONLY" ]]; then
+      ids=("$ONLY")
+    else
+      mapfile -t ids < <(jq -r '.storages[].id' "$RBV_CONFIG")
+    fi
+    for sid in "${ids[@]}"; do
+      if [[ "$DUE" == true ]]; then
+        rbv_storage_due "$sid" || continue
+      fi
+      rbv_enqueue_storage "$sid" "$([[ $DUE == true ]] && echo schedule || echo manual)"
+    done
+    "${SCRIPT_DIR}/rbv-worker.sh"
+    ;;
+
+  run-one)
+    exec "${SCRIPT_DIR}/rbv-run-one.sh" "$@"
+    ;;
+
+  queue)
+    sub="${1:-status}"; shift || true
+    case "$sub" in
+      status)
+        ls -1 "$(rbv_queue_dir)"/*.job 2>/dev/null || echo "(пусто)"
+        ;;
+      clear)
+        rm -f "$(rbv_queue_dir)"/*.job
+        msg OK "Очередь очищена"
+        ;;
+      work)
+        exec "${SCRIPT_DIR}/rbv-worker.sh"
+        ;;
+      *) msg ERR "queue: status|clear|work"; exit 1 ;;
+    esac
+    ;;
+
+  tick)
+    # Для systemd timer (каждую минуту): кто due → в очередь → worker.
+    # Совпавшие тайминги разных storage попадают в очередь и идут строго по одному.
+    mapfile -t ids < <(jq -r '.storages[].id' "$RBV_CONFIG")
+    for sid in "${ids[@]}"; do
+      if rbv_storage_due "$sid"; then
+        rbv_enqueue_storage "$sid" "schedule"
+      fi
+    done
+    "${SCRIPT_DIR}/rbv-worker.sh"
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac

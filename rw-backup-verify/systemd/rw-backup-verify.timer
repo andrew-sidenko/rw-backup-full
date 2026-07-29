@@ -1,0 +1,11 @@
+[Unit]
+Description=rw-backup-verify schedule tick (every minute)
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=15s
+Persistent=true
+Unit=rw-backup-verify.service
+
+[Install]
+WantedBy=timers.target
