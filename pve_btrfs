@@ -1,0 +1,269 @@
+#!/bin/sh
+# setup-luks2-btrfs-raid1.sh
+#
+# Полное шифрование root: LUKS2 x2 + Btrfs RAID1 поверх, для Debian 13 (trixie).
+#
+# ГДЕ ЗАПУСКАТЬ:
+#   Debian Netinst -> "Advanced options" -> "Expert install"
+#   -> дойти до шага разметки дисков (partman), НЕ выбирать автоматическую разметку
+#   -> переключиться в консоль: Ctrl+Alt+F2 (вернуться в инсталлятор: Ctrl+Alt+F1 или F5)
+#   -> вы окажетесь в busybox shell (`~ #`) — это тот же shell, что у вас на скриншоте
+#
+# ВАЖНО: этот shell — busybox, там НЕТ dosfstools, часто нет debootstrap/btrfs-progs.
+# Поэтому:
+#   - разметку, LUKS, mkfs.btrfs скрипт делает прямо тут (эти бинари в d-i есть,
+#     т.к. это часть образа инсталлятора)
+#   - debootstrap тоже есть в d-i (используется самим инсталлятором)
+#   - а вот mkfs.vfat для ESP — делаем ПОСЛЕ debootstrap, внутри chroot,
+#     где уже будет apt и можно поставить dosfstools
+#
+# Если debootstrap или btrfs-progs всё же не найдутся командой `which` —
+# скрипт сам скажет, чего не хватает, и на каком шаге остановиться,
+# чтобы вернуться в partman и подгрузить нужный udeb через меню
+# "Load installer components from installation media".
+#
+# Скрипт ИДЕМПОТЕНТЕН: повторный запуск пропускает уже сделанные шаги
+# (проверяет наличие LUKS-заголовка, btrfs-сигнатуры, содержимого /target и т.д.)
+# Все destructive-операции (mkfs, luksFormat) требуют явного подтверждения "YES".
+
+set -eu
+
+# ---------- настройки (можно переопределить переменными окружения) ----------
+DISK1="${DISK1:-/dev/nvme0n1}"
+DISK2="${DISK2:-/dev/nvme1n1}"
+ESP_SIZE="${ESP_SIZE:-512MiB}"
+HOSTNAME="${HOSTNAME_TARGET:-}"
+TARGET=/target
+LOG=/tmp/setup-luks2-btrfs-raid1.log
+
+log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+die()  { log "ОШИБКА: $*"; exit 1; }
+
+confirm() {
+    # $1 — текст вопроса
+    printf '%s [YES/no] ' "$1"
+    read -r ans
+    case "$ans" in
+        YES) return 0 ;;
+        *) log "Отменено пользователем на шаге: $1"; exit 1 ;;
+    esac
+}
+
+need_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        log "Не найдена команда: $1"
+        log "$2"
+        exit 1
+    fi
+}
+
+# ---------- 0. базовые проверки окружения ----------
+[ "$(id -u)" = 0 ] || die "Запускать от root (в d-i shell вы и так root)."
+
+log "== Шаг 0: проверка нужных бинарей =="
+need_cmd parted     "Нет parted — вернитесь в меню partman хотя бы на секунду, он подтянет udeb."
+need_cmd cryptsetup "Нет cryptsetup — в partman выберите 'Configure encrypted volumes' один раз (можно Cancel потом), это подгрузит partman-crypto udeb с бинарём."
+need_cmd mkfs.btrfs "Нет mkfs.btrfs — аналогично, один раз зайдите в partman и выберите Btrfs для любого раздела, чтобы подгрузился partman-btrfs udeb."
+need_cmd debootstrap "Нет debootstrap — обычно есть в d-i всегда, если нет — проблема с образом инсталлятора."
+need_cmd blkid
+need_cmd lsblk
+
+log "Диски для установки: $DISK1 и $DISK2"
+for d in "$DISK1" "$DISK2"; do
+    [ -b "$d" ] || die "$d не существует или не блочное устройство. lsblk:\n$(lsblk)"
+done
+
+SIZE1=$(blockdev --getsize64 "$DISK1")
+SIZE2=$(blockdev --getsize64 "$DISK2")
+DIFF=$(( SIZE1 > SIZE2 ? SIZE1 - SIZE2 : SIZE2 - SIZE1 ))
+PCT=$(( DIFF * 100 / SIZE1 ))
+if [ "$PCT" -gt 2 ]; then
+    log "ВНИМАНИЕ: диски разного размера ($SIZE1 vs $SIZE2 байт, разница ${PCT}%)."
+    log "Btrfs RAID1 отработает, но полезный объём срежется до меньшего диска."
+    confirm "Продолжить с разными по размеру дисками?"
+fi
+
+# ---------- 1. разметка ----------
+part_exists() {
+    # проверяем что на диске уже 2 раздела с ожидаемыми размерами / esp-флагом
+    parted -s "$1" print 2>/dev/null | grep -q "esp"
+}
+
+log "== Шаг 1: разметка дисков =="
+if part_exists "$DISK1" && part_exists "$DISK2"; then
+    log "Разметка на обоих дисках уже похожа на нужную (найден esp-флаг) — пропускаю."
+else
+    log "Текущая разметка $DISK1 и $DISK2:"
+    parted -s "$DISK1" print || true
+    parted -s "$DISK2" print || true
+    confirm "ВСЕ ДАННЫЕ на $DISK1 и $DISK2 будут уничтожены. Продолжить разметку?"
+
+    for d in "$DISK1" "$DISK2"; do
+        parted -s "$d" -- mklabel gpt
+        parted -s "$d" -- mkpart ESP fat32 1MiB "$ESP_SIZE"
+        parted -s "$d" -- set 1 esp on
+        parted -s "$d" -- mkpart primary "$ESP_SIZE" 100%
+        partprobe "$d" || true
+    done
+    sleep 1
+fi
+
+P1_1="${DISK1}p1"; P1_2="${DISK1}p2"
+P2_1="${DISK2}p1"; P2_2="${DISK2}p2"
+# на не-nvme дисках (sdX) партиции без "p"
+case "$DISK1" in nvme*) : ;; *) P1_1="${DISK1}1"; P1_2="${DISK1}2" ;; esac
+case "$DISK2" in nvme*) : ;; *) P2_1="${DISK2}1"; P2_2="${DISK2}2" ;; esac
+
+for p in "$P1_1" "$P1_2" "$P2_1" "$P2_2"; do
+    [ -b "$p" ] || die "Раздел $p не появился после разметки. lsblk:\n$(lsblk)"
+done
+
+# ---------- 2. LUKS2 ----------
+log "== Шаг 2: LUKS2 =="
+
+is_luks() { cryptsetup isLuks "$1" 2>/dev/null; }
+
+if is_luks "$P1_2"; then
+    log "$P1_2 уже LUKS — пропускаю luksFormat."
+else
+    confirm "Отформатировать $P1_2 под LUKS2? (данные будут уничтожены)"
+    cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 \
+        --hash sha256 --pbkdf argon2id "$P1_2"
+fi
+
+if is_luks "$P2_2"; then
+    log "$P2_2 уже LUKS — пропускаю luksFormat."
+else
+    log "Введите ТОТ ЖЕ пароль, что и для первого диска — при загрузке он будет спрошен на каждом диске отдельно."
+    cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 \
+        --hash sha256 --pbkdf argon2id "$P2_2"
+fi
+
+open_mapper() {
+    name="$1"; dev="$2"
+    if [ -e "/dev/mapper/$name" ]; then
+        log "/dev/mapper/$name уже открыт — пропускаю."
+    else
+        cryptsetup open "$dev" "$name"
+    fi
+}
+open_mapper cryptroot0 "$P1_2"
+open_mapper cryptroot1 "$P2_2"
+
+# ---------- 3. Btrfs RAID1 ----------
+log "== Шаг 3: Btrfs RAID1 =="
+
+has_btrfs_sig() { blkid -o value -s TYPE "$1" 2>/dev/null | grep -q btrfs; }
+
+if has_btrfs_sig /dev/mapper/cryptroot0; then
+    log "На cryptroot0 уже есть btrfs-сигнатура — пропускаю mkfs.btrfs."
+else
+    confirm "Создать Btrfs RAID1 на cryptroot0+cryptroot1? (уничтожит данные внутри)"
+    mkfs.btrfs -f -m raid1 -d raid1 -L rootfs /dev/mapper/cryptroot0 /dev/mapper/cryptroot1
+fi
+
+mkdir -p "$TARGET"
+if mountpoint -q "$TARGET"; then
+    log "$TARGET уже смонтирован — пропускаю mount верхнего уровня."
+else
+    mount /dev/mapper/cryptroot0 "$TARGET"
+fi
+
+for sv in @ @home; do
+    if btrfs subvolume list "$TARGET" 2>/dev/null | grep -q "path $sv\$"; then
+        log "Подтом $sv уже существует."
+    else
+        btrfs subvolume create "$TARGET/$sv"
+    fi
+done
+
+umount "$TARGET"
+mount -o subvol=@,compress=zstd /dev/mapper/cryptroot0 "$TARGET"
+mkdir -p "$TARGET/home"
+mountpoint -q "$TARGET/home" || mount -o subvol=@home,compress=zstd /dev/mapper/cryptroot0 "$TARGET/home"
+
+# ---------- 4. debootstrap ----------
+log "== Шаг 4: debootstrap =="
+if [ -x "$TARGET/bin/sh" ] || [ -x "$TARGET/usr/bin/dpkg" ]; then
+    log "$TARGET уже похож на установленную систему — пропускаю debootstrap."
+else
+    debootstrap trixie "$TARGET" http://deb.debian.org/debian
+fi
+
+# ---------- 5. подготовка chroot: bind mounts ----------
+log "== Шаг 5: bind mounts для chroot =="
+for m in dev proc sys; do
+    mountpoint -q "$TARGET/$m" || mount --bind "/$m" "$TARGET/$m"
+done
+mkdir -p "$TARGET/boot/efi"
+
+# UUID-ы для crypttab / fstab / grub cmdline
+UUID1=$(blkid -o value -s UUID "$P1_2")
+UUID2=$(blkid -o value -s UUID "$P2_2")
+UUID_ESP=$(blkid -o value -s UUID "$P1_1" || true)
+
+# ---------- 6. генерируем скрипт для запуска ВНУТРИ chroot ----------
+log "== Шаг 6: конфигурация внутри chroot (сеть нужна, apt install dosfstools/grub) =="
+
+cat > "$TARGET/root/chroot-setup.sh" <<CHROOTEOF
+#!/bin/sh
+set -eu
+
+echo "== apt update + пакеты =="
+apt-get update
+apt-get install -y --no-install-recommends \\
+    dosfstools cryptsetup-initramfs grub-efi-amd64 btrfs-progs \\
+    linux-image-amd64 sudo openssh-server
+
+echo "== форматируем ESP (тут уже есть dosfstools, чего не было в d-i shell) =="
+if ! blkid -o value -s TYPE "$P1_1" 2>/dev/null | grep -q vfat; then
+    mkfs.vfat -F32 "$P1_1"
+fi
+mount "$P1_1" /boot/efi
+
+echo "== crypttab (один пароль, спросит на обоих дисках при загрузке) =="
+cat > /etc/crypttab <<EOF
+cryptroot0 UUID=$UUID1 none luks,discard
+cryptroot1 UUID=$UUID2 none luks,discard
+EOF
+
+echo "== fstab =="
+cat > /etc/fstab <<EOF
+/dev/mapper/cryptroot0 / btrfs subvol=@,compress=zstd,defaults 0 0
+/dev/mapper/cryptroot0 /home btrfs subvol=@home,compress=zstd,defaults 0 0
+UUID=$UUID_ESP /boot/efi vfat defaults 0 1
+EOF
+
+echo "== GRUB: указываем оба luks-устройства, чтобы initramfs знал что расшифровывать =="
+sed -i "s#^GRUB_CMDLINE_LINUX=.*#GRUB_CMDLINE_LINUX=\"rd.luks.uuid=$UUID1 rd.luks.uuid=$UUID2\"#" /etc/default/grub
+grep -q GRUB_ENABLE_CRYPTODISK /etc/default/grub || echo 'GRUB_ENABLE_CRYPTODISK=y' >> /etc/default/grub
+
+update-initramfs -u -k all
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian
+update-grub
+
+echo "== hostname =="
+if [ -n "${HOSTNAME:-}" ]; then
+    echo "$HOSTNAME" > /etc/hostname
+    sed -i "s/127.0.1.1.*/127.0.1.1\t$HOSTNAME/" /etc/hosts || echo "127.0.1.1 $HOSTNAME" >> /etc/hosts
+fi
+
+echo "== root-пароль =="
+echo "Задайте пароль root:"
+passwd
+
+echo "Chroot-настройка завершена."
+CHROOTEOF
+
+chmod +x "$TARGET/root/chroot-setup.sh"
+
+log "Захожу в chroot, дальше — интерактивно (apt install, пароль root)..."
+chroot "$TARGET" /root/chroot-setup.sh
+
+log "== Готово =="
+log "Второй ESP ($P2_1) пока не забутается сам по себе — после первой успешной загрузки"
+log "с $DISK1 можно склонировать содержимое ESP на второй диск (dd или rsync) на случай отказа $DISK1."
+log ""
+log "Дальше: umount -R $TARGET, cryptsetup close cryptroot0 cryptroot1, reboot,"
+log "убрать установочный носитель, загрузиться в свежепоставленный Debian 13 —"
+log "затем накатывать Proxmox VE 9 поверх (см. предыдущий шаг с репозиторием)."
