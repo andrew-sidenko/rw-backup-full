@@ -2,7 +2,8 @@
 # Один прогон экземпляра с расширенными проверками и TG-отчётом.
 # <storage-id> <kind:panel|bot> <instance_id> <s3_key> [parent_dir]
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "${SCRIPT_DIR}/../lib/common.sh"
 # shellcheck source=../lib/checks.sh

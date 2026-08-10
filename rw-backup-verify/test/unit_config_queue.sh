@@ -37,6 +37,17 @@ ih="$(jq -r '.verify.interval_hours' "$RBV_CONFIG")"
 "$ROOT/bin/rw-backup-verify" telegram set --token tok --chat-id 123 >/dev/null
 pass "telegram set"
 
+# --- symlink like install.sh: /usr/local/bin → …/bin/rw-backup-verify ---
+fake_local="$T/usr/local/bin"
+mkdir -p "$fake_local"
+ln -sfn "$ROOT/bin/rw-backup-verify" "$fake_local/rw-backup-verify"
+# Регресс: без readlink -f ROOT становился …/usr/local и искал …/usr/local/lib/common.sh
+if out="$("$fake_local/rw-backup-verify" telegram show 2>&1)"; then
+  printf '%s\n' "$out" | grep -q '"token"' && pass "symlink cli" || fail "symlink cli" "no token in: $out"
+else
+  fail "symlink cli" "$out"
+fi
+
 # --- tested registry ---
 rbv_mark_tested s1 "rw-backup-full/panel/h1/remnawave_backup_1.tar.gz" true "run1"
 if rbv_is_tested s1 "rw-backup-full/panel/h1/remnawave_backup_1.tar.gz"; then

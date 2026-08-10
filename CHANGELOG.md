@@ -1,5 +1,10 @@
 # Changelog
 
+## v5.6.17 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`rw-backup-verify: …/usr/local/lib/common.sh: No such file`**: CLI через симлинк `/usr/local/bin` считал `ROOT=/usr/local`. Теперь путь к дереву установки через `readlink -f` (+ fallback на `/opt/rw-backup-verify`).
+
 ## v5.6.16 (2026-08-10)
 
 ### Изменено (`rw-backup-verify`)

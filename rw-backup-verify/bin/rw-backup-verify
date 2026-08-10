@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # Главный CLI: rw-backup-verify <команда> ...
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Через /usr/local/bin симлинк dirname(BASH_SOURCE)=/usr/local/bin → нужен realpath.
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMMON="${ROOT}/lib/common.sh"
+# Запасной путь на случай копирования бинаря без дерева (install.sh ставит в /opt).
+if [[ ! -f "$COMMON" ]]; then
+  COMMON="${RBV_INSTALL_DIR:-/opt/rw-backup-verify}/lib/common.sh"
+fi
+if [[ ! -f "$COMMON" ]]; then
+  echo "[ERR] Не найден common.sh (ожидали ${ROOT}/lib/common.sh). Переустановите: sudo ./install.sh" >&2
+  exit 1
+fi
 # shellcheck source=../lib/common.sh
-source "${ROOT}/lib/common.sh"
+source "$COMMON"
 
 usage() {
   cat <<'EOF'
