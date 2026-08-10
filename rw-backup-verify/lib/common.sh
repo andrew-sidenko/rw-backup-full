@@ -8,7 +8,6 @@ __RBV_LIB=1
 RBV_INSTALL_DIR="${RBV_INSTALL_DIR:-/opt/rw-backup-verify}"
 RBV_CONFIG="${RBV_CONFIG:-/etc/rw-backup-verify/config.json}"
 # RBV_WORK_DIR / RBV_STATE_DIR — опциональные оверрайды (тесты/отладка).
-# Не задаём дефолт здесь, иначе перекрывается work_dir из config.json.
 
 msg() {
   local t="$1"; shift
@@ -40,7 +39,7 @@ rbv_work_dir() {
   else
     d="$(rbv_cfg '.work_dir // "/var/lib/rw-backup-verify"')"
   fi
-  mkdir -p "$d"/{queue,runs,locks,cache}
+  mkdir -p "$d"/{queue,runs,locks,cache,tested}
   printf '%s\n' "$d"
 }
 
@@ -63,7 +62,6 @@ rbv_tg_send() {
 }
 
 rbv_tg_for_storage() {
-  # stdout: token|chat|thread
   local sid="$1"
   local tok chat thr
   tok="$(jq -r --arg id "$sid" '
@@ -90,7 +88,6 @@ rbv_storage_json() {
 }
 
 rbv_aws_env() {
-  # export AWS_* from storage json on stdin / $1 json string
   local j="$1"
   export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_EC2_METADATA_DISABLED
   AWS_ACCESS_KEY_ID="$(jq -r '.access_key' <<<"$j")"
@@ -102,7 +99,7 @@ rbv_aws_env() {
   RBV_AWS_ENDPOINT=()
   [[ -n "$ep" ]] && RBV_AWS_ENDPOINT=(--endpoint-url "$ep")
   RBV_BUCKET="$(jq -r '.bucket' <<<"$j")"
-  RBV_PREFIX="$(jq -r '.prefix // "rw-backup-full"' <<<"$j" | sed 's:/*$::')"
+  RBV_PREFIX="$(jq -r '.prefix // ""' <<<"$j" | sed 's:/*$::')"
 }
 
 rbv_aws() {
@@ -110,106 +107,204 @@ rbv_aws() {
   aws "${RBV_AWS_ENDPOINT[@]}" "$@"
 }
 
-# List sources under <prefix>/<category>/
-rbv_list_sources() {
-  local category="$1"
-  local pref="${RBV_PREFIX}/${category}/"
-  rbv_aws s3 ls "s3://${RBV_BUCKET}/${pref}" 2>/dev/null \
-    | awk '/PRE/ {print $2}' | tr -d '/' | grep -v '^$' || true
+# Классификация имени файла → kind|family
+# kind: panel|bot
+# family: remnawave_backup | custom_bot_<ProjectSafe>
+# (family = экземпляр внутри одной папки; у ботов проект в имени файла)
+rbv_classify_name() {
+  local name="$1"
+  if [[ "$name" =~ ^remnawave_backup_.*\.tar\.gz(\.age)?$ ]]; then
+    printf 'panel|remnawave_backup\n'
+    return 0
+  fi
+  if [[ "$name" =~ ^custom_bot_(.+)_([0-9]{8}_[0-9]{6})\.tar\.gz(\.age)?$ ]]; then
+    printf 'bot|custom_bot_%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  # fallback: custom_bot_X_... без строгого TS
+  if [[ "$name" =~ ^custom_bot_(.+)\.tar\.gz(\.age)?$ ]]; then
+    local stem="${BASH_REMATCH[1]}"
+    # убрать хвостовой _YYYYMMDD_HHMMSS если есть
+    stem="$(sed -E 's/_[0-9]{8}_[0-9]{6}$//' <<<"$stem")"
+    printf 'bot|custom_bot_%s\n' "$stem"
+    return 0
+  fi
+  return 1
 }
 
-# List object keys (files) under <prefix>/<category>/<source>/
-rbv_list_archives() {
-  local category="$1" source="$2"
-  local pref="${RBV_PREFIX}/${category}/${source}/"
-  rbv_aws s3 ls "s3://${RBV_BUCKET}/${pref}" 2>/dev/null \
-    | awk '/\.tar\.gz(\.age)?$/ {print $4}' \
-    | grep -E '^(remnawave_backup_|custom_bot_)' || true
+# Рекурсивный листинг архивов под prefix.
+# stdout lines: relative_key (от корня bucket, без s3://)
+# Учитывает и корень prefix, и любую вложенность.
+rbv_list_all_archive_keys() {
+  local base="${RBV_PREFIX}"
+  local uri="s3://${RBV_BUCKET}/"
+  [[ -n "$base" ]] && uri="s3://${RBV_BUCKET}/${base}/"
+  # aws s3 ls --recursive: DATE TIME SIZE KEY
+  rbv_aws s3 ls "$uri" --recursive 2>/dev/null \
+    | awk '{print $4}' \
+    | grep -E '(^|/)(remnawave_backup_|custom_bot_)[^/]*\.tar\.gz(\.age)?$' \
+    || true
 }
 
-rbv_latest_archive() {
-  local category="$1" source="$2"
-  rbv_list_archives "$category" "$source" | sort | tail -n1
-}
-
-# Discover jobs: lines "category|source|key"
+# Discover: для каждого экземпляра (папка + family) — latest архив.
+# stdout: kind|instance_id|s3_key|parent_dir
+# instance_id стабилен: "<kind>:<parent_dir>:<family>"
+# --untested-only: пропустить уже протестированные ключи
 rbv_discover() {
   local sid="$1"
-  local j cats cat src key
+  local untested_only="${2:-false}"
+  local j key name parent kind family inst latest_line
   j="$(rbv_storage_json "$sid")"
   rbv_aws_env "$j"
-  cats="$(jq -r '.categories // ["panel","custom-bot"] | join(" ")' <<<"$j")"
-  local filter_sources
-  filter_sources="$(jq -r '.sources // empty | if .==null or .==[] then empty else join(" ") end' <<<"$j")"
-  for cat in $cats; do
-    while IFS= read -r src; do
-      [[ -n "$src" ]] || continue
-      if [[ -n "$filter_sources" ]]; then
-        [[ " $filter_sources " == *" $src "* ]] || continue
-      fi
-      key="$(rbv_latest_archive "$cat" "$src")"
-      [[ -n "$key" ]] || continue
-      printf '%s|%s|%s\n' "$cat" "$src" "$key"
-    done < <(rbv_list_sources "$cat")
-  done
+
+  # tmp: family_key → "sortkey|full_s3_key|parent|kind|family"
+  local tmp
+  tmp="$(mktemp)"
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    name="$(basename "$key")"
+    parent="$(dirname "$key")"
+    [[ "$parent" == "." ]] && parent=""
+    kind=""; family=""
+    IFS='|' read -r kind family < <(rbv_classify_name "$name" || true)
+    [[ -n "$kind" ]] || continue
+    # sortkey = имя файла (TS в имени → лексикографический latest корректен)
+    printf '%s\t%s\t%s\t%s\t%s\n' "${parent}|${family}" "$name" "$key" "$parent" "$kind" >> "$tmp"
+  done < <(rbv_list_all_archive_keys)
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  # по каждой группе parent|family берём max name
+  sort -t$'\t' -k1,1 -k2,2 "$tmp" \
+    | awk -F'\t' '
+      {
+        g=$1
+        if (g != prev) {
+          if (prev != "") print last
+          prev=g
+        }
+        last=$0
+      }
+      END { if (prev != "") print last }
+    ' \
+    | while IFS=$'\t' read -r _grp name key parent kind; do
+        family="$(rbv_classify_name "$name" | cut -d'|' -f2)"
+        inst="${kind}:${parent}:${family}"
+        if [[ "$untested_only" == "true" ]] && rbv_is_tested "$sid" "$key"; then
+          msg INFO "skip tested: ${key}"
+          continue
+        fi
+        printf '%s|%s|%s|%s\n' "$kind" "$inst" "$key" "$parent"
+      done
+  rm -f "$tmp"
 }
 
-# --- Schedule / queue -------------------------------------------------------
+# --- Tested registry --------------------------------------------------------
 
-# Is storage due now? Uses last_run marker + times/interval_hours.
-rbv_storage_due() {
-  local sid="$1"
-  local j now_hm now_epoch last interval times t
-  j="$(rbv_storage_json "$sid")"
+rbv_tested_file() {
+  printf '%s/tested/%s.json\n' "$(rbv_work_dir)" "$1"
+}
+
+rbv_is_tested() {
+  local sid="$1" key="$2"
+  local f
+  f="$(rbv_tested_file "$sid")"
+  [[ -f "$f" ]] || return 1
+  jq -e --arg k "$key" '.[$k] != null' "$f" >/dev/null 2>&1
+}
+
+rbv_mark_tested() {
+  local sid="$1" key="$2" ok="$3" run_id="${4:-}"
+  local f tmp
+  f="$(rbv_tested_file "$sid")"
+  mkdir -p "$(dirname "$f")"
+  [[ -f "$f" ]] || echo '{}' > "$f"
+  tmp="$(mktemp)"
+  jq --arg k "$key" --argjson ok "$ok" --arg r "$run_id" --argjson ts "$(date +%s)" \
+    '.[$k] = {ok:$ok, tested_at:$ts, run_id:$r}' "$f" > "$tmp"
+  mv -f "$tmp" "$f"
+}
+
+# --- Global schedule --------------------------------------------------------
+
+# Глобальная частота (не per-storage):
+#   verify.interval_hours  ИЛИ  verify.times ["HH:MM",...]
+# fallback: interval_hours=12
+rbv_global_due() {
+  local now_epoch now_hm last interval times t
   now_epoch="$(date +%s)"
   now_hm="$(date +%H:%M)"
   local marker
-  marker="$(rbv_work_dir)/locks/last_run_${sid}"
+  marker="$(rbv_work_dir)/locks/last_run_global"
   last=0
   [[ -f "$marker" ]] && last="$(cat "$marker" 2>/dev/null || echo 0)"
-  interval="$(jq -r '.verify.interval_hours // empty' <<<"$j")"
-  if [[ -n "$interval" && "$interval" != "null" ]]; then
+
+  interval="$(rbv_cfg '.verify.interval_hours // empty')"
+  if [[ -n "$interval" && "$interval" != "null" && "$interval" != "" ]]; then
     local need=$(( interval * 3600 ))
     (( now_epoch - last >= need )) && return 0
     return 1
   fi
-  # times: ["06:30","18:30"] — due if current HH:MM matches and not yet run in this minute window
-  times="$(jq -r '.verify.times // [] | .[]' <<<"$j")"
-  [[ -n "$times" ]] || return 1
+
+  times="$(jq -r '.verify.times // [] | .[]' "$RBV_CONFIG" 2>/dev/null || true)"
+  if [[ -z "$times" ]]; then
+    # дефолт: каждые 12ч
+    (( now_epoch - last >= 43200 )) && return 0
+    return 1
+  fi
   while IFS= read -r t; do
     [[ "$t" == "$now_hm" ]] || continue
-    # уже запускали в эту минуту?
-    local stamp
+    local stamp done_m
     stamp="$(date +%Y%m%d%H%M)"
-    local done_m
-    done_m="$(rbv_work_dir)/locks/due_${sid}_${stamp}"
+    done_m="$(rbv_work_dir)/locks/due_global_${stamp}"
     [[ -f "$done_m" ]] && return 1
     return 0
   done <<<"$times"
   return 1
 }
 
-rbv_mark_due_done() {
-  local sid="$1"
+rbv_mark_global_done() {
   local stamp
   stamp="$(date +%Y%m%d%H%M)"
-  date +%s > "$(rbv_work_dir)/locks/last_run_${sid}"
-  : > "$(rbv_work_dir)/locks/due_${sid}_${stamp}"
+  date +%s > "$(rbv_work_dir)/locks/last_run_global"
+  : > "$(rbv_work_dir)/locks/due_global_${stamp}"
 }
 
 rbv_queue_dir() { printf '%s/queue\n' "$(rbv_work_dir)"; }
 
-# Enqueue a storage run (one file = one storage sweep). Sequential worker.
-rbv_enqueue_storage() {
-  local sid="$1" reason="${2:-manual}"
-  local qd ts f
+# Job = один экземпляр (архив) для теста. FIFO по timestamp в имени файла.
+rbv_enqueue_instance() {
+  local sid="$1" kind="$2" inst="$3" key="$4" parent="$5" reason="${6:-manual}"
+  local qd ts f safe
   qd="$(rbv_queue_dir)"
   mkdir -p "$qd"
   ts="$(date +%s%N)"
-  f="${qd}/${ts}_${sid}.job"
-  printf '{"storage":"%s","reason":"%s","enqueued_at":%s}\n' \
-    "$sid" "$reason" "$(date +%s)" > "$f"
-  msg INFO "В очередь: ${sid} (${reason}) → $(basename "$f")"
+  safe="$(printf '%s' "$inst" | tr '/:' '__')"
+  f="${qd}/${ts}_${sid}_${safe}.job"
+  jq -nc \
+    --arg sid "$sid" --arg kind "$kind" --arg inst "$inst" \
+    --arg key "$key" --arg parent "$parent" --arg reason "$reason" \
+    --argjson enq "$(date +%s)" \
+    '{storage:$sid,kind:$kind,instance:$inst,key:$key,parent:$parent,reason:$reason,enqueued_at:$enq}' \
+    > "$f"
+  msg INFO "В очередь: ${sid} ${kind} ${inst} → $(basename "$f")"
+}
+
+# Обход всех хранилищ: discover untested latest → enqueue
+rbv_enqueue_all_untested() {
+  local reason="${1:-schedule}"
+  local sid
+  mapfile -t ids < <(jq -r '.storages[].id' "$RBV_CONFIG")
+  for sid in "${ids[@]}"; do
+    msg INFO "Discover ${sid} (deep, untested latest)…"
+    while IFS='|' read -r kind inst key parent; do
+      [[ -n "$key" ]] || continue
+      rbv_enqueue_instance "$sid" "$kind" "$inst" "$key" "$parent" "$reason"
+    done < <(rbv_discover "$sid" true)
+  done
 }
 
 rbv_queue_lock() {
