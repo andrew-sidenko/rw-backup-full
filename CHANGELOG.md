@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.6.27 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Bot `compose config` / `BACKEND_IMAGE is required`**: перед `config` собирается
+  `compose.env.effective` (.env + stub для `${VAR:?…}`); если image=`rbv-missing/*`
+  (теги не в бэкапе, а задаются при деплое) — **stack skip**, не FAIL.
+- Rewrite также `DB_HOST`/`REDIS_HOST`/`DB_NAME` → sandbox; `deploy:` срезается.
+- Маскировка секретов в дампах compose усилена (`METRICS_PASS`, webhook hex и т.п.).
+
 ## v5.6.26 (2026-08-10)
 
 ### Добавлено (`rw-backup-verify`)

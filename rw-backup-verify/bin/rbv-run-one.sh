@@ -583,14 +583,13 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           v=$0
           if (k ~ /(PASS|SECRET|TOKEN|KEY|URL|URI|DSN)/) {
             if (v ~ /:\/\//) {
-              # url: оставить схему/хост-маску
               gsub(/:\/\/[^@\/]+@/, "://***@", v)
               gsub(/:[^:@\/]+@/, ":***@", v)
             } else if (length(v) > 0) { v="***" }
           }
           print k "=" v
         }
-      ' "${PROJ_DIR}/.env" 2>/dev/null >"${RUN_DIR}/compose.env.masked" || true
+      ' "${PROJ_DIR}/.env" 2>/dev/null | rbv_mask_secrets >"${RUN_DIR}/compose.env.masked" || true
       if [[ -s "${RUN_DIR}/compose.env.keys.txt" ]]; then
         rep "stack: .env keys ($(wc -l <"${RUN_DIR}/compose.env.keys.txt" | tr -d ' ')): $(tr '\n' ',' <"${RUN_DIR}/compose.env.keys.txt" | head -c 500)"
       fi
@@ -601,42 +600,42 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
     docker network create --internal "$NET_NAME" >/dev/null
     COMPOSE_FILE="${RUN_DIR}/compose.isolated.yml"
 
-    # Резолв compose из каталога проекта (.env рядом) — иначе «compose config failed»
+    # .env + stub для ${BACKEND_IMAGE:?…} и т.п. (swarm/bot часто без image в архиве)
+    COMPOSE_ENV="${RUN_DIR}/compose.env.effective"
+    STUB_VARS="$(rbv_compose_prepare_env "$PROJ_DIR" "$CF" "$COMPOSE_ENV" | tr -d '\n')"
+    if [[ -n "${STUB_VARS// }" ]]; then
+      rep "stack: WARN stub env (нет в бэкапе): ${STUB_VARS}"
+      rep "  → образы задаются при деплое; stack up будет skip, если image=rbv-missing/*"
+    fi
+    rbv_mask_secrets <"$COMPOSE_ENV" >"${RUN_DIR}/compose.env.effective.masked" 2>/dev/null || true
+
+    # Резолв compose из каталога проекта
     set +e
     (
       cd "$PROJ_DIR" || exit 1
-      cfg=(docker compose)
-      [[ -f .env ]] && cfg+=(--env-file .env)
       cf_arg="$CF"
       case "$CF" in
         "$PROJ_DIR"/*) cf_arg="${CF#"$PROJ_DIR"/}" ;;
       esac
-      # JSON для jq-rewrite + человекочитаемый YAML из бэкапа
-      "${cfg[@]}" -f "$cf_arg" config --format json
+      docker compose --env-file "$COMPOSE_ENV" -f "$cf_arg" config --format json
     ) >"$COMPOSE_RAW" 2>"${RUN_DIR}/compose.cfg.err"
     cfg_rc=$?
     set -e
 
-    # resolved YAML из бэкапа (как compose его видит с .env) — всегда пытаемся
+    # resolved YAML из бэкапа
     set +e
     (
       cd "$PROJ_DIR" || exit 1
-      cfg=(docker compose)
-      [[ -f .env ]] && cfg+=(--env-file .env)
       cf_arg="$CF"
       case "$CF" in
         "$PROJ_DIR"/*) cf_arg="${CF#"$PROJ_DIR"/}" ;;
       esac
-      "${cfg[@]}" -f "$cf_arg" config
+      docker compose --env-file "$COMPOSE_ENV" -f "$cf_arg" config
     ) >"${RUN_DIR}/compose.from-backup.resolved.yml" 2>>"${RUN_DIR}/compose.cfg.err"
     set -e
-    # маскируем пароли в resolved для отчёта
     if [[ -s "${RUN_DIR}/compose.from-backup.resolved.yml" ]]; then
-      sed -E \
-        -e 's#(://[^:/@]+:)[^@/]+@#\1***@#g' \
-        -e 's#((PASSWORD|SECRET|TOKEN|KEY)[[:space:]]*:[[:space:]]*)[^[:space:]#"'"'"']+#\1***#gI' \
-        "${RUN_DIR}/compose.from-backup.resolved.yml" >"${RUN_DIR}/compose.from-backup.resolved.masked.yml" 2>/dev/null \
-        || cp -f "${RUN_DIR}/compose.from-backup.resolved.yml" "${RUN_DIR}/compose.from-backup.resolved.masked.yml"
+      rbv_mask_secrets <"${RUN_DIR}/compose.from-backup.resolved.yml" \
+        >"${RUN_DIR}/compose.from-backup.resolved.masked.yml"
       rep_file "compose FROM BACKUP (resolved+masked)" "${RUN_DIR}/compose.from-backup.resolved.masked.yml" 200
     fi
 
@@ -648,20 +647,21 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         rep_file "compose.cfg.err" "${RUN_DIR}/compose.cfg.err" 40
       fi
       rep "stack: оригинал из бэкапа: ${BACKUP_COMPOSE_COPY}"
+      rep "stack: effective env: ${COMPOSE_ENV}"
       rep "stack: править инфру → скопируйте compose/env из ${RUN_DIR}/ и перезапустите"
     else
       # Убираем postgres-сервис (его заменяет наш PG_CID) и переписываем
-      # DATABASE_URL/DIRECT_URL/POSTGRES_HOST → remnawave-db:5432 (sandbox).
-      jq --arg net "$NET_NAME" --arg pgsvc "${POSTGRES_SERVICE}" '
+      # DATABASE_URL/DB_HOST/REDIS_HOST → sandbox.
+      jq --arg net "$NET_NAME" --arg pgsvc "${POSTGRES_SERVICE}" --arg pgdb "${RBV_PG_DB:-postgres}" '
         def fix_pg_url:
           if type != "string" then .
           elif (test("(?i)^postgres(ql)?://") | not) then .
           elif test("@") then
-            (capture("(?<pre>.*://[^/@]+@)[^/?#]+(?<post>.*)") // null) as $m
-            | if $m then "\($m.pre)remnawave-db:5432\($m.post)" else . end
+            (capture("(?<pre>.*://[^/@]+@)[^/?#]+(?::(?<port>[0-9]+))?(?:/(?<db>[^/?#]*))?(?<q>[?#].*)?") // null) as $m
+            | if $m then "\($m.pre)remnawave-db:5432/\($pgdb)\($m.q // "")" else . end
           else
-            (capture("(?<pre>.*://)[^/?#]+(?<post>.*)") // null) as $m
-            | if $m then "\($m.pre)remnawave-db:5432\($m.post)" else . end
+            (capture("(?<pre>.*://)[^/?#]+(?::(?<port>[0-9]+))?(?:/(?<db>[^/?#]*))?(?<q>[?#].*)?") // null) as $m
+            | if $m then "\($m.pre)remnawave-db:5432/\($pgdb)\($m.q // "")" else . end
           end;
         def fix_env:
           if type == "object" then
@@ -672,6 +672,10 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
               then .value = "remnawave-db"
               elif (.key | test("(?i)^(POSTGRES_PORT|PGPORT|DB_PORT|DATABASE_PORT)$"))
               then .value = "5432"
+              elif (.key | test("(?i)^(POSTGRES_DB|PGDATABASE|DB_NAME|DATABASE_NAME)$"))
+              then .value = $pgdb
+              elif (.key | test("(?i)^(REDIS_HOST|REDIS_URL)$"))
+              then .value = (if (.key|test("URL")) then ("redis://remnawave-redis:6379") else "remnawave-redis" end)
               else . end
             )
           elif type == "array" then
@@ -684,6 +688,12 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
                   then "\($k)=remnawave-db"
                   elif ($k | test("(?i)^(POSTGRES_PORT|PGPORT|DB_PORT|DATABASE_PORT)$"))
                   then "\($k)=5432"
+                  elif ($k | test("(?i)^(POSTGRES_DB|PGDATABASE|DB_NAME|DATABASE_NAME)$"))
+                  then "\($k)=\($pgdb)"
+                  elif ($k | test("(?i)^REDIS_HOST$"))
+                  then "\($k)=remnawave-redis"
+                  elif ($k | test("(?i)^REDIS_URL$"))
+                  then "\($k)=redis://remnawave-redis:6379"
                   else .
                   end)
               else . end
@@ -692,8 +702,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         .networks = {"rbv": {"name": $net, "external": true}}
         | .services = (.services | to_entries | map(
             .value |= (
-              # env_file/.env с продовым DATABASE_URL иначе перебьёт rewrite
-              del(.ports, .container_name, .env_file, .network_mode, .links)
+              del(.ports, .container_name, .env_file, .network_mode, .links, .deploy)
               | .networks = {"rbv": {}}
               | .restart = "no"
               | if .environment then .environment |= fix_env else . end
@@ -737,11 +746,8 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         >"${RUN_DIR}/compose.isolated.resolved.yml" 2>"${RUN_DIR}/compose.isolated.cfg.err"
       set -e
       if [[ -s "${RUN_DIR}/compose.isolated.resolved.yml" ]]; then
-        sed -E \
-          -e 's#(://[^:/@]+:)[^@/]+@#\1***@#g' \
-          -e 's#((PASSWORD|SECRET|TOKEN|KEY)[[:space:]]*:[[:space:]]*)[^[:space:]#"'"'"']+#\1***#gI' \
-          "${RUN_DIR}/compose.isolated.resolved.yml" >"${RUN_DIR}/compose.isolated.masked.yml" 2>/dev/null \
-          || cp -f "${RUN_DIR}/compose.isolated.resolved.yml" "${RUN_DIR}/compose.isolated.masked.yml"
+        rbv_mask_secrets <"${RUN_DIR}/compose.isolated.resolved.yml" \
+          >"${RUN_DIR}/compose.isolated.masked.yml"
         rep_file "compose ISOLATED (resolved+masked)" "${RUN_DIR}/compose.isolated.masked.yml" 200
       else
         rep_file "compose ISOLATED (json)" "$COMPOSE_FILE" 120
@@ -751,17 +757,35 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
       # Показать, куда ушли DB URL (без пароля)
       db_urls="$(jq -r '
         .services // {} | to_entries[] | .value.environment
-        | if type=="object" then to_entries[] | select(.key|test("(?i)DATABASE_URL|DIRECT_URL")) | "\(.key)=\(.value)"
-          elif type=="array" then .[] | select(test("(?i)^(DATABASE_URL|DIRECT_URL)="))
+        | if type=="object" then to_entries[] | select(.key|test("(?i)DATABASE_URL|DIRECT_URL|DB_HOST|REDIS_HOST")) | "\(.key)=\(.value)"
+          elif type=="array" then .[] | select(test("(?i)^(DATABASE_URL|DIRECT_URL|DB_HOST|REDIS_HOST)="))
           else empty end
-      ' "$COMPOSE_FILE" 2>/dev/null | sed -E 's#(://[^:/@]+:)[^@/]+@#\1***@#g' | head -n 8 || true)"
+      ' "$COMPOSE_FILE" 2>/dev/null | rbv_mask_secrets | head -n 12 || true)"
       if [[ -n "$db_urls" ]]; then
-        rep "stack: DB env после rewrite:"
+        rep "stack: DB/Redis env после rewrite:"
         while IFS= read -r _line; do [[ -n "$_line" ]] && rep "  ${_line}"; done <<<"$db_urls"
       else
-        rep "stack: WARN — DATABASE_URL/DIRECT_URL не найдены в compose (проверьте .env)"
+        rep "stack: WARN — DATABASE_URL/DB_HOST не найдены в compose environment (проверьте env_file)"
       fi
 
+      # Нет реальных образов (BACKEND_IMAGE не в бэкапе) → stack skip, не fail
+      _missing_img="$(jq -r '.services // {} | to_entries[] | .value.image // empty' "$COMPOSE_FILE" 2>/dev/null \
+        | grep -E 'rbv-missing' || true)"
+      if [[ -n "$_missing_img" ]]; then
+        STACK_OK="skip"
+        STACK_DETAIL="нет образов в бэкапе (stubs: ${STUB_VARS:-?})"
+        rbv_check_add stack skip "$STACK_DETAIL"
+        rep "stack: SKIP compose up — в архиве нет BACKEND_IMAGE/CABINET_IMAGE (задаются при деплое)"
+        rep "stack: stub images:"
+        while IFS= read -r _line; do [[ -n "$_line" ]] && rep "  ${_line}"; done <<<"$_missing_img"
+        rep "stack: data-проверки (schema/users) уже пройдены; для stack положите image tags в .env бэкапа"
+        if rbv_check_enabled "$KIND" isolation; then
+          rbv_check_add isolation skip "нет stack up"
+        fi
+        if rbv_check_enabled "$KIND" backend_ports; then
+          rbv_check_add backend_ports skip "нет stack up"
+        fi
+      else
       docker network disconnect "$NET_NAME" "$PG_CID" 2>/dev/null || true
       docker network connect \
         --alias db --alias postgres --alias remnawave-db --alias postgresql \
@@ -878,6 +902,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           rbv_check_add backend_ports skip "отключено"
         fi
       fi
+      fi  # missing images vs real up
     fi
   fi
 elif ! rbv_check_enabled "$KIND" stack; then

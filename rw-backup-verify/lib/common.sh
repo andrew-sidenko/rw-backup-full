@@ -197,6 +197,80 @@ rbv_disk_report() {
   df -h "$p" 2>/dev/null | tail -n1 || true
 }
 
+# Собрать env для `docker compose config`: .env + значения из дерева проекта
+# + заглушки для ${VAR:?required}, иначе swarm/bot compose падает на BACKEND_IMAGE.
+# $1=project_dir $2=compose_file $3=out_env_file
+# stdout: stub-переменные через пробел; rc=0.
+rbv_compose_prepare_env() {
+  local proj="$1" cf="$2" out="$3"
+  local stubs=() var val found line
+  : >"$out"
+  if [[ -f "${proj}/.env" ]]; then
+    cat "${proj}/.env" >>"$out"
+    printf '\n' >>"$out"
+  fi
+
+  _rbv_env_has() {
+    local k="$1" v
+    v="$(grep -E "^[[:space:]]*${k}=" "$out" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    [[ -n "$v" && "$v" != *'${'* ]]
+  }
+
+  _rbv_env_set() {
+    printf '%s=%s\n' "$1" "$2" >>"$out"
+  }
+
+  # кандидаты: обязательные ${VAR:?…} и IMAGE/TAG из compose
+  while IFS= read -r var; do
+    [[ -n "$var" ]] || continue
+    _rbv_env_has "$var" && continue
+
+    found=""
+    while IFS= read -r line; do
+      [[ "$line" == *=* ]] || continue
+      val="${line#*=}"
+      val="${val%\"}"; val="${val#\"}"
+      val="${val%\'}"; val="${val#\'}"
+      [[ -z "$val" || "$val" == *'${'* || "$val" == *':?'* ]] && continue
+      found="$val"
+      break
+    done < <(grep -RhoE "^[[:space:]]*${var}=[^[:space:]#]+" "$proj" 2>/dev/null | head -n 20 || true)
+
+    if [[ -n "$found" ]]; then
+      _rbv_env_set "$var" "$found"
+      continue
+    fi
+
+    case "$var" in
+      *_TAG|TAG|VERSION) val="latest" ;;
+      *_IMAGE|*_REPO|IMAGE)
+        val="rbv-missing/$(printf '%s' "$var" | tr '[:upper:]_' '[:lower:]-')"
+        ;;
+      *) val="rbv-missing" ;;
+    esac
+    _rbv_env_set "$var" "$val"
+    stubs+=("$var")
+  done < <(
+    {
+      grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\?[^}]*\}' "$cf" 2>/dev/null || true
+      grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}' "$cf" 2>/dev/null || true
+      grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "$cf" 2>/dev/null || true
+    } | sed -E 's/^\$\{([A-Za-z0-9_]+).*/\1/' | sort -u \
+      | grep -E '(_IMAGE|_TAG|_REPO|^BACKEND|^CABINET|^APP_|_VERSION$)' || true
+  )
+
+  printf '%s\n' "${stubs[*]}"
+}
+
+# Маскировка секретов в yaml/env тексте (stdin→stdout).
+rbv_mask_secrets() {
+  sed -E \
+    -e 's#(://[^:/@"'"'"']+:)[^@/]+@#\1***@#g' \
+    -e 's#((PASSWORD|SECRET|TOKEN|KEY|PASS|PRIVATE)[_A-Z0-9]*[[:space:]]*[=:][[:space:]]*["_]?)[^[:space:]#"'"'"']{6,}#\1***#gI' \
+    -e 's#((PASSWORD|SECRET|TOKEN|KEY|PASS)[_A-Z0-9]*[[:space:]]*:[[:space:]]*)[^[:space:]#"'"'"']+#\1***#gI'
+}
+
 # --- Telegram ---------------------------------------------------------------
 
 rbv_tg_send() {

@@ -404,6 +404,17 @@ grep -q 'rbv_pg_start' "$ROOT/bin/rbv-run-one.sh" && pass "pg start helper" || f
 grep -q 'compose.from-backup' "$ROOT/bin/rbv-run-one.sh" && pass "compose from backup dump" || fail "compose from backup dump" "missing"
 grep -q 'compose.isolated.masked' "$ROOT/bin/rbv-run-one.sh" && pass "compose isolated dump" || fail "compose isolated dump" "missing"
 grep -q 'compose.logs.txt' "$ROOT/bin/rbv-run-one.sh" && pass "compose logs dump" || fail "compose logs dump" "missing"
+grep -q 'rbv_compose_prepare_env' "$ROOT/bin/rbv-run-one.sh" && pass "compose prepare env" || fail "compose prepare env" "missing"
+grep -q 'rbv-missing' "$ROOT/bin/rbv-run-one.sh" && pass "compose stub skip" || fail "compose stub skip" "missing"
+
+# prepare_env stubs for ${VAR:?}
+_pe="$T/compose_pe"; mkdir -p "$_pe"
+printf '%s\n' 'services:' '  x:' '    image: ${BACKEND_IMAGE:?need}:${BACKEND_TAG:?t}' >"$_pe/c.yml"
+printf 'FOO=1\n' >"$_pe/.env"
+_stubs="$(rbv_compose_prepare_env "$_pe" "$_pe/c.yml" "$_pe/out.env")"
+printf '%s' "$_stubs" | grep -q BACKEND_IMAGE && pass "prepare stub BACKEND_IMAGE" || fail "prepare stub" "$_stubs"
+grep -q '^BACKEND_IMAGE=rbv-missing' "$_pe/out.env" && pass "prepare stub value" || fail "prepare stub value" "$(cat $_pe/out.env)"
+echo 'METRICS_PASS: abcdefghijklmnop' | rbv_mask_secrets | grep -q '\*\*\*' && pass "mask secrets" || fail "mask secrets" "no mask"
 
 # archive cache + runs prune (изолированный каталог runs)
 _rs="$T/state/runs"
