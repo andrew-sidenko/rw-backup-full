@@ -396,6 +396,12 @@ se="$(grep -cE '^ERROR' "$T/empty.err" 2>/dev/null || true)"
 se="$(echo "${se:-0}" | tr -d '[:space:]')"
 [[ "$se" == "0" ]] && pass "sql_errs zero" || fail "sql_errs zero" "se=$se"
 
+# OOM/rc=137 messaging helpers exist in rbv-run-one (bash -n covered below)
+bash -n "$ROOT/bin/rbv-run-one.sh" && pass "rbv-run-one bash -n" || fail "rbv-run-one bash -n" "syntax"
+grep -q 'shm-size' "$ROOT/bin/rbv-run-one.sh" && pass "pg shm-size" || fail "pg shm-size" "missing"
+grep -q 'OOMKilled' "$ROOT/bin/rbv-run-one.sh" && pass "pg OOM diag" || fail "pg OOM diag" "missing"
+grep -q 'rbv_pg_start' "$ROOT/bin/rbv-run-one.sh" && pass "pg start helper" || fail "pg start helper" "missing"
+
 echo "==== help / unknown / save config ===="
 expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help
 expect_rc 1 "unknown cmd" "$ROOT/bin/rw-backup-verify" nosuchcmd

@@ -175,47 +175,120 @@ if [[ "$ok" == true ]]; then
 fi
 
 # --- DB restore + data checks -----------------------------------------------
-DB_TABLES=0
-if [[ "$ok" == true ]]; then
-  PG_CID="rbv_pg_${RUN_ID}"
-  rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID}"
+# Большие dump (200–500M gz) на узком хосте часто ловят OOM (rc=137) /
+# «server closed». Soft-retry в ту же полумёртвую БД бесполезен — только recreate.
+rbv_pg_alive() {
+  [[ -n "${PG_CID:-}" ]] || return 1
+  docker inspect -f '{{.State.Running}}' "$PG_CID" 2>/dev/null | grep -qx true
+}
+
+rbv_pg_diag() {
+  local tag="${1:-diag}"
+  rep "postgres[${tag}]: --- состояние ---"
+  if [[ -n "${PG_CID:-}" ]]; then
+    docker inspect -f 'status={{.State.Status}} running={{.State.Running}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}} error={{.State.Error}}' \
+      "$PG_CID" 2>/dev/null | while IFS= read -r _line; do rep "  ${_line}"; done || rep "  (inspect недоступен)"
+    if docker logs "$PG_CID" >/dev/null 2>&1; then
+      rep "  ----- docker logs (tail 25) -----"
+      docker logs --tail 25 "$PG_CID" 2>&1 | while IFS= read -r _line; do rep "  ${_line}"; done || true
+      rep "  ----- end logs -----"
+    fi
+  fi
+  # память/диск — частая причина 137 / «not ready»
+  if command -v free >/dev/null 2>&1; then
+    rep "  mem: $(free -m | awk '/Mem:/{printf "avail=%sMi total=%sMi", $7, $2}')"
+  fi
+  df -h /var/lib/docker 2>/dev/null | tail -n1 | while IFS= read -r _line; do rep "  disk docker: ${_line}"; done || true
+}
+
+rbv_pg_start() {
+  # $1 — причина (init|retry)
+  local why="${1:-init}"
+  local wait_s=120
   docker rm -f "$PG_CID" >/dev/null 2>&1 || true
-  # stdout глушим, stderr оставляем — прогресс docker pull виден
-  docker run -d --name "$PG_CID" -e POSTGRES_HOST_AUTH_METHOD=trust \
+  # чужие rbv_pg_* после OOM/crash занимают RAM
+  while IFS= read -r _old; do
+    [[ -n "$_old" && "$_old" != "$PG_CID" ]] || continue
+    docker rm -f "$_old" >/dev/null 2>&1 || true
+  done < <(docker ps -aq --filter "name=rbv_pg_" 2>/dev/null || true)
+
+  rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID} (${why})"
+  set +e
+  # shm: крупные COPY/CREATE INDEX в restore без --shm-size часто падают
+  docker run -d --name "$PG_CID" --shm-size=512m \
+    -e POSTGRES_HOST_AUTH_METHOD=trust \
     "postgres:${PG_VER}-alpine" >/dev/null
-  rep "postgres: жду pg_isready (до 60с)…"
-  ready=false
-  for i in $(seq 1 60); do
+  local run_rc=$?
+  set -e
+  if [[ $run_rc -ne 0 ]]; then
+    rep "postgres: docker run rc=${run_rc}"
+    rbv_pg_diag "run-fail"
+    return 1
+  fi
+  if ! rbv_pg_alive; then
+    rep "postgres: контейнер сразу не Running"
+    rbv_pg_diag "not-running"
+    return 1
+  fi
+
+  rep "postgres: жду pg_isready (до ${wait_s}с)…"
+  local i ready=false
+  for i in $(seq 1 "$wait_s"); do
     if docker exec "$PG_CID" pg_isready -U postgres >/dev/null 2>&1; then
       ready=true
       rep "postgres: ready (${i}с)"
       break
     fi
-    if (( i % 10 == 0 )); then
-      rep "postgres: ещё не ready (${i}/60с)…"
+    if ! rbv_pg_alive; then
+      rep "postgres: контейнер умер на ожидании ready (${i}с)"
+      rbv_pg_diag "died-wait"
+      return 1
+    fi
+    if (( i % 15 == 0 )); then
+      rep "postgres: ещё не ready (${i}/${wait_s}с)…"
     fi
     sleep 1
   done
   if [[ "$ready" != true ]]; then
-    fail_add "postgres not ready"
-  else
-    # pg_isready ≠ accepts queries (часто «starting up» ещё пару секунд)
-    rep "postgres: жду SELECT 1…"
-    accept=false
-    for i in $(seq 1 45); do
-      if docker exec "$PG_CID" psql -U postgres -d postgres -Atc 'SELECT 1' >/dev/null 2>&1; then
-        accept=true
-        rep "postgres: accepts connections (${i}с)"
-        break
-      fi
-      sleep 1
-    done
-    if [[ "$accept" != true ]]; then
-      fail_add "postgres not accepting connections"
-    fi
+    rbv_pg_diag "not-ready"
+    return 1
   fi
 
-  if [[ "$ok" == true && "$ready" == true && "${accept:-false}" == true ]]; then
+  rep "postgres: жду SELECT 1…"
+  local accept=false
+  for i in $(seq 1 60); do
+    if docker exec "$PG_CID" psql -U postgres -d postgres -Atc 'SELECT 1' >/dev/null 2>&1; then
+      accept=true
+      rep "postgres: accepts connections (${i}с)"
+      break
+    fi
+    if ! rbv_pg_alive; then
+      rep "postgres: контейнер умер на SELECT 1"
+      rbv_pg_diag "died-select"
+      return 1
+    fi
+    sleep 1
+  done
+  if [[ "$accept" != true ]]; then
+    rbv_pg_diag "no-select"
+    return 1
+  fi
+  return 0
+}
+
+DB_TABLES=0
+if [[ "$ok" == true ]]; then
+  PG_CID="rbv_pg_${RUN_ID}"
+  ready=false
+  accept=false
+  if rbv_pg_start init; then
+    ready=true
+    accept=true
+  else
+    fail_add "postgres not ready"
+  fi
+
+  if [[ "$ok" == true && "$ready" == true && "$accept" == true ]]; then
     sql_sz="$(du -h "$SQL" 2>/dev/null | awk '{print $1}')"
     rep "psql restore: $(basename "$SQL") (${sql_sz}) — может занять минуты"
     (
@@ -227,18 +300,45 @@ if [[ "$ok" == true ]]; then
     ) &
     _hb=$!
     _psql_rc=1
-    for _attempt in 1 2 3 4 5; do
+    _max_restore=3
+    for _attempt in $(seq 1 "$_max_restore"); do
+      if ! rbv_pg_alive; then
+        rep "psql restore: PG мёртв перед попыткой ${_attempt}/${_max_restore} — recreate"
+        if ! rbv_pg_start "retry-${_attempt}"; then
+          _psql_rc=137
+          break
+        fi
+      fi
       : >"${RUN_DIR}/psql.err"
       set +e
       gzip -dc "$SQL" | docker exec -i "$PG_CID" \
         psql -q -U postgres -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err"
       _psql_rc=$?
       set -e
-      if grep -qiE 'starting up|connection.*failed|server closed' "${RUN_DIR}/psql.err" 2>/dev/null; then
-        rep "psql restore: БД ещё не готова (попытка ${_attempt}/5), жду…"
-        sleep $((_attempt * 3))
-        continue
+
+      _oom=false
+      docker inspect -f '{{.State.OOMKilled}}' "$PG_CID" 2>/dev/null | grep -qx true && _oom=true
+      if [[ $_psql_rc -eq 137 ]] || [[ "$_oom" == true ]] || ! rbv_pg_alive; then
+        rep "psql restore: OOM/SIGKILL/dead rc=${_psql_rc} oom=${_oom} (попытка ${_attempt}/${_max_restore})"
+        rbv_pg_diag "oom-${_attempt}"
+        if (( _attempt < _max_restore )); then
+          rep "psql restore: recreate PG и повтор…"
+          rbv_pg_start "retry-${_attempt}" || true
+          continue
+        fi
+        break
       fi
+      if grep -qiE 'starting up|connection.*failed|server closed|the database system is shutting down' \
+           "${RUN_DIR}/psql.err" 2>/dev/null; then
+        rep "psql restore: соединение оборвалось (попытка ${_attempt}/${_max_restore}) — recreate"
+        rbv_pg_diag "conn-${_attempt}"
+        if (( _attempt < _max_restore )); then
+          rbv_pg_start "retry-${_attempt}" || true
+          continue
+        fi
+        break
+      fi
+      # успех или «обычные» ERROR в дампе (DROP ROLE и т.п.) — не ретраим
       break
     done
     kill "$_hb" 2>/dev/null || true
@@ -253,15 +353,26 @@ if [[ "$ok" == true ]]; then
     fi
 
     # Дампы ботов часто создают отдельную БД — ищем таблицы везде
-    DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
-    DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
-    [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
-    rep "db_schema: db=${RBV_PG_DB} user_tables=${DB_TABLES}"
+    if rbv_pg_alive; then
+      DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
+      DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
+      [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
+    else
+      DB_TABLES=0
+      RBV_PG_DB="postgres"
+      rbv_pg_diag "post-restore-dead"
+    fi
+    rep "db_schema: db=${RBV_PG_DB:-postgres} user_tables=${DB_TABLES}"
     if (( DB_TABLES < 1 )); then
-      dbs="$(docker exec "$PG_CID" psql -U postgres -d postgres -Atc \
-        "SELECT string_agg(datname, ',') FROM pg_database WHERE NOT datistemplate" 2>/dev/null || echo "?")"
-      fail_add "empty schema (dbs=${dbs} sql_errors=${sql_errs})"
-      rbv_check_add db_schema fail "user tables=0 (dbs=${dbs}, sql_errors=${sql_errs})"
+      dbs="?"
+      if rbv_pg_alive; then
+        dbs="$(docker exec "$PG_CID" psql -U postgres -d postgres -Atc \
+          "SELECT string_agg(datname, ',') FROM pg_database WHERE NOT datistemplate" 2>/dev/null || echo "?")"
+      fi
+      _extra=""
+      [[ ${_psql_rc:-1} -eq 137 ]] && _extra=" OOM/SIGKILL(rc=137)"
+      fail_add "empty schema (dbs=${dbs} sql_errors=${sql_errs}${_extra})"
+      rbv_check_add db_schema fail "user tables=0 (dbs=${dbs}, sql_errors=${sql_errs}${_extra})"
       if [[ -s "${RUN_DIR}/psql.err" ]]; then
         rep "----- psql.err (tail) -----"
         tail -n 15 "${RUN_DIR}/psql.err" | while IFS= read -r _line; do rep "  ${_line}"; done

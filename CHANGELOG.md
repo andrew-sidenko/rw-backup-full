@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.6.24 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Bot `psql restore rc=137` / empty schema `dbs=?`**: soft-retry в ту же полумёртвую БД
+  заменён на recreate PG (до 3 попыток); детект OOM/SIGKILL; `--shm-size=512m`;
+  перед стартом чистятся чужие `rbv_pg_*`.
+- **Panel `postgres not ready` без деталей**: ожидание до 120с, проверка `docker run`,
+  в отчёт — `OOMKilled`/logs/`free`/`df`.
+
 ## v5.6.23 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)
