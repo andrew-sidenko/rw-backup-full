@@ -6,6 +6,10 @@
 - **Пошаговый вывод `run`**: start → discover/S3 ls → enqueue count → worker → готово; сессионный лог `work_dir/logs/run_*.log`.
 - Пустая очередь / 0 untested — явный WARN с подсказкой `discover --all` и путём к `tested/`.
 - Ошибки `aws s3 ls` больше не глотаются (раньше `run` молча завершался).
+- **Heartbeat в `rbv-run-one`**: postgres ready, psql restore (каждые 15с), settle, stability — чтобы не казалось «зависло» после `docker pull`.
+
+### Исправлено (`rw-backup-verify`)
+- **Bot `rc=141` (SIGPIPE)**: `tar -tzf | head` под `pipefail` ронял прогон; добавлен `|| true`.
 
 ## v5.6.17 (2026-08-10)
 

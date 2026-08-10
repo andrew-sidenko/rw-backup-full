@@ -189,6 +189,7 @@ rbv_check_stability() {
   end=$(( $(date +%s) + sec ))
   local interval=15
   (( sec < 30 )) && interval=5
+  msg INFO "stability: окно ${sec}с, интервал ${interval}с"
   while :; do
     now="$(date +%s)"
     (( now >= end )) && break
@@ -202,6 +203,7 @@ rbv_check_stability() {
       rbv_check_add stack fail "нет running-контейнеров"
       return 1
     fi
+    msg INFO "stability: ещё ~$(( end - now ))с, running=${running}"
     sleep "$interval"
   done
   running="$(docker compose -f "$compose" -p "$project" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
