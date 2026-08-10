@@ -428,6 +428,20 @@ echo dump >"$_sl/extract/x.sql.gz"
 rbv_run_slim "$_sl"
 [[ -f "$_sl/report.txt" && ! -d "$_sl/extract" ]] && pass "run slim keeps report" || fail "run slim" "extract still there"
 
+# cache prune latest per instance parent
+_ca="$T/state/cache/archives/s1"; mkdir -p "$_ca"
+echo 'p/a/old__20260101_000000.tar.gz' >"$_ca/h1.tar.gz.key"
+printf 'old' >"$_ca/h1.tar.gz"
+echo 'p/a/new__20260810_120000.tar.gz' >"$_ca/h2.tar.gz.key"
+printf 'newdata' >"$_ca/h2.tar.gz"
+echo 'p/b/other__20260801_000000.tar.gz' >"$_ca/h3.tar.gz.key"
+printf 'other' >"$_ca/h3.tar.gz"
+_cn="$(rbv_cache_prune_latest s1)"
+_cn="$(echo "$_cn" | tr -d '[:space:]')"
+[[ "$_cn" == "1" ]] && pass "cache prune deleted1" || fail "cache prune deleted1" "n=$_cn"
+[[ ! -f "$_ca/h1.tar.gz" && -f "$_ca/h2.tar.gz" && -f "$_ca/h3.tar.gz" ]] \
+  && pass "cache prune keep latest+other" || fail "cache prune keep" "files: $(ls $_ca)"
+
 # archive cache + runs prune (изолированный каталог runs)
 _rs="$T/state/runs"
 rm -rf "$_rs"

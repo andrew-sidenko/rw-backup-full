@@ -170,6 +170,11 @@ else
     printf '%s\n' "$KEY" >"${_cache}.key"
     ln -f "$_cache" "$ARCH_PATH" 2>/dev/null || cp -f "$_cache" "$ARCH_PATH"
     rbv_check_add download ok "$(basename "$KEY")"
+    if [[ "${RBV_CACHE_LATEST:-true}" == true ]]; then
+      _cn="$(rbv_cache_prune_latest "$SID" || echo 0)"
+      _cn="$(echo "$_cn" | tr -d '[:space:]')"
+      [[ "$_cn" =~ ^[0-9]+$ && "$_cn" -gt 0 ]] && rep "cache: prune latest — удалено старых=${_cn}"
+    fi
   fi
 fi
 

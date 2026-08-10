@@ -124,6 +124,80 @@ rbv_cache_ensure() {
   return 1
 }
 
+# Epoch из имени архива (для сортировки cache); 0 если не разобрали.
+rbv_cache_name_epoch() {
+  local name="$1" y m d H M S
+  if [[ "$name" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})_([0-9]{2})_([0-9]{2})_([0-9]{2}) ]]; then
+    y="${BASH_REMATCH[1]}"; m="${BASH_REMATCH[2]}"; d="${BASH_REMATCH[3]}"
+    H="${BASH_REMATCH[4]}"; M="${BASH_REMATCH[5]}"; S="${BASH_REMATCH[6]}"
+    date -u -d "${y}-${m}-${d} ${H}:${M}:${S}" +%s 2>/dev/null && return 0
+  fi
+  if [[ "$name" =~ _([0-9]{8})_([0-9]{6})\.tar\.gz ]]; then
+    local ds="${BASH_REMATCH[1]}" ts="${BASH_REMATCH[2]}"
+    y="${ds:0:4}"; m="${ds:4:2}"; d="${ds:6:2}"
+    H="${ts:0:2}"; M="${ts:2:2}"; S="${ts:4:2}"
+    date -u -d "${y}-${m}-${d} ${H}:${M}:${S}" +%s 2>/dev/null && return 0
+  fi
+  echo 0
+}
+
+# В cache оставить только последний архив на экземпляр (dirname S3 key).
+# $1 = optional storage-id (пусто = все). stdout: сколько файлов удалено.
+rbv_cache_prune_latest() {
+  local only_sid="${1:-}"
+  local wd cdir sid dir f key parent ep best_ep best_f n=0
+  local -A best_path best_epoch
+  wd="$(rbv_work_dir)"
+  cdir="${wd}/cache/archives"
+  [[ -d "$cdir" ]] || { echo 0; return 0; }
+
+  # collect: group = sid|parent → best file
+  while IFS= read -r f; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    sid="$(basename "$(dirname "$f")")"
+    [[ -n "$only_sid" && "$sid" != "$only_sid" ]] && continue
+    key=""
+    [[ -f "${f}.key" ]] && key="$(head -n1 "${f}.key" 2>/dev/null || true)"
+    [[ -n "$key" ]] || key="$(basename "$f")"
+    parent="$(dirname "$key")"
+    [[ "$parent" == "." ]] && parent="$key"
+    ep="$(rbv_cache_name_epoch "$(basename "$key")")"
+    [[ "$ep" =~ ^[0-9]+$ ]] || ep=0
+    if (( ep == 0 )); then
+      ep="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    fi
+    local g="${sid}|${parent}"
+    if [[ -z "${best_epoch[$g]:-}" ]] || (( ep > best_epoch[$g] )); then
+      best_epoch[$g]="$ep"
+      best_path[$g]="$f"
+    fi
+  done < <(find "$cdir" -type f -name '*.tar.gz' 2>/dev/null || true)
+
+  # delete non-best
+  while IFS= read -r f; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    sid="$(basename "$(dirname "$f")")"
+    [[ -n "$only_sid" && "$sid" != "$only_sid" ]] && continue
+    key=""
+    [[ -f "${f}.key" ]] && key="$(head -n1 "${f}.key" 2>/dev/null || true)"
+    [[ -n "$key" ]] || key="$(basename "$f")"
+    parent="$(dirname "$key")"
+    [[ "$parent" == "." ]] && parent="$key"
+    local g="${sid}|${parent}"
+    if [[ -n "${best_path[$g]:-}" && "$f" != "${best_path[$g]}" ]]; then
+      rm -f "$f" "${f}.key" 2>/dev/null || true
+      n=$((n + 1))
+    fi
+  done < <(find "$cdir" -type f -name '*.tar.gz' 2>/dev/null || true)
+
+  # orphan .key
+  while IFS= read -r f; do
+    [[ -f "${f%.key}" ]] || { rm -f "$f" 2>/dev/null || true; }
+  done < <(find "$cdir" -type f -name '*.tar.gz.key' 2>/dev/null || true)
+
+  echo "$n"
+}
+
 # Перед удалением runs — перенести все архивы в cache (hardlink).
 rbv_cache_adopt_all_runs() {
   local wd d arch line key sid dest

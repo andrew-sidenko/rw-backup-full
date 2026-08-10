@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.6.30 (2026-08-10)
+
+### Изменено (`rw-backup-verify`)
+- **Cache: только latest на экземпляр** — старые архивы в `cache/archives/` удаляются.
+  - `run --storage ID` по умолчанию `--cache-latest`
+  - оставить все: `run --storage ID --keep-cache-all`
+  - вручную: `rw-backup-verify cache prune [--storage ID]`
+
 ## v5.6.29 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)
