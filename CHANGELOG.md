@@ -1,5 +1,10 @@
 # Changelog
 
+## v5.6.16 (2026-08-10)
+
+### Изменено (`rw-backup-verify`)
+- Объединены дубли: `db_rows`+`user_rows_monotonic` → **`user_rows`**; `stack_up`+`stability` → **`stack`** (подъём + окно без падений). Старые ключи остаются алиасами.
+
 ## v5.6.15 (2026-08-10)
 
 ### Добавлено (`rw-backup-verify`)
