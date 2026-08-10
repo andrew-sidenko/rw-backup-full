@@ -11,21 +11,17 @@
     "timezone_skew_hours": 14,
     "stability_seconds": 180,
     "panel": {
-      "db_rows": true,
-      "user_rows_monotonic": true,
+      "user_rows": true,
       "event_freshness": true,
-      "stack_up": true,
+      "stack": true,
       "isolation": true,
-      "stability": true,
       "backend_ports": true
     },
     "bot": {
-      "db_rows": true,
-      "user_rows_monotonic": true,
+      "user_rows": true,
       "event_freshness": true,
-      "stack_up": true,
+      "stack": true,
       "isolation": true,
-      "stability": true,
       "backend_ports": true
     }
   },

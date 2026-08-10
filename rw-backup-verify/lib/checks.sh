@@ -11,17 +11,31 @@ __RBV_CHECKS=1
 rbv_check_enabled() {
   # rbv_check_enabled <kind> <name>  → 0 если включено (default true)
   # Важно: jq `false // x` даёт x — нельзя использовать // для булевых.
+  # Алиасы (старые имена → новые): db_rows|user_rows_monotonic→user_rows,
+  # stack_up|stability→stack.
   local kind="$1" name="$2"
-  local v
-  v="$(jq -r --arg k "$kind" --arg n "$name" '
-    if (.checks[$k] | type)=="object" and (.checks[$k] | has($n)) then .checks[$k][$n]
-    elif (.checks.default | type)=="object" and (.checks.default | has($n)) then .checks.default[$n]
-    else true end
-  ' "$RBV_CONFIG" 2>/dev/null || echo true)"
-  case "$v" in
-    false|FALSE|0|no|off) return 1 ;;
-    *) return 0 ;;
+  local names=("$name")
+  case "$name" in
+    user_rows) names=(user_rows user_rows_monotonic db_rows) ;;
+    stack)     names=(stack stack_up stability) ;;
   esac
+  local n v found=false
+  for n in "${names[@]}"; do
+    v="$(jq -r --arg k "$kind" --arg n "$n" '
+      if (.checks[$k] | type)=="object" and (.checks[$k] | has($n)) then .checks[$k][$n]|tostring
+      elif (.checks.default | type)=="object" and (.checks.default | has($n)) then .checks.default[$n]|tostring
+      else "__missing__" end
+    ' "$RBV_CONFIG" 2>/dev/null || echo "__missing__")"
+    if [[ "$v" != "__missing__" ]]; then
+      found=true
+      case "$v" in
+        false|FALSE|0|no|off) return 1 ;;
+        *) return 0 ;;
+      esac
+    fi
+  done
+  # ни одного ключа нет — default on
+  return 0
 }
 
 rbv_skew_sec() {
@@ -202,17 +216,17 @@ rbv_check_stability() {
     running="$(docker compose -f "$compose" -p "$project" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
     crashed="$(docker compose -f "$compose" -p "$project" ps --status exited --status dead -q 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "${crashed:-0}" -gt 0 ]]; then
-      rbv_check_add stability fail "упали контейнеры: exited/dead=${crashed}, running=${running}"
+      rbv_check_add stack fail "упали контейнеры: exited/dead=${crashed}, running=${running}"
       return 1
     fi
     if [[ "${running:-0}" -lt 1 ]]; then
-      rbv_check_add stability fail "нет running-контейнеров"
+      rbv_check_add stack fail "нет running-контейнеров"
       return 1
     fi
     sleep "$interval"
   done
   running="$(docker compose -f "$compose" -p "$project" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
-  rbv_check_add stability ok "без падений ${sec}с, running=${running}"
+  rbv_check_add stack ok "поднят, без падений ${sec}с, running=${running}"
   return 0
 }
 

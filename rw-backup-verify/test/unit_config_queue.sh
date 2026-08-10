@@ -97,11 +97,14 @@ if rbv_global_due; then pass "times due"; else fail "times due" "not"; fi
 source "$ROOT/lib/checks.sh"
 
 # toggles
-jq '.checks.bot.backend_ports=false | .checks.panel.stability=false' \
+jq '.checks.bot.backend_ports=false | .checks.panel.stack=false' \
   "$RBV_CONFIG" > "$T/c3.json" && mv "$T/c3.json" "$RBV_CONFIG"
 rbv_check_enabled bot backend_ports && fail "bot ports off" "enabled" || pass "bot ports disabled"
 rbv_check_enabled panel backend_ports && pass "panel ports on" || fail "panel ports" "off"
-rbv_check_enabled panel stability && fail "panel stab off" "on" || pass "panel stability disabled"
+rbv_check_enabled panel stack && fail "panel stack off" "on" || pass "panel stack disabled"
+# aliases: старое stability=false должно выключать stack
+jq '.checks.bot.stability=false | del(.checks.bot.stack)' "$RBV_CONFIG" > "$T/c4.json" && mv "$T/c4.json" "$RBV_CONFIG"
+rbv_check_enabled bot stack && fail "alias stability→stack" "still on" || pass "alias stability disables stack"
 
 # archive epoch parse
 ep="$(rbv_parse_archive_epoch 'remnawave_backup_2026-08-10_03_00_00.tar.gz')"
@@ -126,12 +129,12 @@ b="$(rbv_baseline_load s1 "bot:p/A:custom_bot_bot1")"
 rbv_checks_init "$T/checks.json"
 RBV_BUCKET=b
 rbv_check_add download ok "file.tar.gz"
-rbv_check_add user_rows_monotonic fail "меньше" "20" "15"
+rbv_check_add user_rows fail "меньше" "20" "15"
 rbv_check_add isolation ok "internal"
 body="$(rbv_format_tg_report s1 bot "bot:p/A:x" "pref/custom_bot_x.tar.gz" false)"
 printf '%s\n' "$body" | grep -q 'Хранилище' && pass "tg has storage" || fail "tg storage" "missing"
 printf '%s\n' "$body" | grep -q 'Путь' && pass "tg has path" || fail "tg path" "missing"
-printf '%s\n' "$body" | grep -q 'user_rows_monotonic' && pass "tg has check" || fail "tg check" "missing"
+printf '%s\n' "$body" | grep -q 'user_rows' && pass "tg has check" || fail "tg check" "missing"
 printf '%s\n' "$body" | grep -q 'Расхождения' && pass "tg has diffs" || fail "tg diffs" "missing"
 printf '%s\n' "$body" | grep -q '✅\|❌\|⚠\|⚪' && pass "tg icons" || fail "tg icons" "missing"
 

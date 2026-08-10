@@ -54,19 +54,19 @@ rw-backup-verify run --storage cf-oneok     # сейчас
 
 | Ключ | Смысл |
 |---|---|
-| `db_rows` | таблица users не пуста |
-| `user_rows_monotonic` | строк users ≥ предыдущей успешной проверки |
+| `user_rows` | users не пуста и ≥ предыдущей проверки (baseline) |
 | `event_freshness` | max(created/updated/…) в окне [prev_backup − skew … curr_backup + skew] |
-| `stack_up` | поднять compose в `--internal` сети |
+| `stack` | поднять compose в `--internal` + без падений `stability_seconds` |
 | `isolation` | сеть Internal + нет внешнего DNS |
-| `stability` | без падений контейнеров N секунд (`stability_seconds`) |
 | `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
 
 `timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
 
+Старые имена `db_rows` / `user_rows_monotonic` / `stack_up` / `stability` ещё читаются как алиасы.
+
 Отключить пример:
 ```json
-"checks": { "bot": { "backend_ports": false, "stability": false } }
+"checks": { "bot": { "backend_ports": false, "stack": false } }
 ```
 
 ## Telegram-отчёт

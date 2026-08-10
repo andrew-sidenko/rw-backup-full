@@ -185,43 +185,36 @@ if [[ "$ok" == true ]]; then
       rbv_check_add db_schema ok "tables=${DB_TABLES}"
     fi
 
-    # user rows
-    if rbv_check_enabled "$KIND" user_rows_monotonic || rbv_check_enabled "$KIND" db_rows; then
+    # user_rows: не пусто + ≥ предыдущей проверки (один toggle)
+    if rbv_check_enabled "$KIND" user_rows; then
       utbl="$(rbv_find_users_table)"
-      if [[ -n "$utbl" ]]; then
-        USER_ROWS="$(rbv_count_table "$utbl")"
-        if rbv_check_enabled "$KIND" db_rows; then
-          if (( USER_ROWS < 1 )); then
-            rbv_check_add db_rows fail "users(${utbl})=0" "" "$USER_ROWS"
-            fail_add "users empty"
-          else
-            rbv_check_add db_rows ok "users(${utbl})=${USER_ROWS}" "" "$USER_ROWS"
-          fi
-        fi
-        if rbv_check_enabled "$KIND" user_rows_monotonic; then
-          if [[ -n "$PREV_USER_ROWS" && "$PREV_USER_ROWS" =~ ^[0-9]+$ ]]; then
-            if (( USER_ROWS < PREV_USER_ROWS )); then
-              rbv_check_add user_rows_monotonic fail \
-                "строк users меньше предыдущей проверки" "$PREV_USER_ROWS" "$USER_ROWS"
-              fail_add "user_rows ${USER_ROWS}<${PREV_USER_ROWS}"
-            else
-              rbv_check_add user_rows_monotonic ok \
-                "users не уменьшились" "$PREV_USER_ROWS" "$USER_ROWS"
-            fi
-          else
-            rbv_check_add user_rows_monotonic skip "нет baseline (первый прогон)" "" "$USER_ROWS"
-          fi
-        fi
+      if [[ -z "$utbl" ]]; then
+        rbv_check_add user_rows skip "таблица users не найдена"
       else
-        rbv_check_add db_rows skip "таблица users не найдена"
-        rbv_check_add user_rows_monotonic skip "таблица users не найдена"
+        USER_ROWS="$(rbv_count_table "$utbl")"
+        if (( USER_ROWS < 1 )); then
+          rbv_check_add user_rows fail "users(${utbl})=0" "${PREV_USER_ROWS:-}" "$USER_ROWS"
+          fail_add "users empty"
+        elif [[ -n "$PREV_USER_ROWS" && "$PREV_USER_ROWS" =~ ^[0-9]+$ ]]; then
+          if (( USER_ROWS < PREV_USER_ROWS )); then
+            rbv_check_add user_rows fail \
+              "users меньше предыдущей проверки" "$PREV_USER_ROWS" "$USER_ROWS"
+            fail_add "user_rows ${USER_ROWS}<${PREV_USER_ROWS}"
+          else
+            rbv_check_add user_rows ok \
+              "users(${utbl})=${USER_ROWS} ≥ prev" "$PREV_USER_ROWS" "$USER_ROWS"
+          fi
+        else
+          rbv_check_add user_rows ok \
+            "users(${utbl})=${USER_ROWS} (первый baseline)" "" "$USER_ROWS"
+        fi
       fi
     fi
 
     # event freshness (relative to backup window + skew)
     if rbv_check_enabled "$KIND" event_freshness; then
       LAST_EVENT="$(rbv_max_event_epoch)"
-        skew="$(rbv_skew_sec)"
+      skew="$(rbv_skew_sec)"
       if [[ "${LAST_EVENT:-0}" -eq 0 ]]; then
         rbv_check_add event_freshness skip "нет timestamp-колонок событий"
       elif [[ "${CURR_ARCH_EPOCH:-0}" -eq 0 ]]; then
@@ -249,20 +242,20 @@ if [[ "$ok" == true ]]; then
   fi
 fi
 
-# --- stack up + isolation / stability / ports -------------------------------
+# --- stack (= up + stability) + isolation / ports ---------------------------
 STACK_OK="skip"
 STACK_DETAIL=""
 SETTLE="$(rbv_cfg '.settle_seconds // 25')"
 SAMPLE_CID=""
 
-if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack_up; then
+if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack; then
   CF=""
   for c in "${PROJ_DIR}/docker-compose.yml" "${PROJ_DIR}/docker-compose.yaml" \
            "${PROJ_DIR}/compose.yml" "${PROJ_DIR}/compose.yaml"; do
     [[ -f "$c" ]] && { CF="$c"; break; }
   done
   if [[ -z "$CF" ]]; then
-    rbv_check_add stack_up skip "compose не найден"
+    rbv_check_add stack skip "compose не найден"
   else
     NET_NAME="rbv_net_${RUN_ID}"
     docker network create --internal "$NET_NAME" >/dev/null
@@ -311,7 +304,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack_
       if [[ $up_rc -ne 0 ]]; then
         STACK_OK="fail"
         STACK_DETAIL="compose up rc=${up_rc}"
-        rbv_check_add stack_up fail "$STACK_DETAIL: $(tail -n2 "${RUN_DIR}/compose.up.err" | tr '\n' ' ')"
+        rbv_check_add stack fail "$STACK_DETAIL: $(tail -n2 "${RUN_DIR}/compose.up.err" | tr '\n' ' ')"
         fail_add "stack up failed"
       else
         sleep "$SETTLE"
@@ -321,11 +314,16 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack_
         SAMPLE_CID="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | head -n1 || true)"
         if [[ "${running:-0}" -lt 1 ]]; then
           STACK_OK="fail"
-          rbv_check_add stack_up fail "$STACK_DETAIL"
+          rbv_check_add stack fail "после up: $STACK_DETAIL"
           fail_add "no running containers"
         else
           STACK_OK="ok"
-          rbv_check_add stack_up ok "$STACK_DETAIL"
+          # подъём + окно без падений — одна проверка stack
+          stab="$(rbv_stability_sec)"
+          if ! rbv_check_stability "rbv_${RUN_ID}" "$COMPOSE_FILE" "$stab"; then
+            STACK_OK="fail"
+            fail_add "stack stability"
+          fi
         fi
 
         if rbv_check_enabled "$KIND" isolation; then
@@ -334,15 +332,6 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack_
           fi
         else
           rbv_check_add isolation skip "отключено"
-        fi
-
-        if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" stability; then
-          stab="$(rbv_stability_sec)"
-          if ! rbv_check_stability "rbv_${RUN_ID}" "$COMPOSE_FILE" "$stab"; then
-            fail_add "stability"
-          fi
-        elif ! rbv_check_enabled "$KIND" stability; then
-          rbv_check_add stability skip "отключено"
         fi
 
         if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" backend_ports; then
@@ -354,12 +343,12 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack_
         fi
       fi
     else
-      rbv_check_add stack_up fail "compose config failed"
+      rbv_check_add stack fail "compose config failed"
       fail_add "compose config"
     fi
   fi
-elif ! rbv_check_enabled "$KIND" stack_up; then
-  rbv_check_add stack_up skip "отключено"
+elif ! rbv_check_enabled "$KIND" stack; then
+  rbv_check_add stack skip "отключено"
 fi
 
 # --- save baseline (только при успехе данных) ------------------------------
