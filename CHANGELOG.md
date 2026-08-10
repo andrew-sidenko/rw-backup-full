@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.6.28 (2026-08-10)
+
+### Изменено (`rw-backup-verify`)
+- **Isolation preflight** до download/restore/stack: если Docker `--internal`
+  пропускает egress — все тесты останавливаются сразу.
+- В stack: **isolation до stability/ports**; при fail — дальше не идём.
+- Отключается: `checks.preflight_isolation=false`.
+
 ## v5.6.27 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)

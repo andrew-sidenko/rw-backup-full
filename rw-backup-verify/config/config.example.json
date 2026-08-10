@@ -11,6 +11,7 @@
   "checks": {
     "timezone_skew_hours": 14,
     "stability_seconds": 180,
+    "preflight_isolation": true,
     "panel": {
       "user_rows": true,
       "event_freshness": true,

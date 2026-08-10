@@ -415,6 +415,9 @@ _stubs="$(rbv_compose_prepare_env "$_pe" "$_pe/c.yml" "$_pe/out.env")"
 printf '%s' "$_stubs" | grep -q BACKEND_IMAGE && pass "prepare stub BACKEND_IMAGE" || fail "prepare stub" "$_stubs"
 grep -q '^BACKEND_IMAGE=rbv-missing' "$_pe/out.env" && pass "prepare stub value" || fail "prepare stub value" "$(cat $_pe/out.env)"
 echo 'METRICS_PASS: abcdefghijklmnop' | rbv_mask_secrets | grep -q '\*\*\*' && pass "mask secrets" || fail "mask secrets" "no mask"
+grep -q 'rbv_preflight_isolation' "$ROOT/lib/checks.sh" && pass "preflight isolation fn" || fail "preflight isolation fn" "missing"
+grep -q 'preflight: isolation' "$ROOT/bin/rbv-run-one.sh" && pass "preflight in run-one" || fail "preflight in run-one" "missing"
+grep -q 'check isolation (до stability)' "$ROOT/bin/rbv-run-one.sh" && pass "isolation before stability" || fail "isolation before stability" "missing"
 
 # archive cache + runs prune (изолированный каталог runs)
 _rs="$T/state/runs"

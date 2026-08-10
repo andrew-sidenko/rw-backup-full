@@ -216,6 +216,52 @@ rbv_check_add() {
 
 # --- stack probes -----------------------------------------------------------
 
+# TCP egress с сети $1 наружу? rc=0 = дыра (egress есть), rc=1 = изолировано/нет egress.
+# Не пишет в checks.json — только probe.
+rbv_net_has_egress() {
+  local net="$1"
+  local probe="rbv_iso_${RANDOM}"
+  docker rm -f "$probe" >/dev/null 2>&1 || true
+  if ! docker run -d --name "$probe" --network "$net" busybox:1.36 sleep 30 >/dev/null 2>&1; then
+    # нет busybox — не можем доказать egress; считаем «нет дыры» (осторожный false)
+    return 1
+  fi
+  local leak=1
+  if docker exec "$probe" nc -z -w 3 1.1.1.1 443 >/dev/null 2>&1 \
+     || docker exec "$probe" wget -qO- -T 3 http://1.1.1.1 >/dev/null 2>&1; then
+    leak=0
+  fi
+  docker rm -f "$probe" >/dev/null 2>&1 || true
+  return "$leak"
+}
+
+# Preflight до download/restore: Docker умеет --internal без egress.
+# При fail — вызывающий должен остановить все тесты.
+# stdout: краткий detail; rc=0 ok, rc=1 fail.
+rbv_preflight_isolation() {
+  local net="rbv_preflight_${RANDOM}_net"
+  local inn
+  docker network rm "$net" >/dev/null 2>&1 || true
+  if ! docker network create --internal "$net" >/dev/null 2>&1; then
+    printf '%s\n' "не удалось создать --internal сеть"
+    return 1
+  fi
+  inn="$(docker network inspect -f '{{.Internal}}' "$net" 2>/dev/null || echo false)"
+  if [[ "$inn" != "true" ]]; then
+    docker network rm "$net" >/dev/null 2>&1 || true
+    printf '%s\n' "network.Internal=${inn} после create --internal"
+    return 1
+  fi
+  if rbv_net_has_egress "$net"; then
+    docker network rm "$net" >/dev/null 2>&1 || true
+    printf '%s\n' "TCP egress на --internal сети (1.1.1.1) — хост не изолирует"
+    return 1
+  fi
+  docker network rm "$net" >/dev/null 2>&1 || true
+  printf '%s\n' "Internal=true, внешнего TCP нет"
+  return 0
+}
+
 # Проверка изоляции: DNS на internal-сети Docker часто резолвится —
 # смотрим Internal-флаг и реальный TCP egress.
 rbv_check_isolation() {
@@ -227,19 +273,13 @@ rbv_check_isolation() {
     rbv_check_add isolation fail "network.Internal=${inn}"
     return 1
   fi
-  # TCP к внешнему IP с той же сети (busybox). Успех = дыра в изоляции.
-  local probe="rbv_iso_${RANDOM}"
-  docker rm -f "$probe" >/dev/null 2>&1 || true
-  if docker run -d --name "$probe" --network "$NET_NAME" busybox:1.36 sleep 30 >/dev/null 2>&1; then
-    if docker exec "$probe" nc -z -w 3 1.1.1.1 443 >/dev/null 2>&1 \
-       || docker exec "$probe" wget -qO- -T 3 http://1.1.1.1 >/dev/null 2>&1; then
-      docker rm -f "$probe" >/dev/null 2>&1 || true
-      rbv_check_add isolation fail "есть TCP egress наружу (1.1.1.1) при Internal=true"
-      return 1
-    fi
-    docker rm -f "$probe" >/dev/null 2>&1 || true
-  elif [[ -n "$sample" ]]; then
-    # fallback без busybox: /dev/tcp в контейнере приложения
+  if rbv_net_has_egress "$NET_NAME"; then
+    rbv_check_add isolation fail "есть TCP egress наружу (1.1.1.1) при Internal=true"
+    return 1
+  fi
+  # fallback: sample container /dev/tcp, если busybox не поднялся в has_egress
+  # (has_egress при отсутствии busybox возвращает «нет дыры» — доп. проверка)
+  if [[ -n "$sample" ]]; then
     if docker exec "$sample" sh -c 'timeout 3 sh -c "echo >/dev/tcp/1.1.1.1/443"' >/dev/null 2>&1; then
       rbv_check_add isolation fail "есть TCP egress наружу из sample-контейнера"
       return 1

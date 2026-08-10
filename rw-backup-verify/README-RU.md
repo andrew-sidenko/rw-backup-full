@@ -58,7 +58,7 @@ rw-backup-verify run --storage cf-oneok     # сейчас
 | `user_rows` | users не пуста и ≥ предыдущей проверки (baseline) |
 | `event_freshness` | max(created/updated/…) в окне [prev_backup − skew … curr_backup + skew] |
 | `stack` | поднять compose в `--internal` + без падений `stability_seconds` |
-| `isolation` | сеть `Internal=true` + нет внешнего TCP egress (DNS на internal часто резолвится — это не leak) |
+| `isolation` | сеть `Internal=true` + нет внешнего TCP egress (DNS на internal часто резолвится — это не leak). **Preflight** до download: если хост не изолирует — все тесты стоп. В stack — до stability/ports. |
 | `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
 
 `timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
@@ -114,6 +114,11 @@ bash test/unit_logic_full.sh
 (повторный прогон не качает S3). В `runs/<id>/` также лежат дампы compose
 из бэкапа и isolated-версии (`compose.from-backup*`, `compose.isolated*`,
 `compose.ps.txt`, `compose.logs.txt`) — для ручной корректировки инфры.
+
+Panel (Remnawave): compose обычно схож, отличается в основном расположением БД
+(URL переписывается на sandbox `remnawave-db`). Bot: схемы разные (swarm/
+`BACKEND_IMAGE`, infra-compose и т.д.) — смотрите дамп; без image tags в архиве
+stack будет skip.
 
 Освободить диск:
 

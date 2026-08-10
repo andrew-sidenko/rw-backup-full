@@ -77,9 +77,35 @@ BASELINE_JSON="$(rbv_baseline_load "$SID" "$INST")"
 PREV_ARCH_EPOCH="$(jq -r '.archive_ts // 0' <<<"$BASELINE_JSON")"
 PREV_USER_ROWS="$(jq -r '.user_rows // empty' <<<"$BASELINE_JSON")"
 
+# --- preflight isolation (до download/restore/stack) ------------------------
+# Если хост не умеет --internal без egress — все проверки бессмысленны.
+_preflight_iso=true
+v_pf="$(jq -r '.checks.preflight_isolation // .checks.default.preflight_isolation // true' "$RBV_CONFIG" 2>/dev/null || echo true)"
+case "$v_pf" in false|FALSE|0|no|off) _preflight_iso=false ;; esac
+if [[ "$_preflight_iso" == true ]]; then
+  rep "preflight: isolation (Docker --internal без egress)…"
+  set +e
+  _pf_detail="$(rbv_preflight_isolation 2>/dev/null)"
+  _pf_rc=$?
+  set -e
+  if [[ $_pf_rc -ne 0 ]]; then
+    rbv_check_add isolation fail "preflight: ${_pf_detail:-fail}"
+    fail_add "isolation preflight — тесты остановлены"
+    rep "FAIL isolation preflight: ${_pf_detail}"
+    rep "  исправьте Docker/firewall (сети --internal не должны иметь egress), затем повторите run"
+  else
+    rep "preflight: isolation OK (${_pf_detail})"
+  fi
+else
+  rep "preflight: isolation пропущен (checks.preflight_isolation=false)"
+fi
+
 # --- download / extract -----------------------------------------------------
 # Кэш архивов: work_dir/cache/archives/<sid>/<hash>.tar.gz — не качаем повторно.
 # Перед скачиванием чистим старые runs/ (архивы уже в cache через hardlink).
+if [[ "$ok" != true ]]; then
+  rep "skip: download/restore/stack не запускаются (preflight fail)"
+else
 ARCH_PATH="${RUN_DIR}/archive.tar.gz"
 S3_URI="s3://${RBV_BUCKET}/${KEY}"
 _keep_runs="$(rbv_cfg '.runs_keep // 2')"
@@ -862,44 +888,51 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           fail_add "no running containers"
         else
           STACK_OK="ok"
-          stab="$(rbv_stability_sec)"
-          rep "stack: stability window ${stab}с…"
-          if ! rbv_check_stability "${COMPOSE_PROJECT}" "$COMPOSE_FILE" "$stab"; then
-            STACK_OK="fail"
-            fail_add "stack stability"
-            # обновить логи после падения
-            {
-              echo "=== compose ps (after stability fail) ==="
-              docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -a 2>&1 || true
-              echo
-              while IFS= read -r _cid; do
-                [[ -n "$_cid" ]] || continue
-                _name="$(docker inspect -f '{{.Name}}' "$_cid" 2>/dev/null | sed 's#^/##')"
-                echo "=== logs: ${_name} (tail 80) ==="
-                docker logs --tail 80 "$_cid" 2>&1 || true
+          # isolation СРАЗУ после up/settle — до stability (180с) и ports
+          if rbv_check_enabled "$KIND" isolation; then
+            rep "check isolation (до stability)…"
+            if ! rbv_check_isolation "$SAMPLE_CID"; then
+              STACK_OK="fail"
+              fail_add "isolation leak — дальнейшие stack-тесты остановлены"
+              rbv_check_add stack skip "остановлено: isolation fail"
+              if rbv_check_enabled "$KIND" backend_ports; then
+                rbv_check_add backend_ports skip "остановлено: isolation fail"
+              fi
+            fi
+          else
+            rbv_check_add isolation skip "отключено"
+          fi
+
+          if [[ "$STACK_OK" == "ok" ]]; then
+            stab="$(rbv_stability_sec)"
+            rep "stack: stability window ${stab}с…"
+            if ! rbv_check_stability "${COMPOSE_PROJECT}" "$COMPOSE_FILE" "$stab"; then
+              STACK_OK="fail"
+              fail_add "stack stability"
+              {
+                echo "=== compose ps (after stability fail) ==="
+                docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -a 2>&1 || true
                 echo
-              done < <(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -aq 2>/dev/null || true)
-            } >"${RUN_DIR}/compose.logs.txt" 2>&1 || true
-            rep_file "compose logs after fail" "${RUN_DIR}/compose.logs.txt" 120
+                while IFS= read -r _cid; do
+                  [[ -n "$_cid" ]] || continue
+                  _name="$(docker inspect -f '{{.Name}}' "$_cid" 2>/dev/null | sed 's#^/##')"
+                  echo "=== logs: ${_name} (tail 80) ==="
+                  docker logs --tail 80 "$_cid" 2>&1 || true
+                  echo
+                done < <(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -aq 2>/dev/null || true)
+              } >"${RUN_DIR}/compose.logs.txt" 2>&1 || true
+              rep_file "compose logs after fail" "${RUN_DIR}/compose.logs.txt" 120
+            fi
           fi
-        fi
 
-        if rbv_check_enabled "$KIND" isolation; then
-          rep "check isolation…"
-          if ! rbv_check_isolation "$SAMPLE_CID"; then
-            fail_add "isolation leak"
+          if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" backend_ports; then
+            rep "check backend_ports…"
+            if ! rbv_check_backend_ports "$NET_NAME" "$COMPOSE_RAW" "${COMPOSE_PROJECT}"; then
+              fail_add "backend_ports"
+            fi
+          elif [[ "$STACK_OK" == "ok" ]] && ! rbv_check_enabled "$KIND" backend_ports; then
+            rbv_check_add backend_ports skip "отключено"
           fi
-        else
-          rbv_check_add isolation skip "отключено"
-        fi
-
-        if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" backend_ports; then
-          rep "check backend_ports…"
-          if ! rbv_check_backend_ports "$NET_NAME" "$COMPOSE_RAW" "${COMPOSE_PROJECT}"; then
-            fail_add "backend_ports"
-          fi
-        elif ! rbv_check_enabled "$KIND" backend_ports; then
-          rbv_check_add backend_ports skip "отключено"
         fi
       fi
       fi  # missing images vs real up
@@ -909,6 +942,8 @@ elif ! rbv_check_enabled "$KIND" stack; then
   rbv_check_add stack skip "отключено"
   rep "stack: отключено в checks"
 fi
+
+fi  # ok after preflight — download/restore/stack
 
 # --- save baseline (только при успехе данных) ------------------------------
 if [[ "$ok" == true || "$USER_ROWS" -gt 0 ]]; then
