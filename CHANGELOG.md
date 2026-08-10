@@ -1,5 +1,24 @@
 # Changelog
 
+## v5.6.18 (2026-08-10)
+
+### Добавлено (`rw-backup-verify`)
+- **Пошаговый вывод `run`**: start → discover/S3 ls → enqueue count → worker → готово; сессионный лог `work_dir/logs/run_*.log`.
+- Пустая очередь / 0 untested — явный WARN с подсказкой `discover --all` и путём к `tested/`.
+- Ошибки `aws s3 ls` больше не глотаются (раньше `run` молча завершался).
+
+## v5.6.17 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`rw-backup-verify: …/usr/local/lib/common.sh: No such file`**: CLI через симлинк `/usr/local/bin` считал `ROOT=/usr/local`. Теперь путь к дереву установки через `readlink -f` (+ fallback на `/opt/rw-backup-verify`).
+- **`storage show` / `discover` неизвестного id** больше не «успех» с пустым выводом: `rbv_storage_json` проверяет непустой результат; `discover`/`run --storage` валидируют хранилище до process substitution.
+- **`schedule set --interval-hours`**: только целое `> 0` (иначе отрицательный интервал делал schedule всегда due); **`--times`**: строгий `HH:MM`.
+- **age-архивы**: ошибка decrypt / пустой `age_identity` → `fail_add` + check `decrypt`, без мгновенного `set -e` exit до отчёта.
+- Алиасы **`tel`/`tg`** → `telegram`.
+
+### Тесты
+- Расширен прогон: `test/unit_logic_full.sh` (mock AWS discover, worker+flock, валидации, symlink).
+
 ## v5.6.16 (2026-08-10)
 
 ### Изменено (`rw-backup-verify`)

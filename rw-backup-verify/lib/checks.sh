@@ -19,7 +19,7 @@ rbv_check_enabled() {
     user_rows) names=(user_rows user_rows_monotonic db_rows) ;;
     stack)     names=(stack stack_up stability) ;;
   esac
-  local n v found=false
+  local n v
   for n in "${names[@]}"; do
     v="$(jq -r --arg k "$kind" --arg n "$n" '
       if (.checks[$k] | type)=="object" and (.checks[$k] | has($n)) then .checks[$k][$n]|tostring
@@ -27,7 +27,6 @@ rbv_check_enabled() {
       else "__missing__" end
     ' "$RBV_CONFIG" 2>/dev/null || echo "__missing__")"
     if [[ "$v" != "__missing__" ]]; then
-      found=true
       case "$v" in
         false|FALSE|0|no|off) return 1 ;;
         *) return 0 ;;
@@ -124,29 +123,9 @@ rbv_count_table() {
   [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
 }
 
-# Max epoch of "event-like" columns across public tables (best-effort).
+# Max epoch of "event-like" columns (best-effort по известным таблицам/полям).
 rbv_max_event_epoch() {
-  local sql epoch
-  sql="$(cat <<'SQL'
-SELECT COALESCE(EXTRACT(EPOCH FROM MAX(v))::bigint, 0) FROM (
-  SELECT MAX(c.val) AS v FROM (
-    SELECT CASE
-      WHEN a.atttypid IN ('timestamp'::regtype,'timestamptz'::regtype,'date'::regtype)
-      THEN (xpath('/row/c/text()', query_to_xml(format('SELECT max(%I) AS c FROM %I.%I', a.attname, n.nspname, c.relname), false, true, '')))[1]::text::timestamptz
-      ELSE NULL
-    END AS val
-    FROM pg_attribute a
-    JOIN pg_class c ON c.oid=a.attrelid
-    JOIN pg_namespace n ON n.oid=c.relnamespace
-    WHERE n.nspname='public' AND c.relkind='r' AND a.attnum>0 AND NOT a.attisdropped
-      AND a.attname ~* '(created|updated|modified|last_|event|time|date|at$)'
-  ) c WHERE c.val IS NOT NULL
-) s;
-SQL
-)"
-  # Simpler portable approach: try known columns on users/nodes
-  epoch=0
-  local cand e
+  local epoch=0 cand e
   for cand in \
     "SELECT EXTRACT(EPOCH FROM MAX(updated_at))::bigint FROM users" \
     "SELECT EXTRACT(EPOCH FROM MAX(created_at))::bigint FROM users" \
