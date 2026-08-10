@@ -1,5 +1,12 @@
 # Changelog
 
+## v5.6.18 (2026-08-10)
+
+### Добавлено (`rw-backup-verify`)
+- **Пошаговый вывод `run`**: start → discover/S3 ls → enqueue count → worker → готово; сессионный лог `work_dir/logs/run_*.log`.
+- Пустая очередь / 0 untested — явный WARN с подсказкой `discover --all` и путём к `tested/`.
+- Ошибки `aws s3 ls` больше не глотаются (раньше `run` молча завершался).
+
 ## v5.6.17 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)

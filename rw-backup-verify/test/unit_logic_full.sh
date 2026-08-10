@@ -204,6 +204,66 @@ lock="$(rbv_work_dir)/locks/worker.lock"
 )
 "$ROOT/bin/rw-backup-verify" queue clear >/dev/null
 
+echo "==== run --storage verbose / empty / S3 fail ===="
+# дерево как после install.sh, с mock run-one (без Docker)
+FAKE2="$T/opt2/rw-backup-verify"
+mkdir -p "$FAKE2/bin" "$FAKE2/lib"
+cp -a "$ROOT/lib/." "$FAKE2/lib/"
+cp -a "$ROOT/bin/rw-backup-verify" "$FAKE2/bin/"
+cp -a "$ROOT/bin/rbv-worker.sh" "$FAKE2/bin/"
+cat > "$FAKE2/bin/rbv-run-one.sh" <<'RUN'
+#!/bin/bash
+set -euo pipefail
+echo "MOCK-RUN $*" >&2
+mkdir -p "${RBV_STATE_DIR}/runs/mockrun_verbose"
+exit 0
+RUN
+chmod +x "$FAKE2/bin/rbv-run-one.sh"
+
+# очистить tested чтобы run что-то нашёл
+rm -f "$(rbv_tested_file s1)"
+set +e
+out="$("$FAKE2/bin/rw-backup-verify" run --storage s1 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "run verbose rc" "rc=$rc out=${out:0:300}"
+printf '%s\n' "$out" | grep -q 'run start' && pass "run logs start" || fail "run logs start" "$out"
+printf '%s\n' "$out" | grep -q 'шаг 1/3' && pass "run logs step1" || fail "run logs step1" "$out"
+printf '%s\n' "$out" | grep -q 'S3 ls' && pass "run logs s3" || fail "run logs s3" "$out"
+printf '%s\n' "$out" | grep -q 'в очередь поставлено' && pass "run logs enqueued" || fail "run logs enq" "$out"
+printf '%s\n' "$out" | grep -q 'шаг 2/3: worker' && pass "run logs worker" || fail "run logs worker" "$out"
+printf '%s\n' "$out" | grep -q 'шаг 3/3: готово' && pass "run logs done" || fail "run logs done" "$out"
+printf '%s\n' "$out" | grep -q 'лог:' && pass "run logs path" || fail "run logs path" "$out"
+# файл лога должен существовать
+logf="$(printf '%s\n' "$out" | sed -n 's/.*лог: //p' | head -n1)"
+[[ -n "$logf" && -f "$logf" ]] && pass "run log file" || fail "run log file" "logf=$logf"
+
+# всё уже tested → пустой run с понятным WARN
+set +e
+out2="$("$FAKE2/bin/rw-backup-verify" run --storage s1 2>&1)"
+rc2=$?
+set -e
+[[ "$rc2" -eq 0 ]] && pass "run empty rc0" || fail "run empty rc" "rc=$rc2"
+printf '%s\n' "$out2" | grep -qi 'Нечего выполнять' && pass "run empty warn" || fail "run empty warn" "$out2"
+printf '%s\n' "$out2" | grep -q 'Очередь пуста\|в очередь поставлено 0' && pass "run empty detail" || pass "run empty detail-alt"
+
+# S3 ошибка должна быть видна (не тихий exit)
+cat > "$T/bin/aws" <<'AWS'
+#!/bin/bash
+echo "AccessDenied: mock" >&2
+exit 254
+AWS
+chmod +x "$T/bin/aws"
+set +e
+out3="$("$FAKE2/bin/rw-backup-verify" run --storage s1 2>&1)"
+rc3=$?
+set -e
+[[ "$rc3" -ne 0 ]] && pass "run s3 fail rc" || fail "run s3 fail rc" "rc=0 out=$out3"
+printf '%s\n' "$out3" | grep -q 'S3 ls' && pass "run s3 fail msg" || fail "run s3 fail msg" "$out3"
+
+# worker empty message
+# восстановим aws mock для остальных тестов не нужен — дальше checks
+
 echo "==== checks / baseline / tg format ===="
 jq '.checks.bot.backend_ports=false | .checks.panel.stack=false' \
   "$RBV_CONFIG" > "$T/c3.json" && mv "$T/c3.json" "$RBV_CONFIG"

@@ -107,3 +107,7 @@ rw-backup-verify tick
 bash test/unit_config_queue.sh
 bash test/unit_logic_full.sh
 ```
+
+Ручной `run` пишет шаги в stderr и в `work_dir/logs/run_*.log`
+(по умолчанию `/var/lib/rw-backup-verify/logs/`). Отчёты прогонов —
+`work_dir/runs/<id>/`.

@@ -19,6 +19,10 @@ msg() {
     ERR)  c=$'\e[31m' ;;
   esac
   printf '%s[%s]%s %s\n' "$c" "$t" $'\e[0m' "$*" >&2
+  if [[ -n "${RBV_LOG:-}" ]]; then
+    # без ANSI в файл
+    printf '[%s] %s\n' "$t" "$*" >>"$RBV_LOG" 2>/dev/null || true
+  fi
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || { msg ERR "Нужен $1"; exit 1; }; }
@@ -140,21 +144,35 @@ rbv_classify_name() {
 # Рекурсивный листинг архивов под prefix.
 # stdout lines: relative_key (от корня bucket, без s3://)
 # Учитывает и корень prefix, и любую вложенность.
+# Ошибки aws НЕ глотаем — иначе run выглядит как «ничего не произошло».
 rbv_list_all_archive_keys() {
   local base="${RBV_PREFIX}"
   local uri="s3://${RBV_BUCKET}/"
   [[ -n "$base" ]] && uri="s3://${RBV_BUCKET}/${base}/"
-  # aws s3 ls --recursive: DATE TIME SIZE KEY
-  rbv_aws s3 ls "$uri" --recursive 2>/dev/null \
-    | awk '{print $4}' \
+  local err out rc
+  err="$(mktemp)"; out="$(mktemp)"
+  set +e
+  rbv_aws s3 ls "$uri" --recursive >"$out" 2>"$err"
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    msg ERR "S3 ls ${uri} rc=${rc}: $(tr '\n' ' ' <"$err" | head -c 400)"
+    rm -f "$err" "$out"
+    return 1
+  fi
+  local n
+  n="$(wc -l <"$out" | tr -d ' ')"
+  msg INFO "S3 ls ${uri} — объектов: ${n}"
+  awk '{print $4}' "$out" \
     | grep -E '(^|/)(remnawave_backup_|custom_bot_)[^/]*\.tar\.gz(\.age)?$' \
     || true
+  rm -f "$err" "$out"
 }
 
 # Discover: для каждого экземпляра (папка + family) — latest архив.
 # stdout: kind|instance_id|s3_key|parent_dir
 # instance_id стабилен: "<kind>:<parent_dir>:<family>"
-# --untested-only: пропустить уже протестированные ключи
+# untested_only=true: пропустить уже протестированные ключи
 rbv_discover() {
   local sid="$1"
   local untested_only="${2:-false}"
@@ -162,11 +180,18 @@ rbv_discover() {
   j="$(rbv_storage_json "$sid")"
   rbv_aws_env "$j"
 
-  # tmp: family_key → "sortkey|full_s3_key|parent|kind|family"
-  local tmp
+  local tmp keys_file
   tmp="$(mktemp)"
+  keys_file="$(mktemp)"
+  if ! rbv_list_all_archive_keys >"$keys_file"; then
+    rm -f "$tmp" "$keys_file"
+    return 1
+  fi
+
+  local arch_n=0
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
+    arch_n=$((arch_n + 1))
     name="$(basename "$key")"
     parent="$(dirname "$key")"
     [[ "$parent" == "." ]] && parent=""
@@ -175,14 +200,17 @@ rbv_discover() {
     [[ -n "$kind" ]] || continue
     # sortkey = имя файла (TS в имени → лексикографический latest корректен)
     printf '%s\t%s\t%s\t%s\t%s\n' "${parent}|${family}" "$name" "$key" "$parent" "$kind" >> "$tmp"
-  done < <(rbv_list_all_archive_keys)
+  done <"$keys_file"
+  rm -f "$keys_file"
 
   if [[ ! -s "$tmp" ]]; then
+    msg WARN "Discover ${sid}: архивов panel/bot не найдено (ключей по маске=${arch_n})"
     rm -f "$tmp"
     return 0
   fi
 
-  # по каждой группе parent|family берём max name
+  local latest_file
+  latest_file="$(mktemp)"
   sort -t$'\t' -k1,1 -k2,2 "$tmp" \
     | awk -F'\t' '
       {
@@ -194,17 +222,25 @@ rbv_discover() {
         last=$0
       }
       END { if (prev != "") print last }
-    ' \
-    | while IFS=$'\t' read -r _grp name key parent kind; do
-        family="$(rbv_classify_name "$name" | cut -d'|' -f2)"
-        inst="${kind}:${parent}:${family}"
-        if [[ "$untested_only" == "true" ]] && rbv_is_tested "$sid" "$key"; then
-          msg INFO "skip tested: ${key}"
-          continue
-        fi
-        printf '%s|%s|%s|%s\n' "$kind" "$inst" "$key" "$parent"
-      done
+    ' >"$latest_file"
   rm -f "$tmp"
+
+  local out_n=0 skip_n=0
+  while IFS=$'\t' read -r _grp name key parent kind; do
+    [[ -n "${key:-}" ]] || continue
+    family="$(rbv_classify_name "$name" | cut -d'|' -f2)"
+    inst="${kind}:${parent}:${family}"
+    if [[ "$untested_only" == "true" ]] && rbv_is_tested "$sid" "$key"; then
+      skip_n=$((skip_n + 1))
+      msg INFO "skip tested: ${key}"
+      continue
+    fi
+    out_n=$((out_n + 1))
+    printf '%s|%s|%s|%s\n' "$kind" "$inst" "$key" "$parent"
+  done <"$latest_file"
+  rm -f "$latest_file"
+
+  msg INFO "Discover ${sid}: latest=${out_n} skip_tested=${skip_n} (untested_only=${untested_only})"
 }
 
 # --- Tested registry --------------------------------------------------------

@@ -27,10 +27,11 @@ rw-backup-verify — автономная проверка логических 
 
   discover <storage-id> [--all]     # deep; по умолчанию только untested
   run [--due]                       # все хранилища: discover untested → очередь → work
-  run --storage ID                  # только одно хранилище
+  run --storage ID                  # только одно хранилище (с пошаговым логом)
   queue status|clear|work
-  tick                              # systemd: если глобально due → run
+  tick                              # systemd: если глобально due → run --due
 
+Логи ручного run: work_dir/logs/run_*.log и work_dir/runs/<id>/
 Глубокий обход: любые вложенные папки; в каждой — экземпляры panel/bot
 (по семейству имён). Тестируется только latest каждого экземпляра,
 если этот архив ещё не был в tested/.
@@ -179,12 +180,22 @@ case "$cmd" in
     sid="${1:?storage-id}"; shift || true
     mode=true
     [[ "${1:-}" == "--all" ]] && mode=false
-    # fail-fast: process substitution не пробрасывает exit rbv_discover в set -e
     rbv_storage_json "$sid" >/dev/null
+    disc_file="$(mktemp)"
+    set +e
+    rbv_discover "$sid" "$mode" >"$disc_file"
+    drc=$?
+    set -e
+    if (( drc != 0 )); then
+      rm -f "$disc_file"
+      exit "$drc"
+    fi
     printf '%-6s %-50s %s\n' "KIND" "INSTANCE" "KEY"
     while IFS='|' read -r kind inst key parent; do
+      [[ -n "${key:-}" ]] || continue
       printf '%-6s %-50s %s\n' "$kind" "$inst" "$key"
-    done < <(rbv_discover "$sid" "$mode")
+    done <"$disc_file"
+    rm -f "$disc_file"
     ;;
 
   run)
@@ -196,20 +207,89 @@ case "$cmd" in
         *) msg ERR "unknown $1"; exit 1 ;;
       esac
     done
+
+    # Файловый лог сессии (дублирует msg); дети наследуют RBV_LOG.
+    WD="$(rbv_work_dir)"
+    mkdir -p "${WD}/logs"
+    export RBV_LOG="${WD}/logs/run_$(date -u +%Y%m%d_%H%M%S).log"
+    : >"$RBV_LOG"
+    reason="manual"
+    [[ "$DUE" == true ]] && reason="schedule"
+
+    msg INFO "=== run start reason=${reason} storage=${ONLY:-ALL} ==="
+    msg INFO "лог: ${RBV_LOG}"
+    msg INFO "work_dir: ${WD}"
+
     if [[ "$DUE" == true ]]; then
-      rbv_global_due || { msg INFO "Ещё не время (глобальное расписание)"; exit 0; }
+      msg INFO "шаг: проверка глобального расписания"
+      rbv_global_due || { msg INFO "Ещё не время (глобальное расписание) — выход"; exit 0; }
+      msg OK "расписание: due"
     fi
+
+    enq=0
+    disc_file="$(mktemp)"
     if [[ -n "$ONLY" ]]; then
       rbv_storage_json "$ONLY" >/dev/null
+      msg INFO "шаг 1/3: discover untested latest → ${ONLY}"
+      set +e
+      rbv_discover "$ONLY" true >"$disc_file"
+      drc=$?
+      set -e
+      if (( drc != 0 )); then
+        rm -f "$disc_file"
+        msg ERR "discover failed rc=${drc} — см. ${RBV_LOG}"
+        exit "$drc"
+      fi
       while IFS='|' read -r kind inst key parent; do
         [[ -n "${key:-}" ]] || continue
-        rbv_enqueue_instance "$ONLY" "$kind" "$inst" "$key" "$parent" "manual"
-      done < <(rbv_discover "$ONLY" true)
+        rbv_enqueue_instance "$ONLY" "$kind" "$inst" "$key" "$parent" "$reason"
+        enq=$((enq + 1))
+      done <"$disc_file"
     else
-      rbv_enqueue_all_untested "$([[ $DUE == true ]] && echo schedule || echo manual)"
+      msg INFO "шаг 1/3: discover untested latest → все хранилища"
+      mapfile -t ids < <(jq -r '.storages[].id' "$RBV_CONFIG")
+      if [[ ${#ids[@]} -eq 0 ]]; then
+        msg WARN "В конфиге нет storages — нечего запускать"
+        rm -f "$disc_file"
+        exit 0
+      fi
+      for sid in "${ids[@]}"; do
+        msg INFO "— storage ${sid}"
+        : >"$disc_file"
+        set +e
+        rbv_discover "$sid" true >"$disc_file"
+        drc=$?
+        set -e
+        if (( drc != 0 )); then
+          msg ERR "discover ${sid} failed rc=${drc}"
+          rm -f "$disc_file"
+          exit "$drc"
+        fi
+        while IFS='|' read -r kind inst key parent; do
+          [[ -n "${key:-}" ]] || continue
+          rbv_enqueue_instance "$sid" "$kind" "$inst" "$key" "$parent" "$reason"
+          enq=$((enq + 1))
+        done <"$disc_file"
+      done
     fi
+    rm -f "$disc_file"
+
+    msg INFO "шаг 1/3 итог: в очередь поставлено ${enq}"
+    if (( enq == 0 )); then
+      msg WARN "Нечего выполнять (0 untested latest)."
+      msg INFO "Проверьте: rw-backup-verify discover ${ONLY:-<id>} --all"
+      msg INFO "и реестр tested: ${WD}/tested/"
+      msg INFO "лог: ${RBV_LOG}"
+      exit 0
+    fi
+
+    msg INFO "шаг 2/3: worker (последовательный drain очереди)"
     "${SCRIPT_DIR}/rbv-worker.sh"
     [[ "$DUE" == true ]] && rbv_mark_global_done
+
+    msg OK "шаг 3/3: готово"
+    msg INFO "отчёты прогонов: ${WD}/runs/"
+    msg INFO "лог сессии: ${RBV_LOG}"
     ;;
 
   queue)
@@ -230,10 +310,9 @@ case "$cmd" in
     ;;
 
   tick)
+    # единый путь с run --due (логи сессии / шаги)
     if rbv_global_due; then
-      rbv_enqueue_all_untested schedule
-      "${SCRIPT_DIR}/rbv-worker.sh"
-      rbv_mark_global_done
+      exec "${SCRIPT_DIR}/rw-backup-verify" run --due
     fi
     ;;
 
