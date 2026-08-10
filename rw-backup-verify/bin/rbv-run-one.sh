@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Один прогон: storage + category + source + archive key → изоляция → TG.
-# Вызов: rbv-run-one.sh <storage-id> <category> <source> <archive-key>
+# Один прогон экземпляра.
+# Аргументы: <storage-id> <kind:panel|bot> <instance_id> <s3_key> [parent_dir]
+#
+# panel — как проверенный verify-stack dump-path: dump + remnawave_dir + isolate.
+# bot   — по custom-restore: PROFILE.env + postgres dump + redis rdb + project_dir + isolate.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "${SCRIPT_DIR}/../lib/common.sh"
 
 SID="${1:?storage}"
-CATEGORY="${2:?category}"
-SOURCE="${3:?source}"
-KEY="${4:?archive-key}"
+KIND="${2:?kind}"
+INST="${3:?instance}"
+KEY="${4:?s3-key}"
+PARENT="${5:-}"
 
 rbv_load_config
 need docker
@@ -20,7 +24,7 @@ need gzip
 J="$(rbv_storage_json "$SID")"
 rbv_aws_env "$J"
 WD="$(rbv_work_dir)"
-RUN_ID="$(date -u +%Y%m%d_%H%M%S)_${SID}_${CATEGORY}_${SOURCE}"
+RUN_ID="$(date -u +%Y%m%d_%H%M%S)_$(printf '%s' "$INST" | tr '/:' '__' | cut -c1-80)"
 RUN_DIR="${WD}/runs/${RUN_ID}"
 mkdir -p "$RUN_DIR"
 REPORT="${RUN_DIR}/report.txt"
@@ -34,6 +38,7 @@ PG_CID=""
 COMPOSE_FILE=""
 NET_NAME=""
 KEEP="${KEEP:-false}"
+PROJ_DIR=""
 
 cleanup() {
   if [[ "$KEEP" != "true" ]]; then
@@ -47,12 +52,12 @@ cleanup() {
 trap cleanup EXIT
 
 rep "=== rw-backup-verify ==="
-rep "storage=${SID} category=${CATEGORY} source=${SOURCE}"
-rep "archive=${KEY}"
+rep "storage=${SID} kind=${KIND} instance=${INST}"
+rep "key=${KEY} parent=${PARENT}"
 rep "started=$(date -Is)"
 
 ARCH_PATH="${RUN_DIR}/archive.tar.gz"
-S3_URI="s3://${RBV_BUCKET}/${RBV_PREFIX}/${CATEGORY}/${SOURCE}/${KEY}"
+S3_URI="s3://${RBV_BUCKET}/${KEY}"
 rep "download ${S3_URI}"
 if ! rbv_aws s3 cp "$S3_URI" "$ARCH_PATH" --only-show-errors; then
   ok=false
@@ -60,7 +65,8 @@ if ! rbv_aws s3 cp "$S3_URI" "$ARCH_PATH" --only-show-errors; then
   rep "FAIL download"
 fi
 
-if [[ "$ok" == true && "$KEY" == *.age ]]; then
+base_name="$(basename "$KEY")"
+if [[ "$ok" == true && "$base_name" == *.age ]]; then
   need age
   AGE_ID="$(rbv_cfg '.age_identity // empty')"
   [[ -n "$AGE_ID" ]] || { ok=false; fail_reasons+=("age archive but age_identity unset"); }
@@ -81,17 +87,16 @@ if [[ "$ok" == true ]]; then
 fi
 
 SQL=""
-PROJ_DIR=""
+REDIS_RDB=""
+PROFILE_ENV=""
 PG_VER="$(rbv_cfg '.pg_version // "17"')"
+POSTGRES_SERVICE="postgres"
+REDIS_SERVICE="redis"
 
 if [[ "$ok" == true ]]; then
-  SQL="$(find "$EXTRACT" -maxdepth 2 \( -name 'dump_*.sql.gz' -o -name 'postgres_dump.sql.gz' \) | head -n1 || true)"
-  [[ -n "$SQL" ]] || { ok=false; fail_reasons+=("no sql dump in archive"); rep "FAIL no dump"; }
-fi
-
-if [[ "$ok" == true ]]; then
-  if [[ "$CATEGORY" == "panel" ]]; then
-    DIR_TAR="$(find "$EXTRACT" -maxdepth 1 -name 'remnawave_dir_*.tar.gz' | head -n1 || true)"
+  if [[ "$KIND" == "panel" ]]; then
+    SQL="$(find "$EXTRACT" -type f \( -name 'dump_*.sql.gz' -o -name 'postgres_dump.sql.gz' \) | head -n1 || true)"
+    DIR_TAR="$(find "$EXTRACT" -type f -name 'remnawave_dir_*.tar.gz' | head -n1 || true)"
     if [[ -n "$DIR_TAR" ]]; then
       PROJ_DIR="${RUN_DIR}/project"
       mkdir -p "$PROJ_DIR"
@@ -102,17 +107,44 @@ if [[ "$ok" == true ]]; then
       fi
     fi
   else
-    DIR_TAR="$(find "$EXTRACT" -maxdepth 2 -name 'project_dir.tar.gz' | head -n1 || true)"
+    # bot — как custom-restore
+    SQL="$(find "$EXTRACT" -type f -name 'postgres_dump.sql.gz' | head -n1 || true)"
+    [[ -n "$SQL" ]] || SQL="$(find "$EXTRACT" -type f -name 'dump_*.sql.gz' | head -n1 || true)"
+    REDIS_RDB="$(find "$EXTRACT" -type f -name 'redis_dump.rdb' | head -n1 || true)"
+    PROFILE_ENV="$(find "$EXTRACT" -type f -name 'PROFILE.env' | head -n1 || true)"
+    DIR_TAR="$(find "$EXTRACT" -type f -name 'project_dir.tar.gz' | head -n1 || true)"
+    if [[ -n "$PROFILE_ENV" ]]; then
+      set +u
+      # shellcheck disable=SC1090
+      source "$PROFILE_ENV"
+      set -u
+      POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
+      REDIS_SERVICE="${REDIS_SERVICE:-redis}"
+      rep "profile: PROJECT_NAME=${PROJECT_NAME:-?} POSTGRES_SERVICE=${POSTGRES_SERVICE} REDIS_SERVICE=${REDIS_SERVICE}"
+    fi
     if [[ -n "$DIR_TAR" ]]; then
-      PROJ_DIR="${RUN_DIR}/project"
-      mkdir -p "$PROJ_DIR"
-      tar -xzf "$DIR_TAR" -C "$PROJ_DIR"
+      pe="${RUN_DIR}/project_extract"
+      mkdir -p "$pe"
+      tar -xzf "$DIR_TAR" -C "$pe"
+      project_top="$(tar -tzf "$DIR_TAR" | head -n1 | cut -d/ -f1)"
+      if [[ -n "$project_top" && -d "$pe/$project_top" ]]; then
+        PROJ_DIR="$pe/$project_top"
+      else
+        PROJ_DIR="$pe"
+      fi
+      # Redis RDB до запуска (как в restore_custom_archive)
+      if [[ -n "$REDIS_RDB" && -f "$REDIS_RDB" ]]; then
+        mkdir -p "${PROJ_DIR}/volumes/redis"
+        cp -f "$REDIS_RDB" "${PROJ_DIR}/volumes/redis/dump.rdb"
+        chmod 644 "${PROJ_DIR}/volumes/redis/dump.rdb" || true
+        rep "redis_dump → volumes/redis/dump.rdb"
+      fi
     fi
   fi
+  [[ -n "$SQL" ]] || { ok=false; fail_reasons+=("no sql dump in archive"); rep "FAIL no dump"; }
   rep "dump=$(basename "${SQL:-}") project_dir=${PROJ_DIR:-none}"
 fi
 
-DB_ROWS=0
 DB_TABLES=0
 if [[ "$ok" == true ]]; then
   PG_CID="rbv_pg_${RUN_ID}"
@@ -147,17 +179,19 @@ SETTLE="$(rbv_cfg '.settle_seconds // 25')"
 if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]]; then
   CF=""
   for c in "${PROJ_DIR}/docker-compose.yml" "${PROJ_DIR}/docker-compose.yaml" \
-           "${PROJ_DIR}/compose.yml"; do
+           "${PROJ_DIR}/compose.yml" "${PROJ_DIR}/compose.yaml"; do
     [[ -f "$c" ]] && { CF="$c"; break; }
   done
   if [[ -n "$CF" ]]; then
-    rep "compose found: $CF — поднимаю в изоляции"
+    rep "compose found: $CF — изоляция"
     NET_NAME="rbv_net_${RUN_ID}"
     docker network create --internal "$NET_NAME" >/dev/null
     COMPOSE_FILE="${RUN_DIR}/compose.isolated.yml"
 
     if docker compose -f "$CF" config --format json >"${RUN_DIR}/compose.raw.json" 2>"${RUN_DIR}/compose.cfg.err"; then
-      jq --arg net "$NET_NAME" '
+      # Убираем postgres-сервисы (БД = наш контейнер с алиасами).
+      # Redis и apps оставляем — для бота redis уже с dump.rdb.
+      jq --arg net "$NET_NAME" --arg pgsvc "${POSTGRES_SERVICE}" '
         .networks = {"rbv": {"name": $net, "external": true}}
         | .services = (.services | to_entries | map(
             .value |= (
@@ -175,7 +209,8 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]]; then
           ) | from_entries)
         | .services |= with_entries(
             select(
-              ((.value.image // "") | test("postgres"; "i") | not)
+              (.key != $pgsvc)
+              and ((.value.image // "") | test("postgres"; "i") | not)
             )
           )
         | if .volumes then
@@ -186,6 +221,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]]; then
       docker network disconnect "$NET_NAME" "$PG_CID" 2>/dev/null || true
       docker network connect \
         --alias db --alias postgres --alias remnawave-db --alias postgresql \
+        --alias "${POSTGRES_SERVICE}" \
         "$NET_NAME" "$PG_CID" 2>/dev/null \
         || docker network connect "$NET_NAME" "$PG_CID" || true
 
@@ -250,8 +286,9 @@ else
   result_line="Результат: FAIL — ${reasons_txt}"
 fi
 body="$(printf '%s\n' \
-  "${icon} <b>verify</b> ${SID}/${CATEGORY}/${SOURCE}" \
-  "Архив: <code>${KEY}</code>" \
+  "${icon} <b>verify</b> ${SID}" \
+  "Экземпляр: <code>${INST}</code>" \
+  "Вид: ${KIND} · архив: <code>$(basename "$KEY")</code>" \
   "БД: tables=${DB_TABLES} · dump=${dump_base}" \
   "Стек: ${STACK_OK}${STACK_DETAIL:+ (${STACK_DETAIL})}" \
   "${result_line}" \
@@ -267,10 +304,10 @@ if [[ ${#fail_reasons[@]} -gt 0 ]]; then
   reasons_json="$(printf '%s\n' "${fail_reasons[@]}" | jq -R . | jq -s .)"
 fi
 jq -n \
-  --arg sid "$SID" --arg cat "$CATEGORY" --arg src "$SOURCE" --arg key "$KEY" \
+  --arg sid "$SID" --arg kind "$KIND" --arg inst "$INST" --arg key "$KEY" \
   --argjson ok "$ok" --arg stack "$STACK_OK" --arg detail "$STACK_DETAIL" \
   --argjson tables "${DB_TABLES:-0}" --argjson reasons "$reasons_json" \
-  '{storage:$sid,category:$cat,source:$src,archive:$key,ok:$ok,db_tables:$tables,stack:$stack,stack_detail:$detail,reasons:$reasons}' \
+  '{storage:$sid,kind:$kind,instance:$inst,archive:$key,ok:$ok,db_tables:$tables,stack:$stack,stack_detail:$detail,reasons:$reasons}' \
   > "${RUN_DIR}/summary.json"
 
 [[ "$ok" == true ]]

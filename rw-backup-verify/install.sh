@@ -47,7 +47,8 @@ systemctl enable --now rw-backup-verify.timer
 
 echo
 echo "[OK] Готово."
-echo "  1) rw-backup-verify storage add --id ... --bucket ... --access-key ... --secret-key ... --times 06:30,18:30"
-echo "  2) rw-backup-verify telegram set --token ... --chat-id ..."
-echo "  3) rw-backup-verify run --storage <id>     # пробный прогон"
+echo "  1) rw-backup-verify storage add --id ... --bucket ... --access-key ... --secret-key ..."
+echo "  2) rw-backup-verify schedule set --interval-hours 12   # или --times 06:30,18:30"
+echo "  3) rw-backup-verify telegram set --token ... --chat-id ..."
+echo "  4) rw-backup-verify discover <id> && rw-backup-verify run --storage <id>"
 echo "  Timer: systemctl status rw-backup-verify.timer"

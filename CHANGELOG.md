@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.6.14 (2026-08-10)
+
+### Изменено (`rw-backup-verify`)
+- **Глубокий discover**: рекурсивный обход S3 — архивы panel/bot в корне и любой вложенности; в каждой папке несколько экземпляров (разные боты/серверы).
+- **Latest per instance** + реестр `tested/` — повторно не гоняем уже проверенный ключ.
+- **Глобальное расписание** (`schedule set --interval-hours` / `--times`) на все хранилища сразу.
+- **Bot restore** по образцу `custom-restore`: `PROFILE.env`, `redis_dump.rdb` → `volumes/redis`, изоляция compose.
+
 ## v5.6.13 (2026-07-29)
 
 ### Добавлено

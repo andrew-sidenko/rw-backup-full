@@ -10,22 +10,19 @@ usage() {
   cat <<'EOF'
 rw-backup-verify — автономная проверка логических бэкапов в S3
 
-  storage list
-  storage show <id>
-  storage add --id NAME --bucket B --access-key K --secret-key S
-              [--endpoint URL] [--prefix P] [--region R]
-              [--times HH:MM,HH:MM | --interval-hours N]
-              [--backup-hint TEXT] [--categories panel,custom-bot]
-  storage remove <id>
+  storage list|show|add|remove
+  telegram set|show
+  schedule show|set --times HH:MM,HH:MM | --interval-hours N
 
-  telegram set --token T --chat-id C [--thread-id N]
-  telegram show
+  discover <storage-id> [--all]     # deep; по умолчанию только untested
+  run [--due]                       # все хранилища: discover untested → очередь → work
+  run --storage ID                  # только одно хранилище
+  queue status|clear|work
+  tick                              # systemd: если глобально due → run
 
-  discover <storage-id>
-  run [--storage ID] [--due]     # без --due: сразу в очередь выбранные/все
-  run-one <storage> <category> <source> <archive-key>
-  queue status|clear|work        # work — обработать очередь сейчас
-  tick                           # для systemd timer: due → enqueue → work
+Глубокий обход: любые вложенные папки; в каждой — экземпляры panel/bot
+(по семейству имён). Тестируется только latest каждого экземпляра,
+если этот архив ещё не был в tested/.
 EOF
 }
 
@@ -37,13 +34,11 @@ case "$cmd" in
   -h|--help|help) usage; exit 0 ;;
 esac
 
-# ensure config exists for most commands
 if [[ ! -f "$RBV_CONFIG" ]]; then
   if [[ "$cmd" == "init" ]]; then
     mkdir -p "$(dirname "$RBV_CONFIG")"
     cp "${ROOT}/config/config.example.json" "$RBV_CONFIG"
     chmod 600 "$RBV_CONFIG"
-    mkdir -p "$(rbv_cfg '.work_dir // "/var/lib/rw-backup-verify"' 2>/dev/null || echo /var/lib/rw-backup-verify)"
     msg OK "Создан $RBV_CONFIG"
     exit 0
   fi
@@ -54,15 +49,13 @@ fi
 rbv_load_config
 
 case "$cmd" in
-  init)
-    msg INFO "Конфиг уже есть: $RBV_CONFIG"
-    ;;
+  init) msg INFO "Конфиг уже есть: $RBV_CONFIG" ;;
 
   storage)
     sub="${1:-list}"; shift || true
     case "$sub" in
       list)
-        jq -r '.storages[] | "\(.id)\tprefix=\(.prefix)\tbucket=\(.bucket)\tverify=\(.verify|tostring)\thint=\(.backup_hint // "")"' \
+        jq -r '.storages[] | "\(.id)\tbucket=\(.bucket)\tprefix=\(.prefix // "")\thint=\(.backup_hint // "")"' \
           "$RBV_CONFIG"
         ;;
       show)
@@ -76,8 +69,7 @@ case "$cmd" in
         ;;
       add)
         ID=""; EP=""; BUCKET=""; AK=""; SK=""; REGION="us-east-1"
-        PREFIX="rw-backup-full"; TIMES=""; INTERVAL=""; HINT=""
-        CATS='["panel","custom-bot"]'
+        PREFIX=""; HINT=""
         while [[ $# -gt 0 ]]; do
           case "$1" in
             --id) ID="$2"; shift 2 ;;
@@ -87,36 +79,56 @@ case "$cmd" in
             --secret-key) SK="$2"; shift 2 ;;
             --region) REGION="$2"; shift 2 ;;
             --prefix) PREFIX="$2"; shift 2 ;;
-            --times) TIMES="$2"; shift 2 ;;
-            --interval-hours) INTERVAL="$2"; shift 2 ;;
             --backup-hint) HINT="$2"; shift 2 ;;
-            --categories) CATS="$(jq -nc --arg s "$2" '$s|split(",")')"; shift 2 ;;
+            --times|--interval-hours|--categories)
+              msg WARN "$1 устарел: расписание теперь глобальное (schedule set); категории — авто deep-scan"
+              shift 2 ;;
             *) msg ERR "unknown $1"; exit 1 ;;
           esac
         done
         [[ -n "$ID" && -n "$BUCKET" && -n "$AK" && -n "$SK" ]] \
           || { msg ERR "--id --bucket --access-key --secret-key обязательны"; exit 1; }
-        verify='{}'
-        if [[ -n "$INTERVAL" ]]; then
-          verify="$(jq -nc --argjson h "$INTERVAL" '{interval_hours:$h}')"
-        elif [[ -n "$TIMES" ]]; then
-          verify="$(jq -nc --arg s "$TIMES" '{times:($s|split(","))}')"
-        else
-          verify='{"times":["06:30"]}'
-        fi
         entry="$(jq -nc \
           --arg id "$ID" --arg ep "$EP" --arg b "$BUCKET" \
           --arg ak "$AK" --arg sk "$SK" --arg r "$REGION" --arg p "$PREFIX" \
-          --arg hint "$HINT" --argjson cats "$CATS" --argjson ver "$verify" \
+          --arg hint "$HINT" \
           '{id:$id, endpoint:$ep, bucket:$b, access_key:$ak, secret_key:$sk,
-            region:$r, prefix:$p, backup_hint:$hint, categories:$cats,
-            verify:$ver, telegram:{}}')"
+            region:$r, prefix:$p, backup_hint:$hint, telegram:{}}')"
         jq --argjson e "$entry" '
           .storages = ([.storages[] | select(.id != $e.id)] + [$e])
         ' "$RBV_CONFIG" | rbv_save_config
         msg OK "Хранилище ${ID} сохранено"
         ;;
       *) msg ERR "storage: list|show|add|remove"; exit 1 ;;
+    esac
+    ;;
+
+  schedule)
+    sub="${1:-show}"; shift || true
+    case "$sub" in
+      show)
+        jq '.verify // {interval_hours:12}' "$RBV_CONFIG"
+        ;;
+      set)
+        TIMES=""; INTERVAL=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --times) TIMES="$2"; shift 2 ;;
+            --interval-hours) INTERVAL="$2"; shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        if [[ -n "$INTERVAL" ]]; then
+          jq --argjson h "$INTERVAL" '.verify={interval_hours:$h}' "$RBV_CONFIG" | rbv_save_config
+        elif [[ -n "$TIMES" ]]; then
+          jq --arg s "$TIMES" '.verify={times:($s|split(","))}' "$RBV_CONFIG" | rbv_save_config
+        else
+          msg ERR "нужен --times или --interval-hours"; exit 1
+        fi
+        msg OK "Глобальное расписание сохранено"
+        jq '.verify' "$RBV_CONFIG"
+        ;;
+      *) msg ERR "schedule: show|set"; exit 1 ;;
     esac
     ;;
 
@@ -145,10 +157,13 @@ case "$cmd" in
     ;;
 
   discover)
-    sid="${1:?storage-id}"
-    rbv_discover "$sid" | while IFS='|' read -r c s k; do
-      printf '%-12s %-20s %s\n' "$c" "$s" "$k"
-    done
+    sid="${1:?storage-id}"; shift || true
+    mode=true
+    [[ "${1:-}" == "--all" ]] && mode=false
+    printf '%-6s %-50s %s\n' "KIND" "INSTANCE" "KEY"
+    while IFS='|' read -r kind inst key parent; do
+      printf '%-6s %-50s %s\n' "$kind" "$inst" "$key"
+    done < <(rbv_discover "$sid" "$mode")
     ;;
 
   run)
@@ -160,22 +175,18 @@ case "$cmd" in
         *) msg ERR "unknown $1"; exit 1 ;;
       esac
     done
-    if [[ -n "$ONLY" ]]; then
-      ids=("$ONLY")
-    else
-      mapfile -t ids < <(jq -r '.storages[].id' "$RBV_CONFIG")
+    if [[ "$DUE" == true ]]; then
+      rbv_global_due || { msg INFO "Ещё не время (глобальное расписание)"; exit 0; }
     fi
-    for sid in "${ids[@]}"; do
-      if [[ "$DUE" == true ]]; then
-        rbv_storage_due "$sid" || continue
-      fi
-      rbv_enqueue_storage "$sid" "$([[ $DUE == true ]] && echo schedule || echo manual)"
-    done
+    if [[ -n "$ONLY" ]]; then
+      while IFS='|' read -r kind inst key parent; do
+        rbv_enqueue_instance "$ONLY" "$kind" "$inst" "$key" "$parent" "manual"
+      done < <(rbv_discover "$ONLY" true)
+    else
+      rbv_enqueue_all_untested "$([[ $DUE == true ]] && echo schedule || echo manual)"
+    fi
     "${SCRIPT_DIR}/rbv-worker.sh"
-    ;;
-
-  run-one)
-    exec "${SCRIPT_DIR}/rbv-run-one.sh" "$@"
+    [[ "$DUE" == true ]] && rbv_mark_global_done
     ;;
 
   queue)
@@ -196,15 +207,11 @@ case "$cmd" in
     ;;
 
   tick)
-    # Для systemd timer (каждую минуту): кто due → в очередь → worker.
-    # Совпавшие тайминги разных storage попадают в очередь и идут строго по одному.
-    mapfile -t ids < <(jq -r '.storages[].id' "$RBV_CONFIG")
-    for sid in "${ids[@]}"; do
-      if rbv_storage_due "$sid"; then
-        rbv_enqueue_storage "$sid" "schedule"
-      fi
-    done
-    "${SCRIPT_DIR}/rbv-worker.sh"
+    if rbv_global_due; then
+      rbv_enqueue_all_untested schedule
+      "${SCRIPT_DIR}/rbv-worker.sh"
+      rbv_mark_global_done
+    fi
     ;;
 
   *)

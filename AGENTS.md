@@ -72,7 +72,8 @@ bash -n scripts/rw-backup-full.sh                    # syntax check
 ### Standalone verify (`rw-backup-verify/`)
 
 Separate product under `rw-backup-verify/` — install on its own server (`sudo ./install.sh`).
-No fleet web/SSH. Config: `/etc/rw-backup-verify/config.json`. Smoke without Docker/S3:
+Deep S3 scan (any nesting), latest per instance, global schedule, `tested/` skip registry.
+Bot path follows `custom-restore` (PROFILE + redis RDB). Smoke:
 `bash rw-backup-verify/test/unit_config_queue.sh`. Docs: `rw-backup-verify/README-RU.md`.
 
 ### Sandbox / verify-stack notes
