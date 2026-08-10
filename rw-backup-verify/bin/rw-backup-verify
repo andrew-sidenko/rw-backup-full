@@ -211,7 +211,8 @@ case "$cmd" in
     # Файловый лог сессии (дублирует msg); дети наследуют RBV_LOG.
     WD="$(rbv_work_dir)"
     mkdir -p "${WD}/logs"
-    export RBV_LOG="${WD}/logs/run_$(date -u +%Y%m%d_%H%M%S).log"
+    RBV_LOG="${WD}/logs/run_$(date -u +%Y%m%d_%H%M%S).log"
+    export RBV_LOG
     : >"$RBV_LOG"
     reason="manual"
     [[ "$DUE" == true ]] && reason="schedule"
