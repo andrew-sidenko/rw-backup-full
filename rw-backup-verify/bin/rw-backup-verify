@@ -29,6 +29,7 @@ rw-backup-verify — автономная проверка логических 
   run [--due]                       # все хранилища: discover untested → очередь → work
   run --storage ID                  # только одно хранилище (с пошаговым логом)
   queue status|clear|work
+  tested list <id> | clear <id> [--key KEY]
   tick                              # systemd: если глобально due → run --due
 
 Логи ручного run: work_dir/logs/run_*.log и work_dir/runs/<id>/
@@ -307,6 +308,47 @@ case "$cmd" in
         exec "${SCRIPT_DIR}/rbv-worker.sh"
         ;;
       *) msg ERR "queue: status|clear|work"; exit 1 ;;
+    esac
+    ;;
+
+  tested)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      list)
+        sid="${1:?storage-id}"
+        f="$(rbv_tested_file "$sid")"
+        if [[ ! -f "$f" ]]; then
+          echo "(пусто — нет $f)"
+        else
+          jq -r 'to_entries[] | "\(.key)\tok=\(.value.ok)\tat=\(.value.tested_at)\trun=\(.value.run_id // "")"' "$f"
+        fi
+        ;;
+      clear)
+        sid="${1:?storage-id}"; shift || true
+        key=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --key) key="$2"; shift 2 ;;
+            --all) key=""; shift ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        f="$(rbv_tested_file "$sid")"
+        if [[ ! -f "$f" ]]; then
+          msg INFO "Нечего чистить: $f"
+          exit 0
+        fi
+        if [[ -n "$key" ]]; then
+          tmp="$(mktemp)"
+          jq --arg k "$key" 'del(.[$k])' "$f" >"$tmp"
+          mv -f "$tmp" "$f"
+          msg OK "Удалён ключ из tested: $key"
+        else
+          rm -f "$f"
+          msg OK "Очищен tested: $f"
+        fi
+        ;;
+      *) msg ERR "tested: list|clear"; exit 1 ;;
     esac
     ;;
 

@@ -127,7 +127,10 @@ rbv_classify_name() {
     return 0
   fi
   if [[ "$name" =~ ^custom_bot_(.+)_([0-9]{8}_[0-9]{6})\.tar\.gz(\.age)?$ ]]; then
-    printf 'bot|custom_bot_%s\n' "${BASH_REMATCH[1]}"
+    local fam="${BASH_REMATCH[1]}"
+    # custom_bot_foo__20260810_… → fam=foo_ → убрать хвостовые _
+    fam="$(sed -E 's/_+$//' <<<"$fam")"
+    printf 'bot|custom_bot_%s\n' "$fam"
     return 0
   fi
   # fallback: custom_bot_X_... без строгого TS
@@ -135,6 +138,7 @@ rbv_classify_name() {
     local stem="${BASH_REMATCH[1]}"
     # убрать хвостовой _YYYYMMDD_HHMMSS если есть
     stem="$(sed -E 's/_[0-9]{8}_[0-9]{6}$//' <<<"$stem")"
+    stem="$(sed -E 's/_+$//' <<<"$stem")"
     printf 'bot|custom_bot_%s\n' "$stem"
     return 0
   fi

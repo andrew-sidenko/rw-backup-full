@@ -347,8 +347,15 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
       if [[ $up_rc -ne 0 ]]; then
         STACK_OK="fail"
         STACK_DETAIL="compose up rc=${up_rc}"
-        rbv_check_add stack fail "$STACK_DETAIL: $(tail -n2 "${RUN_DIR}/compose.up.err" | tr '\n' ' ')"
-        fail_add "stack up failed"
+        err_snip="$(tail -n 8 "${RUN_DIR}/compose.up.err" 2>/dev/null | tr '\n' ' ' | head -c 500)"
+        rbv_check_add stack fail "$STACK_DETAIL: ${err_snip}"
+        fail_add "stack up failed: ${err_snip}"
+        rep "stack up FAILED — полный лог: ${RUN_DIR}/compose.up.err"
+        if [[ -s "${RUN_DIR}/compose.up.err" ]]; then
+          rep "----- compose.up.err (tail) -----"
+          tail -n 20 "${RUN_DIR}/compose.up.err" | while IFS= read -r _line; do rep "  ${_line}"; done
+          rep "----- end -----"
+        fi
       else
         rep "stack: settle ${SETTLE}с…"
         _left="$SETTLE"
@@ -442,7 +449,7 @@ if [[ "$ok" != true ]] || [[ "$notify_ok" == "true" ]]; then
   fi
 fi
 
-cp -f "$CHECKS_JSON" "${RUN_DIR}/checks.json"
+# CHECKS_JSON уже = ${RUN_DIR}/checks.json — не cp сам в себя
 jq -n \
   --arg sid "$SID" --arg kind "$KIND" --arg inst "$INST" --arg key "$KEY" \
   --argjson ok "$ok" --argjson tables "${DB_TABLES:-0}" --argjson users "${USER_ROWS:-0}" \

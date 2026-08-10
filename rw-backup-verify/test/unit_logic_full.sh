@@ -74,6 +74,10 @@ else
   pass "classify no-ts panel"
 fi
 
+out="$(rbv_classify_name 'custom_bot_oneokbot-infra__20260810_140923.tar.gz')"
+[[ "$out" == "bot|custom_bot_oneokbot-infra" ]] && pass "classify bot double underscore" \
+  || fail "classify bot double underscore" "$out"
+
 echo "==== storage CLI ===="
 "$ROOT/bin/rw-backup-verify" storage add \
   --id s1 --bucket b --access-key a --secret-key s \
@@ -141,6 +145,11 @@ disc2="$("$ROOT/bin/rw-backup-verify" discover s1 2>/dev/null)"
 printf '%s\n' "$disc2" | grep -q 'panel/h1/remnawave' && fail "untested skip" "still listed" || pass "untested skip"
 disc_all="$("$ROOT/bin/rw-backup-verify" discover s1 --all)"
 printf '%s\n' "$disc_all" | grep -q 'panel/h1/remnawave' && pass "discover --all" || fail "discover --all" "missing"
+
+"$ROOT/bin/rw-backup-verify" tested list s1 | grep -q 'remnawave_backup_2026-08-10' && pass "tested list" || fail "tested list" "missing"
+"$ROOT/bin/rw-backup-verify" tested clear s1 --key "rw-backup-full/panel/h1/remnawave_backup_2026-08-10_03_00_00.tar.gz" >/dev/null
+rbv_is_tested s1 "rw-backup-full/panel/h1/remnawave_backup_2026-08-10_03_00_00.tar.gz" \
+  && fail "tested clear --key" "still tested" || pass "tested clear --key"
 
 echo "==== global due ===="
 "$ROOT/bin/rw-backup-verify" schedule set --interval-hours 6 >/dev/null

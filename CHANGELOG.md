@@ -1,5 +1,16 @@
 # Changelog
 
+## v5.6.19 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`cp: checks.json and checks.json are the same file`**: убран бессмысленный `cp` файла сам в себя.
+- **`stack up failed` без деталей**: в отчёт печатается tail `compose.up.err`.
+- **Bot family с `__` в имени** (`…infra__20260810…`) — хвостовой `_` в instance id больше не остаётся.
+- (из 5.6.18) bot **`rc=141` SIGPIPE** от `tar|head`; heartbeat после docker pull.
+
+### Добавлено (`rw-backup-verify`)
+- **`tested list|clear`**: посмотреть/сбросить реестр, чтобы перезапустить failed прогоны.
+
 ## v5.6.18 (2026-08-10)
 
 ### Добавлено (`rw-backup-verify`)
