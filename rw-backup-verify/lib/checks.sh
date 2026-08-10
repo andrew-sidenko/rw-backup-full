@@ -96,10 +96,46 @@ rbv_baseline_save() {
   printf '%s\n' "$json" > "$f"
 }
 
-# --- DB helpers (PG_CID must be set) ----------------------------------------
+# --- DB helpers (PG_CID must be set; RBV_PG_DB — целевая БД после restore) -
 
 rbv_psql() {
-  docker exec "$PG_CID" psql -U postgres -Atc "$1" 2>/dev/null || true
+  docker exec "$PG_CID" psql -U postgres -d "${RBV_PG_DB:-postgres}" -Atc "$1" 2>/dev/null || true
+}
+
+# Выбрать БД с пользовательскими таблицами (дампы ботов часто не в postgres).
+# $1 — подсказка (POSTGRES_DB из PROFILE.env). stdout: число таблиц; RBV_PG_DB выставляется.
+rbv_select_app_db() {
+  local hint="${1:-}" db tables
+  RBV_PG_DB="postgres"
+  _rbv_db_tables() {
+    docker exec "$PG_CID" psql -U postgres -d "$1" -Atc \
+      "SELECT count(*) FROM pg_stat_user_tables" 2>/dev/null | tr -d '[:space:]' || echo 0
+  }
+  if [[ -n "$hint" ]]; then
+    tables="$(_rbv_db_tables "$hint")"
+    if [[ "$tables" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
+      RBV_PG_DB="$hint"
+      printf '%s\n' "$tables"
+      return 0
+    fi
+  fi
+  tables="$(_rbv_db_tables postgres)"
+  if [[ "$tables" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
+    RBV_PG_DB="postgres"
+    printf '%s\n' "$tables"
+    return 0
+  fi
+  while IFS= read -r db; do
+    [[ -n "$db" ]] || continue
+    tables="$(_rbv_db_tables "$db")"
+    if [[ "$tables" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
+      RBV_PG_DB="$db"
+      printf '%s\n' "$tables"
+      return 0
+    fi
+  done < <(docker exec "$PG_CID" psql -U postgres -d postgres -Atc \
+    "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1" 2>/dev/null || true)
+  printf '0\n'
 }
 
 rbv_find_users_table() {
@@ -303,6 +339,11 @@ rbv_status_icon() {
   esac
 }
 
+rbv_html_esc() {
+  # bash ${var//pat/&amp;} подставляет match в & — поэтому sed
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
 rbv_format_tg_report() {
   # args via env-like: uses RBV_CHECKS_FILE and prints body to stdout
   local sid="$1" kind="$2" inst="$3" key="$4" overall="$5"
@@ -310,18 +351,19 @@ rbv_format_tg_report() {
   [[ "$overall" == "true" ]] || icon="🔴"
   local path="s3://${RBV_BUCKET}/${key}"
   printf '%s <b>VERIFY %s</b>\n' "$icon" "$(echo "$kind" | tr 'a-z' 'A-Z')"
-  printf '🗄 Хранилище: <b>%s</b>\n' "$sid"
-  printf '🆔 Экземпляр: <code>%s</code>\n' "$inst"
-  printf '📁 Путь: <code>%s</code>\n' "$path"
-  printf '📦 Архив: <code>%s</code>\n' "$(basename "$key")"
+  printf '🗄 Хранилище: <b>%s</b>\n' "$(rbv_html_esc "$sid")"
+  printf '🆔 Экземпляр: <code>%s</code>\n' "$(rbv_html_esc "$inst")"
+  printf '📁 Путь: <code>%s</code>\n' "$(rbv_html_esc "$path")"
+  printf '📦 Архив: <code>%s</code>\n' "$(rbv_html_esc "$(basename "$key")")"
   printf '\n<b>Проверки</b>\n'
   jq -r '.[] | "\(.status)|\(.name)|\(.detail)|\(.prev)|\(.curr)"' "$RBV_CHECKS_FILE" 2>/dev/null \
     | while IFS='|' read -r st name detail prev curr; do
         local ic
         ic="$(rbv_status_icon "$st")"
-        printf '%s <b>%s</b> — %s\n' "$ic" "$name" "$detail"
+        printf '%s <b>%s</b> — %s\n' "$ic" "$(rbv_html_esc "$name")" "$(rbv_html_esc "$detail")"
         if [[ -n "$prev" || -n "$curr" ]]; then
-          printf '   └ prev=<code>%s</code> → curr=<code>%s</code>\n' "${prev:-—}" "${curr:-—}"
+          printf '   └ prev=<code>%s</code> → curr=<code>%s</code>\n' \
+            "$(rbv_html_esc "${prev:-—}")" "$(rbv_html_esc "${curr:-—}")"
         fi
       done
   # diffs section
@@ -330,7 +372,10 @@ rbv_format_tg_report() {
   if [[ "${diffs:-0}" -gt 0 ]]; then
     printf '\n<b>⚠ Расхождения</b>\n'
     jq -r '.[] | select(.status=="fail") | "• \(.name): \(.prev) → \(.curr) (\(.detail))"' \
-      "$RBV_CHECKS_FILE" 2>/dev/null || true
+      "$RBV_CHECKS_FILE" 2>/dev/null \
+      | while IFS= read -r line; do
+          printf '%s\n' "$(rbv_html_esc "$line")"
+        done
   fi
 }
 

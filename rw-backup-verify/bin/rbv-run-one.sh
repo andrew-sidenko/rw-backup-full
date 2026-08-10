@@ -116,6 +116,8 @@ PROFILE_ENV=""
 PG_VER="$(rbv_cfg '.pg_version // "17"')"
 POSTGRES_SERVICE="postgres"
 REDIS_SERVICE="redis"
+RBV_PG_DB_HINT=""
+RBV_PG_DB="postgres"
 
 if [[ "$ok" == true ]]; then
   if [[ "$KIND" == "panel" ]]; then
@@ -143,6 +145,8 @@ if [[ "$ok" == true ]]; then
       set -u
       POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
       REDIS_SERVICE="${REDIS_SERVICE:-redis}"
+      RBV_PG_DB_HINT="${POSTGRES_DB:-${DB_NAME:-${POSTGRES_DATABASE:-}}}"
+      [[ -n "$RBV_PG_DB_HINT" ]] && rep "PROFILE: POSTGRES_DB hint=${RBV_PG_DB_HINT}"
     fi
     if [[ -n "$DIR_TAR" ]]; then
       pe="${RUN_DIR}/project_extract"
@@ -212,15 +216,28 @@ if [[ "$ok" == true ]]; then
     kill "$_hb" 2>/dev/null || true
     wait "$_hb" 2>/dev/null || true
     rep "psql restore: rc=${_psql_rc}"
-    DB_TABLES="$(rbv_psql "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")"
+    sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || echo 0)"
+    sql_errs="$(echo "$sql_errs" | tr -d '[:space:]')"
+    [[ "$sql_errs" =~ ^[0-9]+$ ]] || sql_errs=0
+    (( sql_errs > 0 )) && rep "psql restore: ERROR-строк=${sql_errs} (см. ${RUN_DIR}/psql.err)"
+
+    # Дампы ботов часто создают отдельную БД — ищем таблицы везде
+    DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
     DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
     [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
+    rep "db_schema: db=${RBV_PG_DB} user_tables=${DB_TABLES}"
     if (( DB_TABLES < 1 )); then
-      fail_add "empty schema"
-      rbv_check_add db_schema fail "public tables=0"
+      dbs="$(docker exec "$PG_CID" psql -U postgres -d postgres -Atc \
+        "SELECT string_agg(datname, ',') FROM pg_database WHERE NOT datistemplate" 2>/dev/null || echo "?")"
+      fail_add "empty schema (dbs=${dbs} sql_errors=${sql_errs})"
+      rbv_check_add db_schema fail "user tables=0 (dbs=${dbs}, sql_errors=${sql_errs})"
+      if [[ -s "${RUN_DIR}/psql.err" ]]; then
+        rep "----- psql.err (tail) -----"
+        tail -n 15 "${RUN_DIR}/psql.err" | while IFS= read -r _line; do rep "  ${_line}"; done
+        rep "----- end -----"
+      fi
     else
-      rbv_check_add db_schema ok "tables=${DB_TABLES}"
-      rep "db_schema: tables=${DB_TABLES}"
+      rbv_check_add db_schema ok "db=${RBV_PG_DB} tables=${DB_TABLES}"
     fi
 
     # user_rows: не пусто + ≥ предыдущей проверки (один toggle)
@@ -440,6 +457,11 @@ TG_LINE="$(rbv_tg_for_storage "$SID")"
 IFS='|' read -r TOK CHAT THREAD <<<"$TG_LINE"
 body="$(rbv_format_tg_report "$SID" "$KIND" "$INST" "$KEY" "$ok")"
 body+=$'\n'"⏱ ${ended}"
+if [[ -n "$TOK" && -n "$CHAT" ]]; then
+  rep "telegram: отправка в chat=${CHAT} thread=${THREAD:-—}"
+else
+  rep "telegram: ПРОПУСК — нет token/chat_id (rw-backup-verify telegram show)"
+fi
 
 notify_ok="$(rbv_cfg '.notify_on_success // true')"
 if [[ "$ok" != true ]] || [[ "$notify_ok" == "true" ]]; then

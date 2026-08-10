@@ -298,6 +298,14 @@ rbv_check_add user_rows fail "меньше" "20" "15"
 body="$(rbv_format_tg_report s1 bot "bot:p:a" "pref/x.tar.gz" false)"
 printf '%s\n' "$body" | grep -q 'Хранилище' && pass "tg storage" || fail "tg storage" "missing"
 printf '%s\n' "$body" | grep -q 'Расхождения' && pass "tg diffs" || fail "tg diffs" "missing"
+esc="$(rbv_html_esc 'a<b>&c')"
+[[ "$esc" == "a&lt;b&gt;&amp;c" ]] && pass "html esc" || fail "html esc" "$esc"
+
+# telegram empty creds → WARN, not silent success without message
+set +e
+tout="$(rbv_tg_send "" "" "hi" 2>&1)"
+set -e
+printf '%s\n' "$tout" | grep -qi 'пусты\|пропуск\|token' && pass "tg empty warn" || fail "tg empty warn" "$tout"
 
 echo "==== help / unknown / save config ===="
 expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help

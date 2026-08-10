@@ -1,5 +1,11 @@
 # Changelog
 
+## v5.6.20 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`FAIL empty schema` после успешного restore бота (217M)**: дамп часто создаёт отдельную БД — теперь сканируем все non-template БД (как sandbox verify-backup) + hint `POSTGRES_DB` из PROFILE.env.
+- **Telegram молчит**: раньше пустые creds и `ok:false` от API глотались; теперь WARN с description, HTML-escape полей отчёта.
+
 ## v5.6.19 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)

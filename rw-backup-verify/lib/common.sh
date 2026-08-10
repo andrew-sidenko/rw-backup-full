@@ -51,14 +51,24 @@ rbv_work_dir() {
 
 rbv_tg_send() {
   local token="$1" chat="$2" text="$3" thread="${4:-}"
-  [[ -n "$token" && -n "$chat" ]] || return 0
+  if [[ -z "$token" || -z "$chat" ]]; then
+    msg WARN "Telegram: token/chat_id пусты — сообщение не отправлено (rw-backup-verify telegram set …)"
+    return 0
+  fi
   need curl
+  need jq
   local -a form=(-F "chat_id=${chat}" -F "text=${text}" -F "parse_mode=HTML")
   [[ -n "$thread" ]] && form+=(-F "message_thread_id=${thread}")
-  local a
+  local a resp ok
   for a in 1 2 3; do
-    curl -sS -m 25 "https://api.telegram.org/bot${token}/sendMessage" \
-      "${form[@]}" >/dev/null 2>&1 && return 0
+    set +e
+    resp="$(curl -sS -m 25 "https://api.telegram.org/bot${token}/sendMessage" "${form[@]}" 2>/dev/null)"
+    set -e
+    ok="$(jq -r '.ok // false' <<<"$resp" 2>/dev/null || echo false)"
+    if [[ "$ok" == "true" ]]; then
+      return 0
+    fi
+    msg WARN "Telegram API попытка ${a}/3: $(jq -c '{ok,error_code,description}' <<<"$resp" 2>/dev/null || printf '%s' "${resp:0:200}")"
     sleep $((a * 2))
   done
   msg WARN "Telegram: не удалось отправить"
