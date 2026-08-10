@@ -317,6 +317,74 @@ tgline="$(rbv_tg_for_storage s1)"
 proj="$(printf 'rbv_%s' '20260810_X_panel_YTA82294297_remnawave_backup' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/_/g')"
 [[ "$proj" == *yta82294297* && "$proj" != *YTA* ]] && pass "compose project lower" || fail "compose project lower" "$proj"
 
+# stack: rewrite DATABASE_URL host → remnawave-db:5432 (sandbox PG)
+rewritten="$(jq -nr --arg u 'postgresql://user:secret@107.161.160.68:46767/postgres?schema=public' '
+  def fix_pg_url:
+    if type != "string" then .
+    elif (test("(?i)^postgres(ql)?://") | not) then .
+    elif test("@") then
+      (capture("(?<pre>.*://[^/@]+@)[^/?#]+(?<post>.*)") // null) as $m
+      | if $m then "\($m.pre)remnawave-db:5432\($m.post)" else . end
+    else
+      (capture("(?<pre>.*://)[^/?#]+(?<post>.*)") // null) as $m
+      | if $m then "\($m.pre)remnawave-db:5432\($m.post)" else . end
+    end;
+  $u | fix_pg_url
+')"
+[[ "$rewritten" == "postgresql://user:secret@remnawave-db:5432/postgres?schema=public" ]] \
+  && pass "fix_pg_url rewrite" || fail "fix_pg_url rewrite" "$rewritten"
+iso="$(jq -n --arg net 'rbv_net' --arg pgsvc 'postgres' '
+  def fix_pg_url:
+    if type != "string" then .
+    elif (test("(?i)^postgres(ql)?://") | not) then .
+    elif test("@") then
+      (capture("(?<pre>.*://[^/@]+@)[^/?#]+(?<post>.*)") // null) as $m
+      | if $m then "\($m.pre)remnawave-db:5432\($m.post)" else . end
+    else . end;
+  def fix_env:
+    if type == "object" then
+      with_entries(
+        if (.key | test("(?i)^(DATABASE_URL|DIRECT_URL)$")) then .value |= fix_pg_url
+        elif (.key | test("(?i)^(POSTGRES_HOST)$")) then .value = "remnawave-db"
+        else . end
+      )
+    else . end;
+  {
+    services: {
+      remnawave: {
+        image: "x",
+        env_file: [".env"],
+        ports: ["3000:3000"],
+        environment: {
+          DATABASE_URL: "postgresql://u:p@10.0.0.1:5432/postgres",
+          DIRECT_URL: "postgresql://u:p@10.0.0.1:5432/postgres",
+          POSTGRES_HOST: "10.0.0.1"
+        }
+      },
+      postgres: { image: "postgres:17" }
+    }
+  }
+  | .networks = {"rbv": {"name": $net, "external": true}}
+  | .services = (.services | to_entries | map(
+      .value |= (
+        del(.ports, .container_name, .env_file, .network_mode, .links)
+        | .networks = {"rbv": {}}
+        | if .environment then .environment |= fix_env else . end
+      )
+      | {key: .key, value: .value}
+    ) | from_entries)
+  | .services |= with_entries(
+      select((.key != $pgsvc) and ((.value.image // "") | test("postgres"; "i") | not))
+    )
+')"
+echo "$iso" | jq -e '
+  (.services|keys) == ["remnawave"]
+  and (.services.remnawave.env_file|not)
+  and (.services.remnawave.ports|not)
+  and (.services.remnawave.environment.DATABASE_URL|test("remnawave-db:5432"))
+  and (.services.remnawave.environment.POSTGRES_HOST == "remnawave-db")
+' >/dev/null && pass "isolated compose rewrite" || fail "isolated compose rewrite" "$iso"
+
 # find_users_table always rc=0 (set -e safe)
 set +e
 out="$(rbv_find_users_table)"; rc=$?

@@ -353,18 +353,84 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
     docker network create --internal "$NET_NAME" >/dev/null
     COMPOSE_FILE="${RUN_DIR}/compose.isolated.yml"
 
-    if docker compose -f "$CF" config --format json >"$COMPOSE_RAW" 2>"${RUN_DIR}/compose.cfg.err"; then
+    # Резолв compose из каталога проекта (.env рядом) — иначе «compose config failed»
+    set +e
+    (
+      cd "$PROJ_DIR" || exit 1
+      cfg=(docker compose)
+      [[ -f .env ]] && cfg+=(--env-file .env)
+      cf_arg="$CF"
+      case "$CF" in
+        "$PROJ_DIR"/*) cf_arg="${CF#"$PROJ_DIR"/}" ;;
+      esac
+      "${cfg[@]}" -f "$cf_arg" config --format json
+    ) >"$COMPOSE_RAW" 2>"${RUN_DIR}/compose.cfg.err"
+    cfg_rc=$?
+    set -e
+
+    if [[ $cfg_rc -ne 0 || ! -s "$COMPOSE_RAW" ]]; then
+      rbv_check_add stack fail "compose config failed"
+      fail_add "compose config"
+      rep "stack: compose config failed — см. ${RUN_DIR}/compose.cfg.err"
+      if [[ -s "${RUN_DIR}/compose.cfg.err" ]]; then
+        rep "----- compose.cfg.err (tail) -----"
+        tail -n 30 "${RUN_DIR}/compose.cfg.err" | while IFS= read -r _line; do rep "  ${_line}"; done
+        rep "----- end -----"
+      fi
+    else
+      # Убираем postgres-сервис (его заменяет наш PG_CID) и переписываем
+      # DATABASE_URL/DIRECT_URL/POSTGRES_HOST → remnawave-db:5432 (sandbox).
       jq --arg net "$NET_NAME" --arg pgsvc "${POSTGRES_SERVICE}" '
+        def fix_pg_url:
+          if type != "string" then .
+          elif (test("(?i)^postgres(ql)?://") | not) then .
+          elif test("@") then
+            (capture("(?<pre>.*://[^/@]+@)[^/?#]+(?<post>.*)") // null) as $m
+            | if $m then "\($m.pre)remnawave-db:5432\($m.post)" else . end
+          else
+            (capture("(?<pre>.*://)[^/?#]+(?<post>.*)") // null) as $m
+            | if $m then "\($m.pre)remnawave-db:5432\($m.post)" else . end
+          end;
+        def fix_env:
+          if type == "object" then
+            with_entries(
+              if (.key | test("(?i)^(DATABASE_URL|DIRECT_URL|POSTGRES_URL|SQLALCHEMY_DATABASE_URL|DATABASE_URI)$"))
+              then .value |= fix_pg_url
+              elif (.key | test("(?i)^(POSTGRES_HOST|PGHOST|DB_HOST|DATABASE_HOST)$"))
+              then .value = "remnawave-db"
+              elif (.key | test("(?i)^(POSTGRES_PORT|PGPORT|DB_PORT|DATABASE_PORT)$"))
+              then .value = "5432"
+              else . end
+            )
+          elif type == "array" then
+            map(
+              if type == "string" and test("=") then
+                (index("=") as $i | .[0:$i] as $k | .[$i+1:] as $v |
+                  if ($k | test("(?i)^(DATABASE_URL|DIRECT_URL|POSTGRES_URL|SQLALCHEMY_DATABASE_URL|DATABASE_URI)$"))
+                  then "\($k)=\($v | fix_pg_url)"
+                  elif ($k | test("(?i)^(POSTGRES_HOST|PGHOST|DB_HOST|DATABASE_HOST)$"))
+                  then "\($k)=remnawave-db"
+                  elif ($k | test("(?i)^(POSTGRES_PORT|PGPORT|DB_PORT|DATABASE_PORT)$"))
+                  then "\($k)=5432"
+                  else .
+                  end)
+              else . end
+            )
+          else . end;
         .networks = {"rbv": {"name": $net, "external": true}}
         | .services = (.services | to_entries | map(
             .value |= (
-              del(.ports, .container_name)
+              # env_file/.env с продовым DATABASE_URL иначе перебьёт rewrite
+              del(.ports, .container_name, .env_file, .network_mode, .links)
               | .networks = {"rbv": {}}
               | .restart = "no"
+              | if .environment then .environment |= fix_env else . end
               | if .volumes then
                   .volumes |= map(select(
-                    (type=="object" and ((.source // "") | contains("docker.sock") | not))
-                    or (type=="string" and (contains("docker.sock") | not))
+                    (type=="object" and ((.source // "") | contains("docker.sock") | not)
+                      and ((.source // "") | test("(^|/)\\.env$") | not))
+                    or (type=="string" and (contains("docker.sock") | not)
+                      and (test("(^|:)/\\.env$|\\.env:") | not))
                   ))
                 else . end
             )
@@ -381,9 +447,24 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           else . end
       ' "$COMPOSE_RAW" > "$COMPOSE_FILE"
 
+      # Показать, куда ушли DB URL (без пароля)
+      db_urls="$(jq -r '
+        .services // {} | to_entries[] | .value.environment
+        | if type=="object" then to_entries[] | select(.key|test("(?i)DATABASE_URL|DIRECT_URL")) | "\(.key)=\(.value)"
+          elif type=="array" then .[] | select(test("(?i)^(DATABASE_URL|DIRECT_URL)="))
+          else empty end
+      ' "$COMPOSE_FILE" 2>/dev/null | sed -E 's#(://[^:/@]+:)[^@/]+@#\1***@#g' | head -n 8 || true)"
+      if [[ -n "$db_urls" ]]; then
+        rep "stack: DB env после rewrite:"
+        while IFS= read -r _line; do [[ -n "$_line" ]] && rep "  ${_line}"; done <<<"$db_urls"
+      else
+        rep "stack: WARN — DATABASE_URL/DIRECT_URL не найдены в compose (проверьте .env)"
+      fi
+
       docker network disconnect "$NET_NAME" "$PG_CID" 2>/dev/null || true
       docker network connect \
         --alias db --alias postgres --alias remnawave-db --alias postgresql \
+        --alias remnawave_db --alias database \
         --alias "${POSTGRES_SERVICE}" \
         "$NET_NAME" "$PG_CID" 2>/dev/null \
         || docker network connect "$NET_NAME" "$PG_CID" || true
@@ -414,12 +495,23 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           (( _left < _step )) && _step=$_left
           sleep "$_step"
           _left=$((_left - _step))
-          (( _left > 0 )) && rep "stack: settle, осталось ~${_left}с"
+          if (( _left > 0 )); then
+            rep "stack: settle, осталось ~${_left}с"
+          fi
         done
         running="$(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
         total="$(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -q 2>/dev/null | wc -l | tr -d ' ')"
         STACK_DETAIL="containers ${running}/${total}"
         SAMPLE_CID="$(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -q 2>/dev/null | head -n1 || true)"
+        # предпочитаем app-контейнер (не redis) для isolation sample
+        while IFS= read -r _cid; do
+          [[ -n "$_cid" ]] || continue
+          _svc="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$_cid" 2>/dev/null || true)"
+          if [[ "$_svc" != *redis* && "$_svc" != *valkey* ]]; then
+            SAMPLE_CID="$_cid"
+            break
+          fi
+        done < <(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -q 2>/dev/null || true)
         rep "stack: после settle ${STACK_DETAIL}"
         if [[ "${running:-0}" -lt 1 ]]; then
           STACK_OK="fail"
@@ -427,7 +519,6 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           fail_add "no running containers"
         else
           STACK_OK="ok"
-          # подъём + окно без падений — одна проверка stack
           stab="$(rbv_stability_sec)"
           rep "stack: stability window ${stab}с…"
           if ! rbv_check_stability "${COMPOSE_PROJECT}" "$COMPOSE_FILE" "$stab"; then
@@ -454,10 +545,6 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           rbv_check_add backend_ports skip "отключено"
         fi
       fi
-    else
-      rbv_check_add stack fail "compose config failed"
-      fail_add "compose config"
-      rep "stack: compose config failed — см. ${RUN_DIR}/compose.cfg.err"
     fi
   fi
 elif ! rbv_check_enabled "$KIND" stack; then

@@ -1,5 +1,16 @@
 # Changelog
 
+## v5.6.23 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Panel stack: Prisma к прод-IP** (`Can't reach database server at 107…`): в isolated compose
+  `DATABASE_URL`/`DIRECT_URL`/`POSTGRES_HOST` переписываются на `remnawave-db:5432`;
+  `env_file` и mount `.env` убираются, чтобы прод-URL не вернулся.
+- **Bot `compose config failed` без деталей**: config из `PROJ_DIR` + `--env-file .env`,
+  в отчёт печатается tail `compose.cfg.err`.
+- **Ложный FAIL isolation**: DNS на `--internal` часто резолвится — проверка по
+  `network.Internal` + реальному TCP egress (не `getent`).
+
 ## v5.6.22 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)

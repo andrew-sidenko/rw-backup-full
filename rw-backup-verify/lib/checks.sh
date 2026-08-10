@@ -216,24 +216,36 @@ rbv_check_add() {
 
 # --- stack probes -----------------------------------------------------------
 
+# Проверка изоляции: DNS на internal-сети Docker часто резолвится —
+# смотрим Internal-флаг и реальный TCP egress.
 rbv_check_isolation() {
   local sample="$1"
-  [[ -n "$sample" ]] || { rbv_check_add isolation skip "нет контейнера"; return 0; }
-  if docker exec "$sample" getent hosts api.telegram.org >/dev/null 2>&1 \
-     || docker exec "$sample" getent hosts 1.1.1.1 >/dev/null 2>&1; then
-    rbv_check_add isolation fail "внешний DNS резолвится (сеть не internal?)"
+  [[ -n "${NET_NAME:-}" ]] || { rbv_check_add isolation skip "нет NET_NAME"; return 0; }
+  local inn
+  inn="$(docker network inspect -f '{{.Internal}}' "$NET_NAME" 2>/dev/null || echo false)"
+  if [[ "$inn" != "true" ]]; then
+    rbv_check_add isolation fail "network.Internal=${inn}"
     return 1
   fi
-  # docker network inspect Internal flag
-  if [[ -n "${NET_NAME:-}" ]]; then
-    local inn
-    inn="$(docker network inspect -f '{{.Internal}}' "$NET_NAME" 2>/dev/null || echo false)"
-    if [[ "$inn" != "true" ]]; then
-      rbv_check_add isolation fail "network.Internal=${inn}"
+  # TCP к внешнему IP с той же сети (busybox). Успех = дыра в изоляции.
+  local probe="rbv_iso_${RANDOM}"
+  docker rm -f "$probe" >/dev/null 2>&1 || true
+  if docker run -d --name "$probe" --network "$NET_NAME" busybox:1.36 sleep 30 >/dev/null 2>&1; then
+    if docker exec "$probe" nc -z -w 3 1.1.1.1 443 >/dev/null 2>&1 \
+       || docker exec "$probe" wget -qO- -T 3 http://1.1.1.1 >/dev/null 2>&1; then
+      docker rm -f "$probe" >/dev/null 2>&1 || true
+      rbv_check_add isolation fail "есть TCP egress наружу (1.1.1.1) при Internal=true"
+      return 1
+    fi
+    docker rm -f "$probe" >/dev/null 2>&1 || true
+  elif [[ -n "$sample" ]]; then
+    # fallback без busybox: /dev/tcp в контейнере приложения
+    if docker exec "$sample" sh -c 'timeout 3 sh -c "echo >/dev/tcp/1.1.1.1/443"' >/dev/null 2>&1; then
+      rbv_check_add isolation fail "есть TCP egress наружу из sample-контейнера"
       return 1
     fi
   fi
-  rbv_check_add isolation ok "internal, без внешнего DNS"
+  rbv_check_add isolation ok "Internal=true, внешнего TCP нет"
   return 0
 }
 

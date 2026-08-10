@@ -58,7 +58,7 @@ rw-backup-verify run --storage cf-oneok     # сейчас
 | `user_rows` | users не пуста и ≥ предыдущей проверки (baseline) |
 | `event_freshness` | max(created/updated/…) в окне [prev_backup − skew … curr_backup + skew] |
 | `stack` | поднять compose в `--internal` + без падений `stability_seconds` |
-| `isolation` | сеть Internal + нет внешнего DNS |
+| `isolation` | сеть `Internal=true` + нет внешнего TCP egress (DNS на internal часто резолвится — это не leak) |
 | `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
 
 `timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
