@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Один прогон экземпляра.
-# Аргументы: <storage-id> <kind:panel|bot> <instance_id> <s3_key> [parent_dir]
-#
-# panel — как проверенный verify-stack dump-path: dump + remnawave_dir + isolate.
-# bot   — по custom-restore: PROFILE.env + postgres dump + redis rdb + project_dir + isolate.
+# Один прогон экземпляра с расширенными проверками и TG-отчётом.
+# <storage-id> <kind:panel|bot> <instance_id> <s3_key> [parent_dir]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "${SCRIPT_DIR}/../lib/common.sh"
+# shellcheck source=../lib/checks.sh
+source "${SCRIPT_DIR}/../lib/checks.sh"
 
 SID="${1:?storage}"
 KIND="${2:?kind}"
@@ -28,17 +27,31 @@ RUN_ID="$(date -u +%Y%m%d_%H%M%S)_$(printf '%s' "$INST" | tr '/:' '__' | cut -c1
 RUN_DIR="${WD}/runs/${RUN_ID}"
 mkdir -p "$RUN_DIR"
 REPORT="${RUN_DIR}/report.txt"
+CHECKS_JSON="${RUN_DIR}/checks.json"
 : > "$REPORT"
+rbv_checks_init "$CHECKS_JSON"
 
 rep() { printf '%s\n' "$*" | tee -a "$REPORT" >&2; }
 ok=true
 fail_reasons=()
+
+fail_add() {
+  ok=false
+  fail_reasons+=("$1")
+  rep "FAIL $1"
+}
 
 PG_CID=""
 COMPOSE_FILE=""
 NET_NAME=""
 KEEP="${KEEP:-false}"
 PROJ_DIR=""
+COMPOSE_RAW="${RUN_DIR}/compose.raw.json"
+USER_ROWS=0
+LAST_EVENT=0
+CURR_ARCH_EPOCH=0
+PREV_ARCH_EPOCH=0
+BASELINE_JSON="{}"
 
 cleanup() {
   if [[ "$KEEP" != "true" ]]; then
@@ -56,21 +69,29 @@ rep "storage=${SID} kind=${KIND} instance=${INST}"
 rep "key=${KEY} parent=${PARENT}"
 rep "started=$(date -Is)"
 
+CURR_ARCH_EPOCH="$(rbv_parse_archive_epoch "$(basename "$KEY")")"
+BASELINE_JSON="$(rbv_baseline_load "$SID" "$INST")"
+PREV_ARCH_EPOCH="$(jq -r '.archive_ts // 0' <<<"$BASELINE_JSON")"
+PREV_USER_ROWS="$(jq -r '.user_rows // empty' <<<"$BASELINE_JSON")"
+
+# --- download / extract -----------------------------------------------------
 ARCH_PATH="${RUN_DIR}/archive.tar.gz"
 S3_URI="s3://${RBV_BUCKET}/${KEY}"
 rep "download ${S3_URI}"
 if ! rbv_aws s3 cp "$S3_URI" "$ARCH_PATH" --only-show-errors; then
-  ok=false
-  fail_reasons+=("download failed")
-  rep "FAIL download"
+  fail_add "download failed"
+  rbv_check_add download fail "не скачался ${S3_URI}"
+else
+  rbv_check_add download ok "$(basename "$KEY")"
 fi
 
 base_name="$(basename "$KEY")"
 if [[ "$ok" == true && "$base_name" == *.age ]]; then
   need age
   AGE_ID="$(rbv_cfg '.age_identity // empty')"
-  [[ -n "$AGE_ID" ]] || { ok=false; fail_reasons+=("age archive but age_identity unset"); }
-  if [[ "$ok" == true ]]; then
+  if [[ -z "$AGE_ID" ]]; then
+    fail_add "age identity unset"
+  else
     age -d -i "$AGE_ID" -o "${ARCH_PATH}.dec" "$ARCH_PATH"
     mv -f "${ARCH_PATH}.dec" "$ARCH_PATH"
   fi
@@ -80,9 +101,7 @@ EXTRACT="${RUN_DIR}/extract"
 mkdir -p "$EXTRACT"
 if [[ "$ok" == true ]]; then
   if ! tar -xzf "$ARCH_PATH" -C "$EXTRACT" 2>"${RUN_DIR}/tar.err"; then
-    ok=false
-    fail_reasons+=("tar extract failed")
-    rep "FAIL tar: $(tail -n2 "${RUN_DIR}/tar.err" | tr '\n' ' ')"
+    fail_add "tar extract failed"
   fi
 fi
 
@@ -107,7 +126,6 @@ if [[ "$ok" == true ]]; then
       fi
     fi
   else
-    # bot — как custom-restore
     SQL="$(find "$EXTRACT" -type f -name 'postgres_dump.sql.gz' | head -n1 || true)"
     [[ -n "$SQL" ]] || SQL="$(find "$EXTRACT" -type f -name 'dump_*.sql.gz' | head -n1 || true)"
     REDIS_RDB="$(find "$EXTRACT" -type f -name 'redis_dump.rdb' | head -n1 || true)"
@@ -120,7 +138,6 @@ if [[ "$ok" == true ]]; then
       set -u
       POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
       REDIS_SERVICE="${REDIS_SERVICE:-redis}"
-      rep "profile: PROJECT_NAME=${PROJECT_NAME:-?} POSTGRES_SERVICE=${POSTGRES_SERVICE} REDIS_SERVICE=${REDIS_SERVICE}"
     fi
     if [[ -n "$DIR_TAR" ]]; then
       pe="${RUN_DIR}/project_extract"
@@ -132,19 +149,17 @@ if [[ "$ok" == true ]]; then
       else
         PROJ_DIR="$pe"
       fi
-      # Redis RDB до запуска (как в restore_custom_archive)
       if [[ -n "$REDIS_RDB" && -f "$REDIS_RDB" ]]; then
         mkdir -p "${PROJ_DIR}/volumes/redis"
         cp -f "$REDIS_RDB" "${PROJ_DIR}/volumes/redis/dump.rdb"
         chmod 644 "${PROJ_DIR}/volumes/redis/dump.rdb" || true
-        rep "redis_dump → volumes/redis/dump.rdb"
       fi
     fi
   fi
-  [[ -n "$SQL" ]] || { ok=false; fail_reasons+=("no sql dump in archive"); rep "FAIL no dump"; }
-  rep "dump=$(basename "${SQL:-}") project_dir=${PROJ_DIR:-none}"
+  [[ -n "$SQL" ]] || fail_add "no sql dump"
 fi
 
+# --- DB restore + data checks -----------------------------------------------
 DB_TABLES=0
 if [[ "$ok" == true ]]; then
   PG_CID="rbv_pg_${RUN_ID}"
@@ -156,41 +171,104 @@ if [[ "$ok" == true ]]; then
     sleep 1
   done
   if ! docker exec "$PG_CID" pg_isready -U postgres >/dev/null 2>&1; then
-    ok=false; fail_reasons+=("postgres not ready"); rep "FAIL pg_isready"
+    fail_add "postgres not ready"
   else
     gzip -dc "$SQL" | docker exec -i "$PG_CID" \
       psql -q -U postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err" || true
-    DB_TABLES="$(docker exec "$PG_CID" psql -U postgres -Atc \
-      "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" \
-      2>/dev/null || echo 0)"
+    DB_TABLES="$(rbv_psql "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")"
     DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
     [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
-    rep "db_tables=${DB_TABLES}"
     if (( DB_TABLES < 1 )); then
-      ok=false; fail_reasons+=("no public tables after restore"); rep "FAIL empty schema"
+      fail_add "empty schema"
+      rbv_check_add db_schema fail "public tables=0"
+    else
+      rbv_check_add db_schema ok "tables=${DB_TABLES}"
+    fi
+
+    # user rows
+    if rbv_check_enabled "$KIND" user_rows_monotonic || rbv_check_enabled "$KIND" db_rows; then
+      utbl="$(rbv_find_users_table)"
+      if [[ -n "$utbl" ]]; then
+        USER_ROWS="$(rbv_count_table "$utbl")"
+        if rbv_check_enabled "$KIND" db_rows; then
+          if (( USER_ROWS < 1 )); then
+            rbv_check_add db_rows fail "users(${utbl})=0" "" "$USER_ROWS"
+            fail_add "users empty"
+          else
+            rbv_check_add db_rows ok "users(${utbl})=${USER_ROWS}" "" "$USER_ROWS"
+          fi
+        fi
+        if rbv_check_enabled "$KIND" user_rows_monotonic; then
+          if [[ -n "$PREV_USER_ROWS" && "$PREV_USER_ROWS" =~ ^[0-9]+$ ]]; then
+            if (( USER_ROWS < PREV_USER_ROWS )); then
+              rbv_check_add user_rows_monotonic fail \
+                "строк users меньше предыдущей проверки" "$PREV_USER_ROWS" "$USER_ROWS"
+              fail_add "user_rows ${USER_ROWS}<${PREV_USER_ROWS}"
+            else
+              rbv_check_add user_rows_monotonic ok \
+                "users не уменьшились" "$PREV_USER_ROWS" "$USER_ROWS"
+            fi
+          else
+            rbv_check_add user_rows_monotonic skip "нет baseline (первый прогон)" "" "$USER_ROWS"
+          fi
+        fi
+      else
+        rbv_check_add db_rows skip "таблица users не найдена"
+        rbv_check_add user_rows_monotonic skip "таблица users не найдена"
+      fi
+    fi
+
+    # event freshness (relative to backup window + skew)
+    if rbv_check_enabled "$KIND" event_freshness; then
+      LAST_EVENT="$(rbv_max_event_epoch)"
+        skew="$(rbv_skew_sec)"
+      if [[ "${LAST_EVENT:-0}" -eq 0 ]]; then
+        rbv_check_add event_freshness skip "нет timestamp-колонок событий"
+      elif [[ "${CURR_ARCH_EPOCH:-0}" -eq 0 ]]; then
+        rbv_check_add event_freshness skip "не разобрать TS архива"
+      else
+        if [[ "${PREV_ARCH_EPOCH:-0}" -gt 0 ]]; then
+          local_lo=$(( PREV_ARCH_EPOCH - skew ))
+        else
+          local_lo=$(( CURR_ARCH_EPOCH - skew - 86400*30 ))
+        fi
+        local_hi=$(( CURR_ARCH_EPOCH + skew ))
+        if (( LAST_EVENT < local_lo || LAST_EVENT > local_hi )); then
+          rbv_check_add event_freshness fail \
+            "событие вне окна [prev−skew … curr+skew] (skew=${skew}s)" \
+            "$(date -u -d "@${PREV_ARCH_EPOCH}" +%F_%T 2>/dev/null || echo "$PREV_ARCH_EPOCH")" \
+            "event=$(date -u -d "@${LAST_EVENT}" +%F_%T 2>/dev/null || echo "$LAST_EVENT"); arch=$(date -u -d "@${CURR_ARCH_EPOCH}" +%F_%T 2>/dev/null || echo "$CURR_ARCH_EPOCH")"
+          fail_add "event_freshness out of window"
+        else
+          rbv_check_add event_freshness ok \
+            "событие в окне бекапов (±${skew}s TZ lag)" \
+            "prev_arch=${PREV_ARCH_EPOCH}" "event=${LAST_EVENT}/arch=${CURR_ARCH_EPOCH}"
+        fi
+      fi
     fi
   fi
 fi
 
+# --- stack up + isolation / stability / ports -------------------------------
 STACK_OK="skip"
 STACK_DETAIL=""
 SETTLE="$(rbv_cfg '.settle_seconds // 25')"
+SAMPLE_CID=""
 
-if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]]; then
+if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack_up; then
   CF=""
   for c in "${PROJ_DIR}/docker-compose.yml" "${PROJ_DIR}/docker-compose.yaml" \
            "${PROJ_DIR}/compose.yml" "${PROJ_DIR}/compose.yaml"; do
     [[ -f "$c" ]] && { CF="$c"; break; }
   done
-  if [[ -n "$CF" ]]; then
-    rep "compose found: $CF — изоляция"
+  if [[ -z "$CF" ]]; then
+    rbv_check_add stack_up skip "compose не найден"
+  else
     NET_NAME="rbv_net_${RUN_ID}"
     docker network create --internal "$NET_NAME" >/dev/null
     COMPOSE_FILE="${RUN_DIR}/compose.isolated.yml"
 
-    if docker compose -f "$CF" config --format json >"${RUN_DIR}/compose.raw.json" 2>"${RUN_DIR}/compose.cfg.err"; then
-      # Убираем postgres-сервисы (БД = наш контейнер с алиасами).
-      # Redis и apps оставляем — для бота redis уже с dump.rdb.
+    if docker compose -f "$CF" config --format json >"$COMPOSE_RAW" 2>"${RUN_DIR}/compose.cfg.err"; then
       jq --arg net "$NET_NAME" --arg pgsvc "${POSTGRES_SERVICE}" '
         .networks = {"rbv": {"name": $net, "external": true}}
         | .services = (.services | to_entries | map(
@@ -216,7 +294,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]]; then
         | if .volumes then
             .volumes |= with_entries(select(.value.external != true))
           else . end
-      ' "${RUN_DIR}/compose.raw.json" > "$COMPOSE_FILE"
+      ' "$COMPOSE_RAW" > "$COMPOSE_FILE"
 
       docker network disconnect "$NET_NAME" "$PG_CID" 2>/dev/null || true
       docker network connect \
@@ -232,82 +310,98 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]]; then
       set -e
       if [[ $up_rc -ne 0 ]]; then
         STACK_OK="fail"
-        STACK_DETAIL="compose up rc=${up_rc}: $(tail -n3 "${RUN_DIR}/compose.up.err" | tr '\n' ' ')"
-        rep "FAIL stack: $STACK_DETAIL"
-        ok=false
-        fail_reasons+=("stack up failed")
+        STACK_DETAIL="compose up rc=${up_rc}"
+        rbv_check_add stack_up fail "$STACK_DETAIL: $(tail -n2 "${RUN_DIR}/compose.up.err" | tr '\n' ' ')"
+        fail_add "stack up failed"
       else
         sleep "$SETTLE"
         running="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
         total="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | wc -l | tr -d ' ')"
         STACK_DETAIL="containers ${running}/${total}"
-        leak=""
-        sample="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | head -n1 || true)"
-        if [[ -n "$sample" ]]; then
-          if docker exec "$sample" getent hosts api.telegram.org >/dev/null 2>&1; then
-            leak="LEAK: external DNS resolved"
-            ok=false
-            fail_reasons+=("$leak")
-          fi
-        fi
+        SAMPLE_CID="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | head -n1 || true)"
         if [[ "${running:-0}" -lt 1 ]]; then
           STACK_OK="fail"
-          ok=false
-          fail_reasons+=("no running containers")
+          rbv_check_add stack_up fail "$STACK_DETAIL"
+          fail_add "no running containers"
         else
           STACK_OK="ok"
+          rbv_check_add stack_up ok "$STACK_DETAIL"
         fi
-        rep "stack=${STACK_OK} ${STACK_DETAIL}${leak:+ · $leak}"
+
+        if rbv_check_enabled "$KIND" isolation; then
+          if ! rbv_check_isolation "$SAMPLE_CID"; then
+            fail_add "isolation leak"
+          fi
+        else
+          rbv_check_add isolation skip "отключено"
+        fi
+
+        if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" stability; then
+          stab="$(rbv_stability_sec)"
+          if ! rbv_check_stability "rbv_${RUN_ID}" "$COMPOSE_FILE" "$stab"; then
+            fail_add "stability"
+          fi
+        elif ! rbv_check_enabled "$KIND" stability; then
+          rbv_check_add stability skip "отключено"
+        fi
+
+        if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" backend_ports; then
+          if ! rbv_check_backend_ports "$NET_NAME" "$COMPOSE_RAW" "rbv_${RUN_ID}"; then
+            fail_add "backend_ports"
+          fi
+        elif ! rbv_check_enabled "$KIND" backend_ports; then
+          rbv_check_add backend_ports skip "отключено"
+        fi
       fi
     else
-      STACK_OK="skip"
-      STACK_DETAIL="compose config failed"
-      rep "WARN stack skipped: $(tail -n2 "${RUN_DIR}/compose.cfg.err" | tr '\n' ' ')"
+      rbv_check_add stack_up fail "compose config failed"
+      fail_add "compose config"
     fi
-  else
-    rep "compose not found — только DB smoke"
+  fi
+elif ! rbv_check_enabled "$KIND" stack_up; then
+  rbv_check_add stack_up skip "отключено"
+fi
+
+# --- save baseline (только при успехе данных) ------------------------------
+if [[ "$ok" == true || "$USER_ROWS" -gt 0 ]]; then
+  new_base="$(jq -n \
+    --argjson ur "${USER_ROWS:-0}" \
+    --argjson at "${CURR_ARCH_EPOCH:-0}" \
+    --argjson le "${LAST_EVENT:-0}" \
+    --arg key "$KEY" \
+    --argjson ts "$(date +%s)" \
+    --argjson tables "${DB_TABLES:-0}" \
+    '{user_rows:$ur, archive_ts:$at, last_event_epoch:$le, archive_key:$key, tested_at:$ts, db_tables:$tables}')"
+  # обновляем baseline всегда при успешном DB restore (даже если stack fail) —
+  # иначе монотонность users не сдвинется после починки стека
+  if [[ "${DB_TABLES:-0}" -gt 0 ]]; then
+    rbv_baseline_save "$SID" "$INST" "$new_base"
   fi
 fi
 
 ended="$(date -Is)"
-rep "finished=${ended}"
-rep "result=$([[ $ok == true ]] && echo OK || echo FAIL)"
-[[ ${#fail_reasons[@]} -gt 0 ]] && rep "reasons: ${fail_reasons[*]}"
+rep "finished=${ended} result=$([[ $ok == true ]] && echo OK || echo FAIL)"
 
-icon="🟢"; [[ "$ok" == true ]] || icon="🔴"
+# --- Telegram ---------------------------------------------------------------
 TG_LINE="$(rbv_tg_for_storage "$SID")"
 IFS='|' read -r TOK CHAT THREAD <<<"$TG_LINE"
-
-reasons_txt="${fail_reasons[*]-}"
-dump_base="$(basename "${SQL:-unknown}")"
-if [[ "$ok" == true ]]; then
-  result_line="Результат: OK"
-else
-  result_line="Результат: FAIL — ${reasons_txt}"
-fi
-body="$(printf '%s\n' \
-  "${icon} <b>verify</b> ${SID}" \
-  "Экземпляр: <code>${INST}</code>" \
-  "Вид: ${KIND} · архив: <code>$(basename "$KEY")</code>" \
-  "БД: tables=${DB_TABLES} · dump=${dump_base}" \
-  "Стек: ${STACK_OK}${STACK_DETAIL:+ (${STACK_DETAIL})}" \
-  "${result_line}" \
-  "Время: ${ended}")"
+body="$(rbv_format_tg_report "$SID" "$KIND" "$INST" "$KEY" "$ok")"
+body+=$'\n'"⏱ ${ended}"
 
 notify_ok="$(rbv_cfg '.notify_on_success // true')"
 if [[ "$ok" != true ]] || [[ "$notify_ok" == "true" ]]; then
-  rbv_tg_send "$TOK" "$CHAT" "$body" "$THREAD"
+  rbv_tg_send_long "$TOK" "$CHAT" "$body" "$THREAD"
+  if [[ "$ok" != true && -n "${COMPOSE_FILE}" && -f "${COMPOSE_FILE}" ]]; then
+    rbv_tg_send_logs "$TOK" "$CHAT" "$THREAD" "rbv_${RUN_ID}" "$COMPOSE_FILE"
+  fi
 fi
 
-reasons_json='[]'
-if [[ ${#fail_reasons[@]} -gt 0 ]]; then
-  reasons_json="$(printf '%s\n' "${fail_reasons[@]}" | jq -R . | jq -s .)"
-fi
+cp -f "$CHECKS_JSON" "${RUN_DIR}/checks.json"
 jq -n \
   --arg sid "$SID" --arg kind "$KIND" --arg inst "$INST" --arg key "$KEY" \
-  --argjson ok "$ok" --arg stack "$STACK_OK" --arg detail "$STACK_DETAIL" \
-  --argjson tables "${DB_TABLES:-0}" --argjson reasons "$reasons_json" \
-  '{storage:$sid,kind:$kind,instance:$inst,archive:$key,ok:$ok,db_tables:$tables,stack:$stack,stack_detail:$detail,reasons:$reasons}' \
+  --argjson ok "$ok" --argjson tables "${DB_TABLES:-0}" --argjson users "${USER_ROWS:-0}" \
+  --slurpfile checks "$CHECKS_JSON" \
+  '{storage:$sid,kind:$kind,instance:$inst,archive:$key,ok:$ok,db_tables:$tables,user_rows:$users,checks:$checks[0]}' \
   > "${RUN_DIR}/summary.json"
 
 [[ "$ok" == true ]]

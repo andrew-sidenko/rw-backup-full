@@ -92,6 +92,49 @@ rm -f "$(rbv_work_dir)/locks/due_global_"*
 # clear interval so times path used — schedule set replaces verify object
 if rbv_global_due; then pass "times due"; else fail "times due" "not"; fi
 
+# --- checks lib ---
+# shellcheck source=../lib/checks.sh
+source "$ROOT/lib/checks.sh"
+
+# toggles
+jq '.checks.bot.backend_ports=false | .checks.panel.stability=false' \
+  "$RBV_CONFIG" > "$T/c3.json" && mv "$T/c3.json" "$RBV_CONFIG"
+rbv_check_enabled bot backend_ports && fail "bot ports off" "enabled" || pass "bot ports disabled"
+rbv_check_enabled panel backend_ports && pass "panel ports on" || fail "panel ports" "off"
+rbv_check_enabled panel stability && fail "panel stab off" "on" || pass "panel stability disabled"
+
+# archive epoch parse
+ep="$(rbv_parse_archive_epoch 'remnawave_backup_2026-08-10_03_00_00.tar.gz')"
+[[ "$ep" -gt 1000000000 ]] && pass "parse panel epoch" || fail "parse panel epoch" "$ep"
+ep2="$(rbv_parse_archive_epoch 'custom_bot_x_20260810_030015.tar.gz')"
+[[ "$ep2" -gt 1000000000 ]] && pass "parse bot epoch" || fail "parse bot epoch" "$ep2"
+
+# skew / event window relative
+skew=3600
+prev=1000000; curr=1003600; event=1001800
+lo=$((prev - skew)); hi=$((curr + skew))
+(( event >= lo && event <= hi )) && pass "event in window" || fail "event window" "$event"
+event_bad=$((curr + skew + 10))
+(( event_bad > hi )) && pass "event out detected" || fail "event out" "not"
+
+# baseline roundtrip
+rbv_baseline_save s1 "bot:p/A:custom_bot_bot1" '{"user_rows":10,"archive_ts":100}'
+b="$(rbv_baseline_load s1 "bot:p/A:custom_bot_bot1")"
+[[ "$(jq -r .user_rows <<<"$b")" == "10" ]] && pass "baseline save/load" || fail "baseline" "$b"
+
+# check accumulator + tg format
+rbv_checks_init "$T/checks.json"
+RBV_BUCKET=b
+rbv_check_add download ok "file.tar.gz"
+rbv_check_add user_rows_monotonic fail "меньше" "20" "15"
+rbv_check_add isolation ok "internal"
+body="$(rbv_format_tg_report s1 bot "bot:p/A:x" "pref/custom_bot_x.tar.gz" false)"
+printf '%s\n' "$body" | grep -q 'Хранилище' && pass "tg has storage" || fail "tg storage" "missing"
+printf '%s\n' "$body" | grep -q 'Путь' && pass "tg has path" || fail "tg path" "missing"
+printf '%s\n' "$body" | grep -q 'user_rows_monotonic' && pass "tg has check" || fail "tg check" "missing"
+printf '%s\n' "$body" | grep -q 'Расхождения' && pass "tg has diffs" || fail "tg diffs" "missing"
+printf '%s\n' "$body" | grep -q '✅\|❌\|⚠\|⚪' && pass "tg icons" || fail "tg icons" "missing"
+
 echo
 echo "==== ${PASS} passed, ${FAIL} failed ===="
 (( FAIL == 0 ))

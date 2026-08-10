@@ -48,12 +48,40 @@ rw-backup-verify discover cf-oneok          # что будет тестиров
 rw-backup-verify run --storage cf-oneok     # сейчас
 ```
 
+## Проверки (включаются/выключаются раздельно для panel и bot)
+
+В `/etc/rw-backup-verify/config.json` → `checks.panel` / `checks.bot`:
+
+| Ключ | Смысл |
+|---|---|
+| `db_rows` | таблица users не пуста |
+| `user_rows_monotonic` | строк users ≥ предыдущей успешной проверки |
+| `event_freshness` | max(created/updated/…) в окне [prev_backup − skew … curr_backup + skew] |
+| `stack_up` | поднять compose в `--internal` сети |
+| `isolation` | сеть Internal + нет внешнего DNS |
+| `stability` | без падений контейнеров N секунд (`stability_seconds`) |
+| `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
+
+`timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
+
+Отключить пример:
+```json
+"checks": { "bot": { "backend_ports": false, "stability": false } }
+```
+
+## Telegram-отчёт
+
+- хранилище, полный S3-путь, id экземпляра
+- список проверок с ✅/❌/⚠️/⚪ и значениями prev→curr
+- блок «Расхождения» при fail
+- при ошибке — второе сообщение с логами контейнеров
+
 ## Восстановление при тесте
 
 | Вид | Основа | Шаги |
 |---|---|---|
 | **panel** | dump-path verify-stack | `dump_*.sql.gz` + `remnawave_dir_*.tar.gz` → PG + isolate compose |
-| **bot** | `custom-restore` из rw-backup-full | `PROFILE.env` + `postgres_dump.sql.gz` + `redis_dump.rdb` → volumes/redis + `project_dir.tar.gz` → isolate (без postgres-сервиса, с алиасами БД) |
+| **bot** | `custom-restore` | PROFILE + postgres dump + redis RDB → isolate |
 
 Изоляция: сеть `--internal`, без published ports / docker.sock / external nets.
 

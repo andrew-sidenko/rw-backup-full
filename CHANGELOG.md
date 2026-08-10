@@ -1,5 +1,12 @@
 # Changelog
 
+## v5.6.15 (2026-08-10)
+
+### Добавлено (`rw-backup-verify`)
+- Проверки panel/bot с отдельными toggles: `db_rows`, `user_rows_monotonic`, `event_freshness` (окно между бекапами + TZ skew), `stack_up`, `isolation`, `stability`, `backend_ports`.
+- Baseline на экземпляр: users не меньше прошлого прогона; события относительно TS архивов.
+- Telegram: хранилище, полный путь, id, статусы с значениями prev→curr, блок расхождений; при ошибке — логи контейнеров.
+
 ## v5.6.14 (2026-08-10)
 
 ### Изменено (`rw-backup-verify`)

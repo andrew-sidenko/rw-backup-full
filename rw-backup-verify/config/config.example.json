@@ -7,6 +7,28 @@
   "verify": {
     "interval_hours": 12
   },
+  "checks": {
+    "timezone_skew_hours": 14,
+    "stability_seconds": 180,
+    "panel": {
+      "db_rows": true,
+      "user_rows_monotonic": true,
+      "event_freshness": true,
+      "stack_up": true,
+      "isolation": true,
+      "stability": true,
+      "backend_ports": true
+    },
+    "bot": {
+      "db_rows": true,
+      "user_rows_monotonic": true,
+      "event_freshness": true,
+      "stack_up": true,
+      "isolation": true,
+      "stability": true,
+      "backend_ports": true
+    }
+  },
   "telegram": {
     "token": "",
     "chat_id": "",
