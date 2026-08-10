@@ -22,7 +22,7 @@ usage() {
 rw-backup-verify — автономная проверка логических бэкапов в S3
 
   storage list|show|add|remove
-  telegram set|show
+  telegram|tel|tg set|show
   schedule show|set --times HH:MM,HH:MM | --interval-hours N
 
   discover <storage-id> [--all]     # deep; по умолчанию только untested
@@ -71,7 +71,7 @@ case "$cmd" in
         ;;
       show)
         id="${1:?id}"
-        jq --arg id "$id" '.storages[] | select(.id==$id)' "$RBV_CONFIG"
+        rbv_storage_json "$id" | jq .
         ;;
       remove)
         id="${1:?id}"
@@ -130,8 +130,16 @@ case "$cmd" in
           esac
         done
         if [[ -n "$INTERVAL" ]]; then
+          [[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]] \
+            || { msg ERR "--interval-hours: целое число > 0"; exit 1; }
           jq --argjson h "$INTERVAL" '.verify={interval_hours:$h}' "$RBV_CONFIG" | rbv_save_config
         elif [[ -n "$TIMES" ]]; then
+          IFS=',' read -ra _times <<<"$TIMES"
+          ((${#_times[@]} > 0)) || { msg ERR "--times: пусто"; exit 1; }
+          for t in "${_times[@]}"; do
+            [[ "$t" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+              || { msg ERR "--times: ожидается HH:MM (00–23:59), плохое значение: ${t}"; exit 1; }
+          done
           jq --arg s "$TIMES" '.verify={times:($s|split(","))}' "$RBV_CONFIG" | rbv_save_config
         else
           msg ERR "нужен --times или --interval-hours"; exit 1
@@ -143,7 +151,7 @@ case "$cmd" in
     esac
     ;;
 
-  telegram)
+  telegram|tel|tg)
     sub="${1:-show}"; shift || true
     case "$sub" in
       show) jq '.telegram' "$RBV_CONFIG" ;;
@@ -171,6 +179,8 @@ case "$cmd" in
     sid="${1:?storage-id}"; shift || true
     mode=true
     [[ "${1:-}" == "--all" ]] && mode=false
+    # fail-fast: process substitution не пробрасывает exit rbv_discover в set -e
+    rbv_storage_json "$sid" >/dev/null
     printf '%-6s %-50s %s\n' "KIND" "INSTANCE" "KEY"
     while IFS='|' read -r kind inst key parent; do
       printf '%-6s %-50s %s\n' "$kind" "$inst" "$key"
@@ -190,7 +200,9 @@ case "$cmd" in
       rbv_global_due || { msg INFO "Ещё не время (глобальное расписание)"; exit 0; }
     fi
     if [[ -n "$ONLY" ]]; then
+      rbv_storage_json "$ONLY" >/dev/null
       while IFS='|' read -r kind inst key parent; do
+        [[ -n "${key:-}" ]] || continue
         rbv_enqueue_instance "$ONLY" "$kind" "$inst" "$key" "$parent" "manual"
       done < <(rbv_discover "$ONLY" true)
     else

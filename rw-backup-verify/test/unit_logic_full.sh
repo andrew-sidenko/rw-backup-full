@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# Полный unit-прогон rw-backup-verify: CLI, discover (mock aws), schedule,
+# tested/queue/worker, symlink, валидации. Без Docker/S3.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0; FAIL=0
+pass(){ PASS=$((PASS+1)); echo "PASS $1"; }
+fail(){ FAIL=$((FAIL+1)); echo "FAIL $1 — $2"; }
+expect_rc(){ # expect_rc <rc> <label> -- cmd...
+  local want="$1" label="$2"; shift 2
+  set +e
+  local out rc
+  out="$("$@" 2>&1)"
+  rc=$?
+  set -e
+  if [[ "$rc" -eq "$want" ]]; then pass "$label"
+  else fail "$label" "rc=$rc want=$want out=${out:0:200}"
+  fi
+}
+
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+export RBV_CONFIG="$T/config.json"
+export RBV_STATE_DIR="$T/state"
+mkdir -p "$RBV_STATE_DIR" "$T/bin"
+
+cp "$ROOT/config/config.example.json" "$RBV_CONFIG"
+# shellcheck source=../lib/common.sh
+source "$ROOT/lib/common.sh"
+# shellcheck source=../lib/checks.sh
+source "$ROOT/lib/checks.sh"
+
+# --- mock aws ---
+cat > "$T/bin/aws" <<'AWS'
+#!/bin/bash
+# пропускаем глобальные флаги (--endpoint-url …)
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --endpoint-url|--region|--profile) shift 2 ;;
+    --*) shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]}"
+if [[ "${1:-}" == "s3" && "${2:-}" == "ls" ]]; then
+  cat <<'EOF'
+2026-08-01 03:00:00   1000 rw-backup-full/panel/h1/remnawave_backup_2026-08-01_03_00_00.tar.gz
+2026-08-10 03:00:00   1000 rw-backup-full/panel/h1/remnawave_backup_2026-08-10_03_00_00.tar.gz
+2026-08-10 03:00:15   1000 rw-backup-full/bots/a/custom_bot_One_20260810_030015.tar.gz
+2026-08-09 03:00:15   1000 rw-backup-full/bots/a/custom_bot_One_20260809_030015.tar.gz
+2026-08-10 04:00:00   1000 rw-backup-full/bots/a/custom_bot_Two_20260810_040000.tar.gz
+2026-08-10 05:00:00   1000 rw-backup-full/deep/x/y/remnawave_backup_2026-08-10_05_00_00.tar.gz
+2026-08-10 05:00:00   1000 other/file.txt
+EOF
+  exit 0
+fi
+echo "unexpected aws: $*" >&2
+exit 1
+AWS
+chmod +x "$T/bin/aws"
+export PATH="$T/bin:$PATH"
+
+echo "==== classify ===="
+out="$(rbv_classify_name 'remnawave_backup_2026-08-10_03_00_00.tar.gz')"
+[[ "$out" == "panel|remnawave_backup" ]] && pass "classify panel" || fail "classify panel" "$out"
+out="$(rbv_classify_name 'remnawave_backup_2026-08-10_03_00_00.tar.gz.age')"
+[[ "$out" == "panel|remnawave_backup" ]] && pass "classify panel.age" || fail "classify panel.age" "$out"
+out="$(rbv_classify_name 'custom_bot_Foo_Bar_20260810_030015.tar.gz')"
+[[ "$out" == "bot|custom_bot_Foo_Bar" ]] && pass "classify bot nested" || fail "classify bot nested" "$out"
+if rbv_classify_name 'remnawave_backup.tar.gz' >/dev/null 2>&1; then
+  fail "classify no-ts panel" "should fail"
+else
+  pass "classify no-ts panel"
+fi
+
+echo "==== storage CLI ===="
+"$ROOT/bin/rw-backup-verify" storage add \
+  --id s1 --bucket b --access-key a --secret-key s \
+  --prefix rw-backup-full --endpoint https://s3.example --backup-hint "hint" >/dev/null
+"$ROOT/bin/rw-backup-verify" storage add \
+  --id s2 --bucket b2 --access-key a --secret-key s >/dev/null
+n="$(jq '.storages|length' "$RBV_CONFIG")"
+[[ "$n" == "2" ]] && pass "storage add×2" || fail "storage add" "n=$n"
+# upsert same id
+"$ROOT/bin/rw-backup-verify" storage add \
+  --id s2 --bucket b2new --access-key a --secret-key s >/dev/null
+n="$(jq '.storages|length' "$RBV_CONFIG")"
+b="$(jq -r '.storages[]|select(.id=="s2").bucket' "$RBV_CONFIG")"
+[[ "$n" == "2" && "$b" == "b2new" ]] && pass "storage upsert" || fail "storage upsert" "n=$n b=$b"
+expect_rc 1 "storage show missing" "$ROOT/bin/rw-backup-verify" storage show nosuch
+"$ROOT/bin/rw-backup-verify" storage show s1 | grep -q '"id": "s1"' && pass "storage show" || fail "storage show" "no id"
+"$ROOT/bin/rw-backup-verify" storage remove s2 >/dev/null
+[[ "$(jq '.storages|length' "$RBV_CONFIG")" == "1" ]] && pass "storage remove" || fail "storage remove" "left"
+
+echo "==== missing storage hard-fail ===="
+set +e
+out="$(rbv_storage_json nosuch 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]] && pass "storage_json missing" || fail "storage_json missing" "rc=0 out=$out"
+expect_rc 1 "discover missing" "$ROOT/bin/rw-backup-verify" discover nosuch
+
+echo "==== schedule validation ===="
+expect_rc 1 "interval abc" "$ROOT/bin/rw-backup-verify" schedule set --interval-hours abc
+expect_rc 1 "interval 0" "$ROOT/bin/rw-backup-verify" schedule set --interval-hours 0
+expect_rc 1 "interval -3" "$ROOT/bin/rw-backup-verify" schedule set --interval-hours -3
+expect_rc 1 "times 25:99" "$ROOT/bin/rw-backup-verify" schedule set --times 25:99
+expect_rc 1 "times 9:30" "$ROOT/bin/rw-backup-verify" schedule set --times 9:30
+"$ROOT/bin/rw-backup-verify" schedule set --interval-hours 6 >/dev/null
+[[ "$(jq -r '.verify.interval_hours' "$RBV_CONFIG")" == "6" ]] && pass "interval 6" || fail "interval 6" "bad"
+"$ROOT/bin/rw-backup-verify" schedule set --times 06:30,18:30 >/dev/null
+[[ "$(jq -r '.verify.times|join(",")' "$RBV_CONFIG")" == "06:30,18:30" ]] && pass "times ok" || fail "times ok" "bad"
+
+echo "==== telegram aliases ===="
+"$ROOT/bin/rw-backup-verify" tel set --token tok --chat-id 42 >/dev/null
+"$ROOT/bin/rw-backup-verify" tg show | grep -q '"token": "tok"' && pass "tel/tg alias" || fail "tel/tg" "no token"
+
+echo "==== symlink CLI (install layout) ===="
+fake_local="$T/usr/local/bin"
+mkdir -p "$fake_local"
+ln -sfn "$ROOT/bin/rw-backup-verify" "$fake_local/rw-backup-verify"
+if out="$("$fake_local/rw-backup-verify" telegram show 2>&1)"; then
+  printf '%s\n' "$out" | grep -q tok && pass "symlink cli" || fail "symlink cli" "$out"
+else
+  fail "symlink cli" "$out"
+fi
+
+echo "==== discover latest + tested ===="
+disc="$("$ROOT/bin/rw-backup-verify" discover s1)"
+printf '%s\n' "$disc" | grep -q 'remnawave_backup_2026-08-10_03_00_00' && pass "discover panel latest" || fail "discover panel latest" "$disc"
+printf '%s\n' "$disc" | grep -q 'custom_bot_One_20260810_030015' && pass "discover bot1 latest" || fail "discover bot1" "$disc"
+printf '%s\n' "$disc" | grep -q 'custom_bot_Two_20260810_040000' && pass "discover bot2" || fail "discover bot2" "$disc"
+printf '%s\n' "$disc" | grep -q 'deep/x/y/remnawave_backup' && pass "discover nested panel" || fail "discover nested" "$disc"
+printf '%s\n' "$disc" | grep -q '2026-08-01' && fail "discover old panel" "old key present" || pass "discover skips older"
+n="$(printf '%s\n' "$disc" | grep -cE '^(panel|bot) ' || true)"
+[[ "$n" == "4" ]] && pass "discover count=4" || fail "discover count" "n=$n disc=$disc"
+
+rbv_mark_tested s1 "rw-backup-full/panel/h1/remnawave_backup_2026-08-10_03_00_00.tar.gz" true run1
+disc2="$("$ROOT/bin/rw-backup-verify" discover s1 2>/dev/null)"
+printf '%s\n' "$disc2" | grep -q 'panel/h1/remnawave' && fail "untested skip" "still listed" || pass "untested skip"
+disc_all="$("$ROOT/bin/rw-backup-verify" discover s1 --all)"
+printf '%s\n' "$disc_all" | grep -q 'panel/h1/remnawave' && pass "discover --all" || fail "discover --all" "missing"
+
+echo "==== global due ===="
+"$ROOT/bin/rw-backup-verify" schedule set --interval-hours 6 >/dev/null
+mkdir -p "$(rbv_work_dir)/locks"
+date +%s > "$(rbv_work_dir)/locks/last_run_global"
+if rbv_global_due; then fail "not due recent" "was due"; else pass "not due recent"; fi
+echo $(( $(date +%s) - 7*3600 )) > "$(rbv_work_dir)/locks/last_run_global"
+if rbv_global_due; then pass "due after interval"; else fail "due after interval" "not"; fi
+# negative interval in config must not be always-due
+jq '.verify={interval_hours:-3}' "$RBV_CONFIG" > "$T/c.json" && mv "$T/c.json" "$RBV_CONFIG"
+date +%s > "$(rbv_work_dir)/locks/last_run_global"
+if rbv_global_due; then fail "neg interval due" "should error/not due"; else pass "neg interval rejected"; fi
+"$ROOT/bin/rw-backup-verify" schedule set --times "$(date +%H:%M)" >/dev/null
+rm -f "$(rbv_work_dir)/locks/due_global_"*
+if rbv_global_due; then pass "times due"; else fail "times due" "not"; fi
+rbv_mark_global_done
+if rbv_global_due; then fail "times already done" "still due"; else pass "times stamped"; fi
+
+echo "==== queue + worker (mock run-one) ===="
+"$ROOT/bin/rw-backup-verify" schedule set --interval-hours 12 >/dev/null
+"$ROOT/bin/rw-backup-verify" queue clear >/dev/null
+FAKE="$T/opt/rw-backup-verify"
+mkdir -p "$FAKE/bin" "$FAKE/lib"
+cp -a "$ROOT/lib/." "$FAKE/lib/"
+cp -a "$ROOT/bin/rw-backup-verify" "$FAKE/bin/"
+cp -a "$ROOT/bin/rbv-worker.sh" "$FAKE/bin/"
+cat > "$FAKE/bin/rbv-run-one.sh" <<'RUN'
+#!/bin/bash
+set -euo pipefail
+echo "MOCK $*" >&2
+mkdir -p "${RBV_STATE_DIR}/runs/mock_${3//\//_}"
+exit 0
+RUN
+chmod +x "$FAKE/bin/rbv-run-one.sh"
+
+rbv_enqueue_instance s1 bot "bot:p:a" "k/a.tar.gz" "k" manual
+sleep 0.01
+rbv_enqueue_instance s1 panel "panel:p:b" "k/b.tar.gz" "k" manual
+mapfile -t jobs < <(ls -1 "$(rbv_queue_dir)"/*.job | sort)
+[[ "$(jq -r .kind "${jobs[0]}")" == "bot" ]] && pass "FIFO bot first" || fail "FIFO" "$(jq -r .kind "${jobs[0]}")"
+"$FAKE/bin/rbv-worker.sh"
+shopt -s nullglob
+left_jobs=( "$(rbv_queue_dir)"/*.job )
+left=${#left_jobs[@]}
+shopt -u nullglob
+[[ "$left" == "0" ]] && pass "worker drained" || fail "worker drained" "left=$left"
+rbv_is_tested s1 "k/a.tar.gz" && pass "marked tested a" || fail "marked tested a" "no"
+rbv_is_tested s1 "k/b.tar.gz" && pass "marked tested b" || fail "marked tested b" "no"
+
+# flock: second worker exits 0 while lock held
+rbv_enqueue_instance s1 bot "bot:p:c" "k/c.tar.gz" "k" manual
+lock="$(rbv_work_dir)/locks/worker.lock"
+(
+  exec 9>"$lock"
+  flock -n 9
+  set +e
+  out="$("$FAKE/bin/rbv-worker.sh" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 && "$out" == *"уже работает"* ]] && pass "worker lock" || fail "worker lock" "rc=$rc out=$out"
+)
+"$ROOT/bin/rw-backup-verify" queue clear >/dev/null
+
+echo "==== checks / baseline / tg format ===="
+jq '.checks.bot.backend_ports=false | .checks.panel.stack=false' \
+  "$RBV_CONFIG" > "$T/c3.json" && mv "$T/c3.json" "$RBV_CONFIG"
+rbv_check_enabled bot backend_ports && fail "bot ports off" "on" || pass "bot ports off"
+rbv_check_enabled panel stack && fail "panel stack off" "on" || pass "panel stack off"
+jq '.checks.bot.stability=false | del(.checks.bot.stack)' "$RBV_CONFIG" > "$T/c4.json" && mv "$T/c4.json" "$RBV_CONFIG"
+rbv_check_enabled bot stack && fail "alias stability" "on" || pass "alias stability→stack"
+
+ep="$(rbv_parse_archive_epoch 'remnawave_backup_2026-08-10_03_00_00.tar.gz.age')"
+[[ "$ep" -gt 1000000000 ]] && pass "parse panel.age epoch" || fail "parse panel.age" "$ep"
+ep2="$(rbv_parse_archive_epoch 'custom_bot_x_20260810_030015.tar.gz.age')"
+[[ "$ep2" -gt 1000000000 ]] && pass "parse bot.age epoch" || fail "parse bot.age" "$ep2"
+
+rbv_baseline_save s1 "bot:p:a" '{"user_rows":10,"archive_ts":100}'
+b="$(rbv_baseline_load s1 "bot:p:a")"
+[[ "$(jq -r .user_rows <<<"$b")" == "10" ]] && pass "baseline" || fail "baseline" "$b"
+
+# shellcheck disable=SC2034
+RBV_BUCKET=b
+rbv_checks_init "$T/checks.json"
+rbv_check_add download ok "file.tar.gz"
+rbv_check_add user_rows fail "меньше" "20" "15"
+body="$(rbv_format_tg_report s1 bot "bot:p:a" "pref/x.tar.gz" false)"
+printf '%s\n' "$body" | grep -q 'Хранилище' && pass "tg storage" || fail "tg storage" "missing"
+printf '%s\n' "$body" | grep -q 'Расхождения' && pass "tg diffs" || fail "tg diffs" "missing"
+
+echo "==== help / unknown / save config ===="
+expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help
+expect_rc 1 "unknown cmd" "$ROOT/bin/rw-backup-verify" nosuchcmd
+set +e
+echo 'not-json' | rbv_save_config 2>/dev/null
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]] && pass "save bad json" || fail "save bad json" "rc=0"
+
+echo "==== install.sh syntax / non-root ===="
+bash -n "$ROOT/install.sh" && pass "install bash -n" || fail "install bash -n" "syntax"
+expect_rc 1 "install non-root" bash "$ROOT/install.sh"
+
+echo
+echo "==== ${PASS} passed, ${FAIL} failed ===="
+(( FAIL == 0 ))

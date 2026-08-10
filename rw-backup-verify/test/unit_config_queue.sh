@@ -138,6 +138,7 @@ b="$(rbv_baseline_load s1 "bot:p/A:custom_bot_bot1")"
 
 # check accumulator + tg format
 rbv_checks_init "$T/checks.json"
+# shellcheck disable=SC2034 # читает rbv_format_tg_report
 RBV_BUCKET=b
 rbv_check_add download ok "file.tar.gz"
 rbv_check_add user_rows fail "меньше" "20" "15"

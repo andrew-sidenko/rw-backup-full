@@ -44,6 +44,7 @@ rw-backup-verify schedule set --interval-hours 12
 # или: rw-backup-verify schedule set --times 06:30,18:30
 
 rw-backup-verify telegram set --token <bot> --chat-id <id>
+# алиасы: tel / tg
 rw-backup-verify discover cf-oneok          # что будет тестироваться
 rw-backup-verify run --storage cf-oneok     # сейчас
 ```
@@ -90,7 +91,7 @@ rw-backup-verify run --storage cf-oneok     # сейчас
 ```
 rw-backup-verify storage list|add|remove|show
 rw-backup-verify schedule show|set
-rw-backup-verify telegram set|show
+rw-backup-verify telegram|tel|tg set|show
 rw-backup-verify discover <id> [--all]
 rw-backup-verify run [--due] [--storage ID]
 rw-backup-verify queue status|clear|work
@@ -99,3 +100,10 @@ rw-backup-verify tick
 
 Конфиг: `/etc/rw-backup-verify/config.json`  
 Состояние tested: `/var/lib/rw-backup-verify/tested/<storage>.json`
+
+Тесты (без Docker/S3):
+
+```bash
+bash test/unit_config_queue.sh
+bash test/unit_logic_full.sh
+```

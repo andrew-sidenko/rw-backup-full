@@ -82,9 +82,14 @@ rbv_tg_for_storage() {
 # --- S3 helpers -------------------------------------------------------------
 
 rbv_storage_json() {
-  local sid="$1"
-  jq -c --arg id "$sid" '.storages[] | select(.id==$id)' "$RBV_CONFIG" \
-    || { msg ERR "Хранилище не найдено: $sid"; exit 1; }
+  local sid="$1" j
+  # jq select по пустому совпадению даёт exit 0 и пустой stdout — проверяем явно.
+  j="$(jq -c --arg id "$sid" '.storages[] | select(.id==$id)' "$RBV_CONFIG" 2>/dev/null || true)"
+  if [[ -z "$j" ]]; then
+    msg ERR "Хранилище не найдено: $sid"
+    exit 1
+  fi
+  printf '%s\n' "$j"
 }
 
 rbv_aws_env() {
@@ -153,7 +158,7 @@ rbv_list_all_archive_keys() {
 rbv_discover() {
   local sid="$1"
   local untested_only="${2:-false}"
-  local j key name parent kind family inst latest_line
+  local j key name parent kind family inst
   j="$(rbv_storage_json "$sid")"
   rbv_aws_env "$j"
 
@@ -244,6 +249,10 @@ rbv_global_due() {
 
   interval="$(rbv_cfg '.verify.interval_hours // empty')"
   if [[ -n "$interval" && "$interval" != "null" && "$interval" != "" ]]; then
+    [[ "$interval" =~ ^[1-9][0-9]*$ ]] || {
+      msg ERR "verify.interval_hours должно быть целым > 0 (сейчас: ${interval})"
+      return 1
+    }
     local need=$(( interval * 3600 ))
     (( now_epoch - last >= need )) && return 0
     return 1

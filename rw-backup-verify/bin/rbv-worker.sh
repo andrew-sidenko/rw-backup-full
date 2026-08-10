@@ -22,7 +22,7 @@ if [[ ${#jobs[@]} -eq 0 ]]; then
   exit 0
 fi
 
-IFS=$'\n' sorted=($(printf '%s\n' "${jobs[@]}" | sort)); unset IFS
+mapfile -t sorted < <(printf '%s\n' "${jobs[@]}" | sort)
 
 for job in "${sorted[@]}"; do
   [[ -f "$job" ]] || continue

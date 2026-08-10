@@ -90,11 +90,15 @@ base_name="$(basename "$KEY")"
 if [[ "$ok" == true && "$base_name" == *.age ]]; then
   need age
   AGE_ID="$(rbv_cfg '.age_identity // empty')"
-  if [[ -z "$AGE_ID" ]]; then
+  if [[ -z "$AGE_ID" || "$AGE_ID" == "null" ]]; then
     fail_add "age identity unset"
+    rbv_check_add decrypt fail "age_identity не задан в конфиге"
+  elif ! age -d -i "$AGE_ID" -o "${ARCH_PATH}.dec" "$ARCH_PATH" 2>"${RUN_DIR}/age.err"; then
+    fail_add "age decrypt failed"
+    rbv_check_add decrypt fail "age -d: $(tr '\n' ' ' <"${RUN_DIR}/age.err" | head -c 200)"
   else
-    age -d -i "$AGE_ID" -o "${ARCH_PATH}.dec" "$ARCH_PATH"
     mv -f "${ARCH_PATH}.dec" "$ARCH_PATH"
+    rbv_check_add decrypt ok "age"
   fi
 fi
 
