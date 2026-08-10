@@ -78,14 +78,65 @@ PREV_ARCH_EPOCH="$(jq -r '.archive_ts // 0' <<<"$BASELINE_JSON")"
 PREV_USER_ROWS="$(jq -r '.user_rows // empty' <<<"$BASELINE_JSON")"
 
 # --- download / extract -----------------------------------------------------
+# Кэш архивов: work_dir/cache/archives/<sid>/<hash>.tar.gz — не качаем повторно.
+# Перед скачиванием чистим старые runs/ (архивы уже в cache через hardlink).
 ARCH_PATH="${RUN_DIR}/archive.tar.gz"
 S3_URI="s3://${RBV_BUCKET}/${KEY}"
-rep "download ${S3_URI}"
-if ! rbv_aws s3 cp "$S3_URI" "$ARCH_PATH" --only-show-errors; then
-  fail_add "download failed"
-  rbv_check_add download fail "не скачался ${S3_URI}"
+_keep_runs="$(rbv_cfg '.runs_keep // 2')"
+[[ "$_keep_runs" =~ ^[0-9]+$ ]] || _keep_runs=2
+_pruned="$(rbv_runs_prune "$_keep_runs" || echo 0)"
+_pruned="$(echo "$_pruned" | tr -d '[:space:]')"
+[[ "$_pruned" =~ ^[0-9]+$ ]] || _pruned=0
+if (( _pruned > 0 )); then
+  rep "disk: удалено старых runs=${_pruned} (keep=${_keep_runs}; архивы в cache)"
+fi
+rep "disk: $(rbv_disk_report "$WD")"
+_avail_kb="$(rbv_disk_avail_kb "$WD")"
+if [[ -n "$_avail_kb" && "$_avail_kb" =~ ^[0-9]+$ ]] && (( _avail_kb < 1048576 )); then
+  rep "WARN: свободно <1GiB (${_avail_kb} KiB) — restore/PG могут упасть (ENOSPC)"
+  rep "  подсказка: rw-backup-verify runs prune --keep 0 && docker system prune -af"
+fi
+
+_cache=""
+set +e
+_cache="$(rbv_cache_ensure "$SID" "$KEY")"
+_ce_rc=$?
+set -e
+if [[ $_ce_rc -eq 0 && -n "$_cache" && -s "$_cache" ]]; then
+  rep "download: cache hit $(basename "$KEY") ← ${_cache#"$WD"/}"
+  ln -f "$_cache" "$ARCH_PATH" 2>/dev/null || cp -f "$_cache" "$ARCH_PATH"
+  if [[ -s "$ARCH_PATH" ]]; then
+    rbv_check_add download ok "$(basename "$KEY") (cache)"
+  else
+    fail_add "download failed (cache copy)"
+    rbv_check_add download fail "cache → run copy failed"
+  fi
 else
-  rbv_check_add download ok "$(basename "$KEY")"
+  rep "download ${S3_URI}"
+  _cache="$(rbv_archive_cache_path "$SID" "$KEY")"
+  set +e
+  rbv_aws s3 cp "$S3_URI" "$_cache" --only-show-errors 2>"${RUN_DIR}/download.err"
+  _dl_rc=$?
+  set -e
+  if [[ $_dl_rc -ne 0 || ! -s "$_cache" ]]; then
+    _err="$(tr '\n' ' ' <"${RUN_DIR}/download.err" 2>/dev/null | head -c 300)"
+    if grep -qiE 'No space left|ENOSPC|errno 28' "${RUN_DIR}/download.err" 2>/dev/null; then
+      fail_add "download failed: диск заполнен (ENOSPC)"
+      rbv_check_add download fail "ENOSPC — runs prune / docker prune"
+      rep "  ${_err}"
+      rep "  → rw-backup-verify runs prune --keep 0"
+      rep "  → docker system prune -af"
+    else
+      fail_add "download failed"
+      rbv_check_add download fail "не скачался ${S3_URI}"
+      [[ -n "$_err" ]] && rep "  ${_err}"
+    fi
+    rm -f "$_cache" 2>/dev/null || true
+  else
+    printf '%s\n' "$KEY" >"${_cache}.key"
+    ln -f "$_cache" "$ARCH_PATH" 2>/dev/null || cp -f "$_cache" "$ARCH_PATH"
+    rbv_check_add download ok "$(basename "$KEY")"
+  fi
 fi
 
 base_name="$(basename "$KEY")"

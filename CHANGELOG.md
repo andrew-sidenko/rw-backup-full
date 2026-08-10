@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.6.25 (2026-08-10)
+
+### Добавлено (`rw-backup-verify`)
+- **Кэш архивов** `work_dir/cache/archives/` — повторный `run` не качает S3 при cache hit
+  (hardlink; adopt из старых `runs/` по `key=` в report).
+- **`runs prune [--keep N]`** / **`cache list|clear`**: освободить диск, оставив архивы в cache.
+- Авто-prune старых runs при `run` / `run-one` (`runs_keep`, default 2).
+- Явный FAIL при ENOSPC с подсказкой prune.
+
 ## v5.6.24 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)

@@ -30,9 +30,12 @@ rw-backup-verify — автономная проверка логических 
   run --storage ID                  # только одно хранилище (с пошаговым логом)
   queue status|clear|work
   tested list <id> | clear <id> [--key KEY]
+  runs prune [--keep N]             # удалить старые runs/ (архивы → cache, default keep=2)
+  cache list | clear                # кэш скачанных архивов (без повторного S3 cp)
   tick                              # systemd: если глобально due → run --due
 
 Логи ручного run: work_dir/logs/run_*.log и work_dir/runs/<id>/
+Кэш архивов: work_dir/cache/archives/ — повторные прогоны не качают S3 заново.
 Глубокий обход: любые вложенные папки; в каждой — экземпляры panel/bot
 (по семейству имён). Тестируется только latest каждого экземпляра,
 если этот архив ещё не был в tested/.
@@ -221,6 +224,13 @@ case "$cmd" in
     msg INFO "=== run start reason=${reason} storage=${ONLY:-ALL} ==="
     msg INFO "лог: ${RBV_LOG}"
     msg INFO "work_dir: ${WD}"
+    _keep="$(rbv_cfg '.runs_keep // 2')"
+    [[ "$_keep" =~ ^[0-9]+$ ]] || _keep=2
+    _n="$(rbv_runs_prune "$_keep" || echo 0)"
+    _n="$(echo "$_n" | tr -d '[:space:]')"
+    [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
+    (( _n > 0 )) && msg INFO "очистка runs: удалено ${_n} (keep=${_keep}, архивы в cache)"
+    msg INFO "disk: $(rbv_disk_report "$WD")"
 
     if [[ "$DUE" == true ]]; then
       msg INFO "шаг: проверка глобального расписания"
@@ -349,6 +359,57 @@ case "$cmd" in
         fi
         ;;
       *) msg ERR "tested: list|clear"; exit 1 ;;
+    esac
+    ;;
+
+  runs)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      prune)
+        keep=2
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --keep) keep="$2"; shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        WD="$(rbv_work_dir)"
+        before="$(rbv_disk_avail_kb "$WD")"
+        n="$(rbv_runs_prune "$keep")"
+        after="$(rbv_disk_avail_kb "$WD")"
+        msg OK "runs prune: удалено ${n}, keep=${keep}"
+        msg INFO "disk: $(rbv_disk_report "$WD")"
+        if [[ -n "$before" && -n "$after" ]]; then
+          msg INFO "свободно было ${before} KiB → стало ${after} KiB"
+        fi
+        msg INFO "кэш архивов: ${WD}/cache/archives/ (S3 не потребуется при cache hit)"
+        ;;
+      *) msg ERR "runs: prune [--keep N]"; exit 1 ;;
+    esac
+    ;;
+
+  cache)
+    sub="${1:-list}"; shift || true
+    WD="$(rbv_work_dir)"
+    cdir="${WD}/cache/archives"
+    case "$sub" in
+      list)
+        if [[ ! -d "$cdir" ]] || [[ -z "$(find "$cdir" -type f -name '*.tar.gz' 2>/dev/null | head -n1)" ]]; then
+          echo "(пусто — $cdir)"
+        else
+          find "$cdir" -type f -name '*.tar.gz' 2>/dev/null | while IFS= read -r p; do
+            sz="$(wc -c <"$p" | tr -d ' ')"
+            k=""; [[ -f "${p}.key" ]] && k="$(head -n1 "${p}.key")"
+            printf '%s\t%s\t%s\n' "$sz" "${k:-?}" "$p"
+          done
+        fi
+        ;;
+      clear)
+        rm -rf "${cdir:?}"
+        mkdir -p "$cdir"
+        msg OK "Очищен cache: $cdir"
+        ;;
+      *) msg ERR "cache: list|clear"; exit 1 ;;
     esac
     ;;
 

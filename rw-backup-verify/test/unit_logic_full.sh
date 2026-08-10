@@ -402,6 +402,29 @@ grep -q 'shm-size' "$ROOT/bin/rbv-run-one.sh" && pass "pg shm-size" || fail "pg 
 grep -q 'OOMKilled' "$ROOT/bin/rbv-run-one.sh" && pass "pg OOM diag" || fail "pg OOM diag" "missing"
 grep -q 'rbv_pg_start' "$ROOT/bin/rbv-run-one.sh" && pass "pg start helper" || fail "pg start helper" "missing"
 
+# archive cache + runs prune (изолированный каталог runs)
+_rs="$T/state/runs"
+rm -rf "$_rs"
+mkdir -p "$_rs/oldrun" "$_rs/newrun"
+printf 'storage=s1 kind=bot\nkey=pref/a.tar.gz parent=pref\n' >"$_rs/oldrun/report.txt"
+printf 'xxxx' >"$_rs/oldrun/archive.tar.gz"
+printf 'storage=s1 kind=panel\nkey=pref/b.tar.gz parent=pref\n' >"$_rs/newrun/report.txt"
+printf 'yyyy' >"$_rs/newrun/archive.tar.gz"
+# newrun новее
+sleep 1
+touch "$_rs/newrun"
+before_n="$(ls -1d "$_rs"/*/ 2>/dev/null | wc -l | tr -d ' ')"
+n="$(rbv_runs_prune 1)"
+n="$(echo "$n" | tr -d '[:space:]')"
+after_n="$(ls -1d "$_rs"/*/ 2>/dev/null | wc -l | tr -d ' ')"
+[[ "$n" == "$((before_n - 1))" && "$after_n" == "1" ]] && pass "runs prune keep1" || fail "runs prune keep1" "n=$n before=$before_n after=$after_n"
+[[ ! -d "$_rs/oldrun" ]] && pass "runs prune old gone" || fail "runs prune old gone" "still there"
+[[ -d "$_rs/newrun" ]] && pass "runs prune new kept" || fail "runs prune new kept" "missing"
+cpath="$(rbv_cache_ensure s1 'pref/a.tar.gz' || true)"
+[[ -n "$cpath" && -s "$cpath" ]] && pass "cache adopt old archive" || fail "cache adopt" "cpath=$cpath"
+c2="$(rbv_cache_ensure s1 'pref/a.tar.gz')"
+[[ "$c2" == "$cpath" ]] && pass "cache hit path" || fail "cache hit path" "$c2"
+
 echo "==== help / unknown / save config ===="
 expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help
 expect_rc 1 "unknown cmd" "$ROOT/bin/rw-backup-verify" nosuchcmd

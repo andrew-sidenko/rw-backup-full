@@ -110,4 +110,11 @@ bash test/unit_logic_full.sh
 
 Ручной `run` пишет шаги в stderr и в `work_dir/logs/run_*.log`
 (по умолчанию `/var/lib/rw-backup-verify/logs/`). Отчёты прогонов —
-`work_dir/runs/<id>/`.
+`work_dir/runs/<id>/`. Архивы кэшируются в `work_dir/cache/archives/`
+(повторный прогон не качает S3). Освободить диск:
+
+```bash
+rw-backup-verify runs prune --keep 0   # архивы остаются в cache
+rw-backup-verify cache list
+# при необходимости: docker system prune -af
+```

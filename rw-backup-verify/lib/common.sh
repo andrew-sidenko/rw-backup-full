@@ -43,8 +43,158 @@ rbv_work_dir() {
   else
     d="$(rbv_cfg '.work_dir // "/var/lib/rw-backup-verify"')"
   fi
-  mkdir -p "$d"/{queue,runs,locks,cache,tested}
+  mkdir -p "$d"/{queue,runs,locks,cache,tested,cache/archives}
   printf '%s\n' "$d"
+}
+
+# --- Archive cache / disk ---------------------------------------------------
+
+# Стабильный id ключа S3 → имя файла в cache/archives/<sid>/<id>.tar.gz
+rbv_cache_key_id() {
+  printf '%s' "$1" | sha256sum 2>/dev/null | awk '{print $1}' \
+    || printf '%s' "$1" | md5sum 2>/dev/null | awk '{print $1}' \
+    || printf '%s' "$1" | cksum | awk '{print $1}'
+}
+
+rbv_archive_cache_path() {
+  local sid="$1" key="$2" wd id
+  wd="$(rbv_work_dir)"
+  id="$(rbv_cache_key_id "$key")"
+  mkdir -p "${wd}/cache/archives/${sid}"
+  printf '%s/cache/archives/%s/%s.tar.gz\n' "$wd" "$sid" "$id"
+}
+
+rbv_disk_avail_kb() {
+  local p="${1:-/}"
+  df -Pk "$p" 2>/dev/null | awk 'NR==2{print $4}'
+}
+
+# Скопировать/hardlink найденные archive.tar.gz из runs/ в cache (по key= в report.txt).
+# Возвращает путь кэша если удалось обеспечить файл для $key; иначе пусто.
+rbv_cache_ensure() {
+  local sid="$1" key="$2"
+  local dest wd d arch line
+  dest="$(rbv_archive_cache_path "$sid" "$key")"
+  if [[ -s "$dest" ]]; then
+    printf '%s\n' "$dest"
+    return 0
+  fi
+  wd="$(rbv_work_dir)"
+  # 1) runs с тем же key в report
+  for d in "$wd"/runs/*/; do
+    [[ -d "$d" ]] || continue
+    arch="${d}archive.tar.gz"
+    [[ -s "$arch" ]] || continue
+    if [[ -f "${d}report.txt" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          "key=${key} "*|"key=${key}")
+            ln -f "$arch" "$dest" 2>/dev/null || cp -f "$arch" "$dest"
+            if [[ -s "$dest" ]]; then
+              printf '%s\n' "$key" >"${dest}.key"
+              printf '%s\n' "$dest"
+              return 0
+            fi
+            ;;
+        esac
+      done <"${d}report.txt"
+    fi
+  done
+  # 2) fallback: единственный archive с тем же basename в runs
+  local bn hits=0 hit=""
+  bn="$(basename "$key")"
+  bn="${bn%.age}"
+  for d in "$wd"/runs/*/; do
+    arch="${d}archive.tar.gz"
+    [[ -s "$arch" ]] || continue
+    # грубая эвристика: report содержит basename
+    if [[ -f "${d}report.txt" ]] && grep -Fq "$bn" "${d}report.txt" 2>/dev/null; then
+      hits=$((hits + 1))
+      hit="$arch"
+    fi
+  done
+  if [[ "$hits" -eq 1 && -n "$hit" ]]; then
+    ln -f "$hit" "$dest" 2>/dev/null || cp -f "$hit" "$dest"
+    if [[ -s "$dest" ]]; then
+      printf '%s\n' "$key" >"${dest}.key"
+      printf '%s\n' "$dest"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Перед удалением runs — перенести все архивы в cache (hardlink).
+rbv_cache_adopt_all_runs() {
+  local wd d arch line key sid dest
+  wd="$(rbv_work_dir)"
+  for d in "$wd"/runs/*/; do
+    [[ -d "$d" ]] || continue
+    arch="${d}archive.tar.gz"
+    [[ -s "$arch" ]] || continue
+    key=""
+    if [[ -f "${d}report.txt" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          key=*)
+            key="${line#key=}"
+            key="${key%% *}"
+            break
+            ;;
+        esac
+      done <"${d}report.txt"
+    fi
+    [[ -n "$key" ]] || continue
+    # sid из имени run или storage= в report
+    sid=""
+    if [[ -f "${d}report.txt" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          storage=*)
+            sid="${line#storage=}"
+            sid="${sid%% *}"
+            break
+            ;;
+        esac
+      done <"${d}report.txt"
+    fi
+    [[ -n "$sid" ]] || sid="_unknown"
+    dest="$(rbv_archive_cache_path "$sid" "$key")"
+    if [[ ! -s "$dest" ]]; then
+      ln -f "$arch" "$dest" 2>/dev/null || cp -f "$arch" "$dest" 2>/dev/null || true
+      [[ -s "$dest" ]] && printf '%s\n' "$key" >"${dest}.key"
+    fi
+  done
+}
+
+# Удалить старые runs/, оставив N новейших. Сначала adopt архивов в cache.
+# stdout: сколько удалено.
+rbv_runs_prune() {
+  local keep="${1:-2}"
+  local wd runs_dir n=0 i=0 d
+  wd="$(rbv_work_dir)"
+  runs_dir="${wd}/runs"
+  [[ -d "$runs_dir" ]] || { echo 0; return 0; }
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=2
+  rbv_cache_adopt_all_runs
+  i=0
+  n=0
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    # ls -1dt даёт trailing /
+    d="${d%/}"
+    i=$((i + 1))
+    if (( i > keep )); then
+      rm -rf "$d"
+      n=$((n + 1))
+    fi
+  done < <(ls -1dt "$runs_dir"/*/ 2>/dev/null || true)
+  echo "$n"
+}
+
+rbv_disk_report() {
+  local p="${1:-$(rbv_work_dir)}"
+  df -h "$p" 2>/dev/null | tail -n1 || true
 }
 
 # --- Telegram ---------------------------------------------------------------
