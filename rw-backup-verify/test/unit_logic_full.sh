@@ -418,6 +418,15 @@ echo 'METRICS_PASS: abcdefghijklmnop' | rbv_mask_secrets | grep -q '\*\*\*' && p
 grep -q 'rbv_preflight_isolation' "$ROOT/lib/checks.sh" && pass "preflight isolation fn" || fail "preflight isolation fn" "missing"
 grep -q 'preflight: isolation' "$ROOT/bin/rbv-run-one.sh" && pass "preflight in run-one" || fail "preflight in run-one" "missing"
 grep -q 'check isolation (до stability)' "$ROOT/bin/rbv-run-one.sh" && pass "isolation before stability" || fail "isolation before stability" "missing"
+grep -q 'rbv_run_slim' "$ROOT/bin/rbv-run-one.sh" && pass "run slim on cleanup" || fail "run slim on cleanup" "missing"
+grep -q 'rbv_ensure_disk_kb' "$ROOT/bin/rbv-run-one.sh" && pass "disk gate before restore" || fail "disk gate" "missing"
+
+# run slim keeps report, drops extract
+_sl="$T/slimrun"; mkdir -p "$_sl/extract" "$_sl/project_extract"
+echo report >"$_sl/report.txt"
+echo dump >"$_sl/extract/x.sql.gz"
+rbv_run_slim "$_sl"
+[[ -f "$_sl/report.txt" && ! -d "$_sl/extract" ]] && pass "run slim keeps report" || fail "run slim" "extract still there"
 
 # archive cache + runs prune (изолированный каталог runs)
 _rs="$T/state/runs"

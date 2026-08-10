@@ -168,21 +168,27 @@ rbv_cache_adopt_all_runs() {
 }
 
 # Удалить старые runs/, оставив N новейших. Сначала adopt архивов в cache.
+# $1=keep $2=optional protect dir (никогда не удалять).
 # stdout: сколько удалено.
 rbv_runs_prune() {
   local keep="${1:-2}"
+  local protect="${2:-${RBV_PROTECT_RUN:-}}"
   local wd runs_dir n=0 i=0 d
   wd="$(rbv_work_dir)"
   runs_dir="${wd}/runs"
   [[ -d "$runs_dir" ]] || { echo 0; return 0; }
   [[ "$keep" =~ ^[0-9]+$ ]] || keep=2
+  protect="${protect%/}"
   rbv_cache_adopt_all_runs
   i=0
   n=0
   while IFS= read -r d; do
     [[ -n "$d" ]] || continue
-    # ls -1dt даёт trailing /
     d="${d%/}"
+    if [[ -n "$protect" && "$d" == "$protect" ]]; then
+      i=$((i + 1))
+      continue
+    fi
     i=$((i + 1))
     if (( i > keep )); then
       rm -rf "$d"
@@ -195,6 +201,58 @@ rbv_runs_prune() {
 rbv_disk_report() {
   local p="${1:-$(rbv_work_dir)}"
   df -h "$p" 2>/dev/null | tail -n1 || true
+}
+
+# Удалить тяжёлые артефакты прогона (дамп/extract), оставить report/compose/checks.
+# Архив в cache/ не трогаем (hardlink).
+rbv_run_slim() {
+  local d="${1:?}"
+  [[ -d "$d" ]] || return 0
+  rm -rf "${d}/extract" "${d}/project_extract" "${d}/project" 2>/dev/null || true
+  rm -f "${d}/archive.tar.gz" 2>/dev/null || true
+  find "$d" -maxdepth 3 -type f \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.rdb' -o -name '*.tar' \) \
+    ! -name 'compose.*' -delete 2>/dev/null || true
+}
+
+# Slim всех runs кроме protect (текущий RUN_DIR).
+rbv_slim_old_runs() {
+  local protect="${1:-}"
+  local wd d
+  wd="$(rbv_work_dir)"
+  for d in "$wd"/runs/*/; do
+    [[ -d "$d" ]] || continue
+    d="${d%/}"
+    if [[ -n "$protect" ]]; then
+      [[ "$d" == "$protect" ]] && continue
+    fi
+    rbv_run_slim "$d"
+  done
+}
+
+# Нужно ≥ need_kb свободно под restore. При нехватке — slim + prune.
+# $1=need_kb $2=protect_run_dir
+# rc=0 если после попыток хватает (или need неизвестен); rc=1 если всё ещё мало.
+rbv_ensure_disk_kb() {
+  local need="${1:-3145728}" protect="${2:-}"
+  local wd avail
+  wd="$(rbv_work_dir)"
+  [[ "$need" =~ ^[0-9]+$ ]] || need=3145728
+  avail="$(rbv_disk_avail_kb "$wd")"
+  [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+  if (( avail >= need )); then
+    return 0
+  fi
+  msg WARN "disk: свободно ${avail} KiB < нужно ${need} KiB — slim/prune"
+  rbv_slim_old_runs "$protect"
+  # оставить только текущий run (+0 старых)
+  rbv_runs_prune 1 >/dev/null || true
+  # если protect не самый новый — prune мог его удалить; не удаляем protect явно в prune
+  avail="$(rbv_disk_avail_kb "$wd")"
+  [[ "$avail" =~ ^[0-9]+$ ]] || return 0
+  if (( avail >= need )); then
+    return 0
+  fi
+  return 1
 }
 
 # Собрать env для `docker compose config`: .env + значения из дерева проекта

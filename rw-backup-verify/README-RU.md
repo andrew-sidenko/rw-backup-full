@@ -127,3 +127,6 @@ rw-backup-verify runs prune --keep 0   # архивы остаются в cache
 rw-backup-verify cache list
 # при необходимости: docker system prune -af
 ```
+
+После каждого job тяжёлые `extract/`/sql из `runs/<id>/` удаляются автоматически
+(остаются report + compose.*); перед большим restore проверяется ≥3 GiB свободно.

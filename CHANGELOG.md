@@ -1,5 +1,15 @@
 # Changelog
 
+## v5.6.29 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Panel empty schema / 100+ FK ERROR после bot**: диск забивался extract/sql
+  предыдущего job (1.9 GiB свободно). Теперь:
+  - после каждого job — `rbv_run_slim` (report/compose остаются, dump/extract нет);
+  - slim старых runs при старте;
+  - перед restore — gate ≥max(3 GiB, 4×sql.gz), иначе prune;
+  - retry restore при пустой schema + много ERROR.
+
 ## v5.6.28 (2026-08-10)
 
 ### Изменено (`rw-backup-verify`)

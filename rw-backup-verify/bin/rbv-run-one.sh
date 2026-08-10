@@ -63,9 +63,16 @@ cleanup() {
     fi
     [[ -n "${NET_NAME}" ]] && docker network rm "$NET_NAME" >/dev/null 2>&1 || true
     [[ -n "${PG_CID}" ]] && docker rm -f "$PG_CID" >/dev/null 2>&1 || true
+    # освободить диск для следующего job: dump/extract убрать, report/compose оставить
+    if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR}" ]]; then
+      rbv_run_slim "$RUN_DIR"
+    fi
   fi
 }
 trap cleanup EXIT
+
+# не дать prune снести текущий run
+export RBV_PROTECT_RUN="$RUN_DIR"
 
 rep "=== rw-backup-verify ==="
 rep "storage=${SID} kind=${KIND} instance=${INST}"
@@ -110,17 +117,18 @@ ARCH_PATH="${RUN_DIR}/archive.tar.gz"
 S3_URI="s3://${RBV_BUCKET}/${KEY}"
 _keep_runs="$(rbv_cfg '.runs_keep // 2')"
 [[ "$_keep_runs" =~ ^[0-9]+$ ]] || _keep_runs=2
-_pruned="$(rbv_runs_prune "$_keep_runs" || echo 0)"
+_pruned="$(rbv_runs_prune "$_keep_runs" "$RUN_DIR" || echo 0)"
 _pruned="$(echo "$_pruned" | tr -d '[:space:]')"
 [[ "$_pruned" =~ ^[0-9]+$ ]] || _pruned=0
 if (( _pruned > 0 )); then
   rep "disk: удалено старых runs=${_pruned} (keep=${_keep_runs}; архивы в cache)"
 fi
+# у старых runs убрать extract/sql — иначе после bot не хватит места на panel
+rbv_slim_old_runs "$RUN_DIR"
 rep "disk: $(rbv_disk_report "$WD")"
 _avail_kb="$(rbv_disk_avail_kb "$WD")"
-if [[ -n "$_avail_kb" && "$_avail_kb" =~ ^[0-9]+$ ]] && (( _avail_kb < 1048576 )); then
-  rep "WARN: свободно <1GiB (${_avail_kb} KiB) — restore/PG могут упасть (ENOSPC)"
-  rep "  подсказка: rw-backup-verify runs prune --keep 0 && docker system prune -af"
+if [[ -n "$_avail_kb" && "$_avail_kb" =~ ^[0-9]+$ ]] && (( _avail_kb < 2097152 )); then
+  rep "WARN: свободно <2GiB (${_avail_kb} KiB) — перед restore будет жёсткий prune"
 fi
 
 _cache=""
@@ -358,10 +366,27 @@ if [[ "$ok" == true ]]; then
   PG_CID="rbv_pg_${RUN_ID}"
   ready=false
   accept=false
-  if rbv_pg_start init; then
+
+  # место под restore: ~4× размер .sql.gz, минимум 3GiB
+  _sql_b=0
+  [[ -n "${SQL:-}" && -f "${SQL:-}" ]] && _sql_b="$(stat -c%s "$SQL" 2>/dev/null || wc -c <"$SQL" | tr -d ' ')"
+  _need_kb=3145728
+  if [[ "$_sql_b" =~ ^[0-9]+$ ]] && (( _sql_b > 0 )); then
+    _need_kb=$(( _sql_b * 4 / 1024 ))
+    (( _need_kb < 3145728 )) && _need_kb=3145728
+  fi
+  if ! rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR"; then
+    _av="$(rbv_disk_avail_kb "$WD")"
+    fail_add "мало места на диске (avail=${_av:-?}KiB need=${_need_kb}KiB)"
+    rbv_check_add db_schema fail "ENOSPC: свободно ${_av:-?} KiB, нужно ≥${_need_kb}"
+    rep "FAIL disk: $(rbv_disk_report "$WD")"
+    rep "  → rw-backup-verify runs prune --keep 0 && docker system prune -af"
+  fi
+
+  if [[ "$ok" == true ]] && rbv_pg_start init; then
     ready=true
     accept=true
-  else
+  elif [[ "$ok" == true ]]; then
     fail_add "postgres not ready"
   fi
 
@@ -399,29 +424,29 @@ if [[ "$ok" == true ]]; then
         rep "psql restore: OOM/SIGKILL/dead rc=${_psql_rc} oom=${_oom} (попытка ${_attempt}/${_max_restore})"
         rbv_pg_diag "oom-${_attempt}"
         if (( _attempt < _max_restore )); then
+          rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR" || true
           rep "psql restore: recreate PG и повтор…"
           rbv_pg_start "retry-${_attempt}" || true
           continue
         fi
         break
       fi
-      if grep -qiE 'starting up|connection.*failed|server closed|the database system is shutting down' \
+      if grep -qiE 'starting up|connection.*failed|server closed|the database system is shutting down|No space left|ENOSPC' \
            "${RUN_DIR}/psql.err" 2>/dev/null; then
-        rep "psql restore: соединение оборвалось (попытка ${_attempt}/${_max_restore}) — recreate"
+        rep "psql restore: соединение/диск (попытка ${_attempt}/${_max_restore}) — recreate"
         rbv_pg_diag "conn-${_attempt}"
         if (( _attempt < _max_restore )); then
+          rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR" || true
           rbv_pg_start "retry-${_attempt}" || true
           continue
         fi
         break
       fi
-      # успех или «обычные» ERROR в дампе (DROP ROLE и т.п.) — не ретраим
       break
     done
     kill "$_hb" 2>/dev/null || true
     wait "$_hb" 2>/dev/null || true
     rep "psql restore: rc=${_psql_rc}"
-    # grep -c → 0 + exit 1; НЕ делать «|| echo 0» (склеит 00)
     sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || true)"
     sql_errs="$(echo "${sql_errs:-0}" | tr -d '[:space:]')"
     [[ "$sql_errs" =~ ^[0-9]+$ ]] || sql_errs=0
@@ -429,7 +454,6 @@ if [[ "$ok" == true ]]; then
       rep "psql restore: ERROR-строк=${sql_errs} (см. ${RUN_DIR}/psql.err)"
     fi
 
-    # Дампы ботов часто создают отдельную БД — ищем таблицы везде
     if rbv_pg_alive; then
       DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
       DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
@@ -439,22 +463,51 @@ if [[ "$ok" == true ]]; then
       RBV_PG_DB="postgres"
       rbv_pg_diag "post-restore-dead"
     fi
+
+    # много ERROR + пустая схема часто = ENOSPC/обрыв — один полный retry
+    if (( DB_TABLES < 1 )) && (( sql_errs > 20 || _psql_rc != 0 )) && rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR"; then
+      rep "psql restore: schema пуста (errors=${sql_errs}) — полный retry на чистом PG"
+      if rbv_pg_start "schema-retry"; then
+        : >"${RUN_DIR}/psql.err"
+        set +e
+        gzip -dc "$SQL" | docker exec -i "$PG_CID" \
+          psql -q -U postgres -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err"
+        _psql_rc=$?
+        set -e
+        rep "psql restore retry: rc=${_psql_rc}"
+        sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || true)"
+        sql_errs="$(echo "${sql_errs:-0}" | tr -d '[:space:]')"
+        [[ "$sql_errs" =~ ^[0-9]+$ ]] || sql_errs=0
+        if rbv_pg_alive; then
+          DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
+          DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
+          [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
+        fi
+        rep "psql restore retry: ERROR-строк=${sql_errs} tables=${DB_TABLES}"
+      fi
+    fi
+
     rep "db_schema: db=${RBV_PG_DB:-postgres} user_tables=${DB_TABLES}"
     if (( DB_TABLES < 1 )); then
       dbs="?"
       if rbv_pg_alive; then
         dbs="$(docker exec "$PG_CID" psql -U postgres -d postgres -Atc \
           "SELECT string_agg(datname, ',') FROM pg_database WHERE NOT datistemplate" 2>/dev/null || echo "?")"
+      else
+        rbv_pg_diag "empty-schema-dead"
       fi
       _extra=""
       [[ ${_psql_rc:-1} -eq 137 ]] && _extra=" OOM/SIGKILL(rc=137)"
+      grep -qiE 'No space left|ENOSPC' "${RUN_DIR}/psql.err" 2>/dev/null && _extra="${_extra} ENOSPC"
+      _av="$(rbv_disk_avail_kb "$WD")"
       fail_add "empty schema (dbs=${dbs} sql_errors=${sql_errs}${_extra})"
-      rbv_check_add db_schema fail "user tables=0 (dbs=${dbs}, sql_errors=${sql_errs}${_extra})"
+      rbv_check_add db_schema fail "user tables=0 (dbs=${dbs}, sql_errors=${sql_errs}${_extra}, disk=${_av:-?}KiB)"
       if [[ -s "${RUN_DIR}/psql.err" ]]; then
         rep "----- psql.err (tail) -----"
         tail -n 15 "${RUN_DIR}/psql.err" | while IFS= read -r _line; do rep "  ${_line}"; done
         rep "----- end -----"
       fi
+      rep "disk now: $(rbv_disk_report "$WD")"
     else
       rbv_check_add db_schema ok "db=${RBV_PG_DB} tables=${DB_TABLES}"
     fi
