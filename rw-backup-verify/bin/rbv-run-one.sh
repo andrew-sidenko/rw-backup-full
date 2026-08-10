@@ -147,8 +147,10 @@ if [[ "$ok" == true ]]; then
     if [[ -n "$DIR_TAR" ]]; then
       pe="${RUN_DIR}/project_extract"
       mkdir -p "$pe"
+      rep "extract project_dir.tar.gz…"
       tar -xzf "$DIR_TAR" -C "$pe"
-      project_top="$(tar -tzf "$DIR_TAR" | head -n1 | cut -d/ -f1)"
+      # pipefail+head → SIGPIPE(141) у tar; || true обязателен
+      project_top="$(tar -tzf "$DIR_TAR" 2>/dev/null | head -n1 | cut -d/ -f1 || true)"
       if [[ -n "$project_top" && -d "$pe/$project_top" ]]; then
         PROJ_DIR="$pe/$project_top"
       else
@@ -159,27 +161,57 @@ if [[ "$ok" == true ]]; then
         cp -f "$REDIS_RDB" "${PROJ_DIR}/volumes/redis/dump.rdb"
         chmod 644 "${PROJ_DIR}/volumes/redis/dump.rdb" || true
       fi
+      rep "project_dir=${PROJ_DIR}"
     fi
   fi
   [[ -n "$SQL" ]] || fail_add "no sql dump"
+  [[ -n "$SQL" ]] && rep "sql_dump=$(basename "$SQL") size=$(du -h "$SQL" 2>/dev/null | awk '{print $1}')"
 fi
 
 # --- DB restore + data checks -----------------------------------------------
 DB_TABLES=0
 if [[ "$ok" == true ]]; then
   PG_CID="rbv_pg_${RUN_ID}"
+  rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID}"
   docker rm -f "$PG_CID" >/dev/null 2>&1 || true
+  # stdout глушим, stderr оставляем — прогресс docker pull виден
   docker run -d --name "$PG_CID" -e POSTGRES_HOST_AUTH_METHOD=trust \
     "postgres:${PG_VER}-alpine" >/dev/null
-  for _ in $(seq 1 60); do
-    docker exec "$PG_CID" pg_isready -U postgres >/dev/null 2>&1 && break
+  rep "postgres: жду pg_isready (до 60с)…"
+  ready=false
+  for i in $(seq 1 60); do
+    if docker exec "$PG_CID" pg_isready -U postgres >/dev/null 2>&1; then
+      ready=true
+      rep "postgres: ready (${i}с)"
+      break
+    fi
+    if (( i % 10 == 0 )); then
+      rep "postgres: ещё не ready (${i}/60с)…"
+    fi
     sleep 1
   done
-  if ! docker exec "$PG_CID" pg_isready -U postgres >/dev/null 2>&1; then
+  if [[ "$ready" != true ]]; then
     fail_add "postgres not ready"
   else
+    sql_sz="$(du -h "$SQL" 2>/dev/null | awk '{print $1}')"
+    rep "psql restore: $(basename "$SQL") (${sql_sz}) — может занять минуты"
+    # heartbeat пока идёт restore
+    (
+      t=0
+      while sleep 15; do
+        t=$((t + 15))
+        printf '%s\n' "psql restore: ещё работает… ${t}с" | tee -a "$REPORT" >&2
+      done
+    ) &
+    _hb=$!
+    set +e
     gzip -dc "$SQL" | docker exec -i "$PG_CID" \
-      psql -q -U postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err" || true
+      psql -q -U postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err"
+    _psql_rc=$?
+    set -e
+    kill "$_hb" 2>/dev/null || true
+    wait "$_hb" 2>/dev/null || true
+    rep "psql restore: rc=${_psql_rc}"
     DB_TABLES="$(rbv_psql "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")"
     DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
     [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
@@ -188,6 +220,7 @@ if [[ "$ok" == true ]]; then
       rbv_check_add db_schema fail "public tables=0"
     else
       rbv_check_add db_schema ok "tables=${DB_TABLES}"
+      rep "db_schema: tables=${DB_TABLES}"
     fi
 
     # user_rows: не пусто + ≥ предыдущей проверки (один toggle)
@@ -213,6 +246,7 @@ if [[ "$ok" == true ]]; then
           rbv_check_add user_rows ok \
             "users(${utbl})=${USER_ROWS} (первый baseline)" "" "$USER_ROWS"
         fi
+        rep "user_rows=${USER_ROWS} table=${utbl:-?}"
       fi
     fi
 
@@ -243,6 +277,7 @@ if [[ "$ok" == true ]]; then
             "prev_arch=${PREV_ARCH_EPOCH}" "event=${LAST_EVENT}/arch=${CURR_ARCH_EPOCH}"
         fi
       fi
+      rep "event_freshness: last_event=${LAST_EVENT:-0}"
     fi
   fi
 fi
@@ -261,7 +296,9 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
   done
   if [[ -z "$CF" ]]; then
     rbv_check_add stack skip "compose не найден"
+    rep "stack: compose не найден — skip"
   else
+    rep "stack: compose=${CF}"
     NET_NAME="rbv_net_${RUN_ID}"
     docker network create --internal "$NET_NAME" >/dev/null
     COMPOSE_FILE="${RUN_DIR}/compose.isolated.yml"
@@ -301,6 +338,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         "$NET_NAME" "$PG_CID" 2>/dev/null \
         || docker network connect "$NET_NAME" "$PG_CID" || true
 
+      rep "stack: compose up -d (сеть ${NET_NAME})…"
       set +e
       docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" up -d --no-build \
         2>"${RUN_DIR}/compose.up.err"
@@ -312,11 +350,20 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         rbv_check_add stack fail "$STACK_DETAIL: $(tail -n2 "${RUN_DIR}/compose.up.err" | tr '\n' ' ')"
         fail_add "stack up failed"
       else
-        sleep "$SETTLE"
+        rep "stack: settle ${SETTLE}с…"
+        _left="$SETTLE"
+        while (( _left > 0 )); do
+          _step=5
+          (( _left < _step )) && _step=$_left
+          sleep "$_step"
+          _left=$((_left - _step))
+          (( _left > 0 )) && rep "stack: settle, осталось ~${_left}с"
+        done
         running="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
         total="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | wc -l | tr -d ' ')"
         STACK_DETAIL="containers ${running}/${total}"
         SAMPLE_CID="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | head -n1 || true)"
+        rep "stack: после settle ${STACK_DETAIL}"
         if [[ "${running:-0}" -lt 1 ]]; then
           STACK_OK="fail"
           rbv_check_add stack fail "после up: $STACK_DETAIL"
@@ -325,6 +372,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           STACK_OK="ok"
           # подъём + окно без падений — одна проверка stack
           stab="$(rbv_stability_sec)"
+          rep "stack: stability window ${stab}с…"
           if ! rbv_check_stability "rbv_${RUN_ID}" "$COMPOSE_FILE" "$stab"; then
             STACK_OK="fail"
             fail_add "stack stability"
@@ -332,6 +380,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         fi
 
         if rbv_check_enabled "$KIND" isolation; then
+          rep "check isolation…"
           if ! rbv_check_isolation "$SAMPLE_CID"; then
             fail_add "isolation leak"
           fi
@@ -340,6 +389,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         fi
 
         if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" backend_ports; then
+          rep "check backend_ports…"
           if ! rbv_check_backend_ports "$NET_NAME" "$COMPOSE_RAW" "rbv_${RUN_ID}"; then
             fail_add "backend_ports"
           fi
@@ -350,10 +400,12 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
     else
       rbv_check_add stack fail "compose config failed"
       fail_add "compose config"
+      rep "stack: compose config failed — см. ${RUN_DIR}/compose.cfg.err"
     fi
   fi
 elif ! rbv_check_enabled "$KIND" stack; then
   rbv_check_add stack skip "отключено"
+  rep "stack: отключено в checks"
 fi
 
 # --- save baseline (только при успехе данных) ------------------------------
