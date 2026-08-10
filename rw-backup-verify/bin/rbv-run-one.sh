@@ -26,6 +26,8 @@ rbv_aws_env "$J"
 WD="$(rbv_work_dir)"
 RUN_ID="$(date -u +%Y%m%d_%H%M%S)_$(printf '%s' "$INST" | tr '/:' '__' | cut -c1-80)"
 RUN_DIR="${WD}/runs/${RUN_ID}"
+# docker compose -p: только [a-z0-9_-], иначе "invalid project name"
+COMPOSE_PROJECT="$(printf 'rbv_%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/_/g' | cut -c1-60)"
 mkdir -p "$RUN_DIR"
 REPORT="${RUN_DIR}/report.txt"
 CHECKS_JSON="${RUN_DIR}/checks.json"
@@ -57,7 +59,7 @@ BASELINE_JSON="{}"
 cleanup() {
   if [[ "$KEEP" != "true" ]]; then
     if [[ -n "${COMPOSE_FILE}" && -f "${COMPOSE_FILE}" ]]; then
-      docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" down -v --remove-orphans >/dev/null 2>&1 || true
+      docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" down -v --remove-orphans >/dev/null 2>&1 || true
     fi
     [[ -n "${NET_NAME}" ]] && docker network rm "$NET_NAME" >/dev/null 2>&1 || true
     [[ -n "${PG_CID}" ]] && docker rm -f "$PG_CID" >/dev/null 2>&1 || true
@@ -219,7 +221,9 @@ if [[ "$ok" == true ]]; then
     sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || echo 0)"
     sql_errs="$(echo "$sql_errs" | tr -d '[:space:]')"
     [[ "$sql_errs" =~ ^[0-9]+$ ]] || sql_errs=0
-    (( sql_errs > 0 )) && rep "psql restore: ERROR-строк=${sql_errs} (см. ${RUN_DIR}/psql.err)"
+    if (( sql_errs > 0 )); then
+      rep "psql restore: ERROR-строк=${sql_errs} (см. ${RUN_DIR}/psql.err)"
+    fi
 
     # Дампы ботов часто создают отдельную БД — ищем таблицы везде
     DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
@@ -316,7 +320,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
     rep "stack: compose не найден — skip"
   else
     rep "stack: compose=${CF}"
-    NET_NAME="rbv_net_${RUN_ID}"
+    NET_NAME="${COMPOSE_PROJECT}_net"
     docker network create --internal "$NET_NAME" >/dev/null
     COMPOSE_FILE="${RUN_DIR}/compose.isolated.yml"
 
@@ -355,9 +359,9 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         "$NET_NAME" "$PG_CID" 2>/dev/null \
         || docker network connect "$NET_NAME" "$PG_CID" || true
 
-      rep "stack: compose up -d (сеть ${NET_NAME})…"
+      rep "stack: compose up -d (project=${COMPOSE_PROJECT}, сеть ${NET_NAME})…"
       set +e
-      docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" up -d --no-build \
+      docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" up -d --no-build \
         2>"${RUN_DIR}/compose.up.err"
       up_rc=$?
       set -e
@@ -383,10 +387,10 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           _left=$((_left - _step))
           (( _left > 0 )) && rep "stack: settle, осталось ~${_left}с"
         done
-        running="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
-        total="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | wc -l | tr -d ' ')"
+        running="$(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')"
+        total="$(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -q 2>/dev/null | wc -l | tr -d ' ')"
         STACK_DETAIL="containers ${running}/${total}"
-        SAMPLE_CID="$(docker compose -f "$COMPOSE_FILE" -p "rbv_${RUN_ID}" ps -q 2>/dev/null | head -n1 || true)"
+        SAMPLE_CID="$(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -q 2>/dev/null | head -n1 || true)"
         rep "stack: после settle ${STACK_DETAIL}"
         if [[ "${running:-0}" -lt 1 ]]; then
           STACK_OK="fail"
@@ -397,7 +401,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           # подъём + окно без падений — одна проверка stack
           stab="$(rbv_stability_sec)"
           rep "stack: stability window ${stab}с…"
-          if ! rbv_check_stability "rbv_${RUN_ID}" "$COMPOSE_FILE" "$stab"; then
+          if ! rbv_check_stability "${COMPOSE_PROJECT}" "$COMPOSE_FILE" "$stab"; then
             STACK_OK="fail"
             fail_add "stack stability"
           fi
@@ -414,7 +418,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
 
         if [[ "$STACK_OK" == "ok" ]] && rbv_check_enabled "$KIND" backend_ports; then
           rep "check backend_ports…"
-          if ! rbv_check_backend_ports "$NET_NAME" "$COMPOSE_RAW" "rbv_${RUN_ID}"; then
+          if ! rbv_check_backend_ports "$NET_NAME" "$COMPOSE_RAW" "${COMPOSE_PROJECT}"; then
             fail_add "backend_ports"
           fi
         elif ! rbv_check_enabled "$KIND" backend_ports; then
@@ -467,7 +471,7 @@ notify_ok="$(rbv_cfg '.notify_on_success // true')"
 if [[ "$ok" != true ]] || [[ "$notify_ok" == "true" ]]; then
   rbv_tg_send_long "$TOK" "$CHAT" "$body" "$THREAD"
   if [[ "$ok" != true && -n "${COMPOSE_FILE}" && -f "${COMPOSE_FILE}" ]]; then
-    rbv_tg_send_logs "$TOK" "$CHAT" "$THREAD" "rbv_${RUN_ID}" "$COMPOSE_FILE"
+    rbv_tg_send_logs "$TOK" "$CHAT" "$THREAD" "${COMPOSE_PROJECT}" "$COMPOSE_FILE"
   fi
 fi
 

@@ -78,16 +78,18 @@ rbv_tg_send() {
 rbv_tg_for_storage() {
   local sid="$1"
   local tok chat thr
+  # Важно: // empty в jq даёт НОЛЬ значений → ветка as $t|… не выполняется,
+  # глобальный .telegram молча теряется. Всегда // "".
   tok="$(jq -r --arg id "$sid" '
-    (.storages[] | select(.id==$id) | .telegram.token // empty) as $t
+    (([.storages[] | select(.id==$id) | .telegram.token // ""][0]) // "") as $t
     | if ($t|length)>0 then $t else (.telegram.token // "") end
   ' "$RBV_CONFIG")"
   chat="$(jq -r --arg id "$sid" '
-    (.storages[] | select(.id==$id) | .telegram.chat_id // empty) as $c
+    (([.storages[] | select(.id==$id) | .telegram.chat_id // ""][0]) // "") as $c
     | if ($c|length)>0 then $c else (.telegram.chat_id // "") end
   ' "$RBV_CONFIG")"
   thr="$(jq -r --arg id "$sid" '
-    (.storages[] | select(.id==$id) | .telegram.thread_id // empty) as $h
+    (([.storages[] | select(.id==$id) | .telegram.thread_id // ""][0]) // "") as $h
     | if ($h|length)>0 then $h else (.telegram.thread_id // "") end
   ' "$RBV_CONFIG")"
   printf '%s|%s|%s\n' "$tok" "$chat" "$thr"

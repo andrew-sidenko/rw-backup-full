@@ -1,5 +1,11 @@
 # Changelog
 
+## v5.6.21 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`invalid project name … YTA…`**: `docker compose -p` требует lowercase — `COMPOSE_PROJECT` теперь нормализуется.
+- **Telegram «пусты» при заполненном `telegram show`**: jq `// empty` обрывал fallback на глобальный `.telegram`; заменено на `// ""`.
+
 ## v5.6.20 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)

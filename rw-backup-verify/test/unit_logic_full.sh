@@ -307,6 +307,16 @@ tout="$(rbv_tg_send "" "" "hi" 2>&1)"
 set -e
 printf '%s\n' "$tout" | grep -qi 'пусты\|пропуск\|token' && pass "tg empty warn" || fail "tg empty warn" "$tout"
 
+# global telegram fallback when storage.telegram empty (jq // empty bug)
+jq '.telegram={token:"GTOK",chat_id:"-1",thread_id:""} | .storages=[{id:"s1",telegram:{}}]' \
+  "$RBV_CONFIG" > "$T/tg.json" && mv "$T/tg.json" "$RBV_CONFIG"
+tgline="$(rbv_tg_for_storage s1)"
+[[ "$tgline" == "GTOK|-1|" ]] && pass "tg global fallback" || fail "tg global fallback" "$tgline"
+
+# compose project sanitize
+proj="$(printf 'rbv_%s' '20260810_X_panel_YTA82294297_remnawave_backup' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/_/g')"
+[[ "$proj" == *yta82294297* && "$proj" != *YTA* ]] && pass "compose project lower" || fail "compose project lower" "$proj"
+
 echo "==== help / unknown / save config ===="
 expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help
 expect_rc 1 "unknown cmd" "$ROOT/bin/rw-backup-verify" nosuchcmd
