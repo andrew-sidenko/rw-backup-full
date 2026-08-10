@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.6.26 (2026-08-10)
+
+### Добавлено (`rw-backup-verify`)
+- В отчёт ручного `run` пишется **compose из бэкапа** (raw + resolved+masked),
+  `.env` (ключи / masked), список infra-файлов, сервисы backup vs isolated,
+  isolated YAML, `compose ps` и логи контейнеров — всё в `runs/<id>/compose.*`
+  и в `report.txt` (чтобы править разворачиваемую инфру).
+
 ## v5.6.25 (2026-08-10)
 
 ### Добавлено (`rw-backup-verify`)

@@ -509,8 +509,94 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
   if [[ -z "$CF" ]]; then
     rbv_check_add stack skip "compose не найден"
     rep "stack: compose не найден — skip"
+    # всё равно покажем, что лежит в бэкапе
+    {
+      echo "# search compose under PROJ_DIR=${PROJ_DIR:-?}"
+      find "${PROJ_DIR:-/nonexistent}" -maxdepth 4 \( \
+        -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+        -o -name 'compose*.yml' -o -name 'compose*.yaml' \
+      \) 2>/dev/null | sort || true
+    } >"${RUN_DIR}/compose.files.txt" || true
+    if [[ -s "${RUN_DIR}/compose.files.txt" ]]; then
+      rep "----- compose search in backup -----"
+      while IFS= read -r _line; do rep "  ${_line}"; done <"${RUN_DIR}/compose.files.txt"
+      rep "----- end -----"
+    fi
   else
     rep "stack: compose=${CF}"
+    rep "stack: project_dir=${PROJ_DIR}"
+    rep "stack: compose project=${COMPOSE_PROJECT}"
+
+    # --- дамп compose из бэкапа (оригинал) + вспомогательные файлы ---
+    rep_file() {
+      # rep_file <title> <path> [max_lines]
+      local title="$1" path="$2" max="${3:-120}"
+      local lines=0
+      rep "----- ${title} (${path}) -----"
+      if [[ ! -f "$path" ]]; then
+        rep "  (нет файла)"
+        rep "----- end ${title} -----"
+        return 0
+      fi
+      lines="$(wc -l <"$path" 2>/dev/null | tr -d ' ' || echo 0)"
+      head -n "$max" "$path" | while IFS= read -r _line || [[ -n "$_line" ]]; do
+        rep "  ${_line}"
+      done
+      if [[ "$lines" =~ ^[0-9]+$ ]] && (( lines > max )); then
+        rep "  … (+$((lines - max)) строк; полный файл: ${path})"
+      fi
+      rep "----- end ${title} -----"
+    }
+
+    # копия оригинального compose из архива
+    _bext="yml"
+    [[ "$CF" == *.yaml ]] && _bext="yaml"
+    BACKUP_COMPOSE_COPY="${RUN_DIR}/compose.from-backup.${_bext}"
+    cp -f "$CF" "$BACKUP_COMPOSE_COPY"
+    rep_file "compose FROM BACKUP (raw)" "$BACKUP_COMPOSE_COPY" 200
+
+    {
+      echo "# infra files in project_dir (compose / env / Dockerfile)"
+      find "$PROJ_DIR" -maxdepth 3 \( \
+        -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' \
+        -o -name 'compose*.yml' -o -name 'compose*.yaml' \
+        -o -name '.env' -o -name '.env.*' -o -name 'Dockerfile*' \
+        -o -name '*.override.yml' -o -name '*.override.yaml' \
+      \) 2>/dev/null | sort
+    } >"${RUN_DIR}/compose.files.txt" || true
+    rep_file "compose.files" "${RUN_DIR}/compose.files.txt" 80
+
+    if [[ -f "${PROJ_DIR}/.env" ]]; then
+      # ключи без значений
+      awk -F= '
+        /^[[:space:]]*#/ {next}
+        NF && $1 !~ /^[[:space:]]*$/ {
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+          if ($1 != "") print $1
+        }
+      ' "${PROJ_DIR}/.env" 2>/dev/null | head -n 120 >"${RUN_DIR}/compose.env.keys.txt" || true
+      # .env с маскированными значениями (для ручной правки инфры)
+      awk -F= '
+        /^[[:space:]]*#/ || NF==0 {print; next}
+        {
+          k=$1; sub(/^[^=]*=/, "")
+          v=$0
+          if (k ~ /(PASS|SECRET|TOKEN|KEY|URL|URI|DSN)/) {
+            if (v ~ /:\/\//) {
+              # url: оставить схему/хост-маску
+              gsub(/:\/\/[^@\/]+@/, "://***@", v)
+              gsub(/:[^:@\/]+@/, ":***@", v)
+            } else if (length(v) > 0) { v="***" }
+          }
+          print k "=" v
+        }
+      ' "${PROJ_DIR}/.env" 2>/dev/null >"${RUN_DIR}/compose.env.masked" || true
+      if [[ -s "${RUN_DIR}/compose.env.keys.txt" ]]; then
+        rep "stack: .env keys ($(wc -l <"${RUN_DIR}/compose.env.keys.txt" | tr -d ' ')): $(tr '\n' ',' <"${RUN_DIR}/compose.env.keys.txt" | head -c 500)"
+      fi
+      rep_file "compose.env.masked (from backup)" "${RUN_DIR}/compose.env.masked" 80
+    fi
+
     NET_NAME="${COMPOSE_PROJECT}_net"
     docker network create --internal "$NET_NAME" >/dev/null
     COMPOSE_FILE="${RUN_DIR}/compose.isolated.yml"
@@ -525,20 +611,44 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
       case "$CF" in
         "$PROJ_DIR"/*) cf_arg="${CF#"$PROJ_DIR"/}" ;;
       esac
+      # JSON для jq-rewrite + человекочитаемый YAML из бэкапа
       "${cfg[@]}" -f "$cf_arg" config --format json
     ) >"$COMPOSE_RAW" 2>"${RUN_DIR}/compose.cfg.err"
     cfg_rc=$?
     set -e
+
+    # resolved YAML из бэкапа (как compose его видит с .env) — всегда пытаемся
+    set +e
+    (
+      cd "$PROJ_DIR" || exit 1
+      cfg=(docker compose)
+      [[ -f .env ]] && cfg+=(--env-file .env)
+      cf_arg="$CF"
+      case "$CF" in
+        "$PROJ_DIR"/*) cf_arg="${CF#"$PROJ_DIR"/}" ;;
+      esac
+      "${cfg[@]}" -f "$cf_arg" config
+    ) >"${RUN_DIR}/compose.from-backup.resolved.yml" 2>>"${RUN_DIR}/compose.cfg.err"
+    set -e
+    # маскируем пароли в resolved для отчёта
+    if [[ -s "${RUN_DIR}/compose.from-backup.resolved.yml" ]]; then
+      sed -E \
+        -e 's#(://[^:/@]+:)[^@/]+@#\1***@#g' \
+        -e 's#((PASSWORD|SECRET|TOKEN|KEY)[[:space:]]*:[[:space:]]*)[^[:space:]#"'"'"']+#\1***#gI' \
+        "${RUN_DIR}/compose.from-backup.resolved.yml" >"${RUN_DIR}/compose.from-backup.resolved.masked.yml" 2>/dev/null \
+        || cp -f "${RUN_DIR}/compose.from-backup.resolved.yml" "${RUN_DIR}/compose.from-backup.resolved.masked.yml"
+      rep_file "compose FROM BACKUP (resolved+masked)" "${RUN_DIR}/compose.from-backup.resolved.masked.yml" 200
+    fi
 
     if [[ $cfg_rc -ne 0 || ! -s "$COMPOSE_RAW" ]]; then
       rbv_check_add stack fail "compose config failed"
       fail_add "compose config"
       rep "stack: compose config failed — см. ${RUN_DIR}/compose.cfg.err"
       if [[ -s "${RUN_DIR}/compose.cfg.err" ]]; then
-        rep "----- compose.cfg.err (tail) -----"
-        tail -n 30 "${RUN_DIR}/compose.cfg.err" | while IFS= read -r _line; do rep "  ${_line}"; done
-        rep "----- end -----"
+        rep_file "compose.cfg.err" "${RUN_DIR}/compose.cfg.err" 40
       fi
+      rep "stack: оригинал из бэкапа: ${BACKUP_COMPOSE_COPY}"
+      rep "stack: править инфру → скопируйте compose/env из ${RUN_DIR}/ и перезапустите"
     else
       # Убираем postgres-сервис (его заменяет наш PG_CID) и переписываем
       # DATABASE_URL/DIRECT_URL/POSTGRES_HOST → remnawave-db:5432 (sandbox).
@@ -609,6 +719,35 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           else . end
       ' "$COMPOSE_RAW" > "$COMPOSE_FILE"
 
+      # Сводка сервисов: backup vs isolated
+      jq -r '
+        .services // {} | to_entries[] |
+        "\(.key)\timage=\(.value.image // "-")\tports=\((.value.ports // [])|tostring)"
+      ' "$COMPOSE_RAW" 2>/dev/null >"${RUN_DIR}/compose.services.backup.txt" || true
+      jq -r '
+        .services // {} | to_entries[] |
+        "\(.key)\timage=\(.value.image // "-")"
+      ' "$COMPOSE_FILE" 2>/dev/null >"${RUN_DIR}/compose.services.isolated.txt" || true
+      rep_file "services FROM BACKUP" "${RUN_DIR}/compose.services.backup.txt" 40
+      rep_file "services ISOLATED (sandbox)" "${RUN_DIR}/compose.services.isolated.txt" 40
+
+      # человекочитаемый isolated YAML
+      set +e
+      docker compose -f "$COMPOSE_FILE" config \
+        >"${RUN_DIR}/compose.isolated.resolved.yml" 2>"${RUN_DIR}/compose.isolated.cfg.err"
+      set -e
+      if [[ -s "${RUN_DIR}/compose.isolated.resolved.yml" ]]; then
+        sed -E \
+          -e 's#(://[^:/@]+:)[^@/]+@#\1***@#g' \
+          -e 's#((PASSWORD|SECRET|TOKEN|KEY)[[:space:]]*:[[:space:]]*)[^[:space:]#"'"'"']+#\1***#gI' \
+          "${RUN_DIR}/compose.isolated.resolved.yml" >"${RUN_DIR}/compose.isolated.masked.yml" 2>/dev/null \
+          || cp -f "${RUN_DIR}/compose.isolated.resolved.yml" "${RUN_DIR}/compose.isolated.masked.yml"
+        rep_file "compose ISOLATED (resolved+masked)" "${RUN_DIR}/compose.isolated.masked.yml" 200
+      else
+        rep_file "compose ISOLATED (json)" "$COMPOSE_FILE" 120
+      fi
+      rep "stack: файлы для правки: ${RUN_DIR}/compose.from-backup* ${RUN_DIR}/compose.isolated*"
+
       # Показать, куда ушли DB URL (без пароля)
       db_urls="$(jq -r '
         .services // {} | to_entries[] | .value.environment
@@ -634,9 +773,12 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
       rep "stack: compose up -d (project=${COMPOSE_PROJECT}, сеть ${NET_NAME})…"
       set +e
       docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" up -d --no-build \
-        2>"${RUN_DIR}/compose.up.err"
+        >"${RUN_DIR}/compose.up.out" 2>"${RUN_DIR}/compose.up.err"
       up_rc=$?
       set -e
+      if [[ -s "${RUN_DIR}/compose.up.out" ]]; then
+        rep_file "compose up stdout" "${RUN_DIR}/compose.up.out" 40
+      fi
       if [[ $up_rc -ne 0 ]]; then
         STACK_OK="fail"
         STACK_DETAIL="compose up rc=${up_rc}"
@@ -644,11 +786,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         rbv_check_add stack fail "$STACK_DETAIL: ${err_snip}"
         fail_add "stack up failed: ${err_snip}"
         rep "stack up FAILED — полный лог: ${RUN_DIR}/compose.up.err"
-        if [[ -s "${RUN_DIR}/compose.up.err" ]]; then
-          rep "----- compose.up.err (tail) -----"
-          tail -n 20 "${RUN_DIR}/compose.up.err" | while IFS= read -r _line; do rep "  ${_line}"; done
-          rep "----- end -----"
-        fi
+        rep_file "compose.up.err" "${RUN_DIR}/compose.up.err" 40
       else
         rep "stack: settle ${SETTLE}с…"
         _left="$SETTLE"
@@ -675,6 +813,25 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           fi
         done < <(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -q 2>/dev/null || true)
         rep "stack: после settle ${STACK_DETAIL}"
+
+        # всегда пишем ps + логи в run dir и в отчёт (для ручной корректировки)
+        docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -a \
+          >"${RUN_DIR}/compose.ps.txt" 2>&1 || true
+        rep_file "compose ps" "${RUN_DIR}/compose.ps.txt" 40
+        {
+          echo "=== compose ps ==="
+          cat "${RUN_DIR}/compose.ps.txt" 2>/dev/null || true
+          echo
+          while IFS= read -r _cid; do
+            [[ -n "$_cid" ]] || continue
+            _name="$(docker inspect -f '{{.Name}}' "$_cid" 2>/dev/null | sed 's#^/##')"
+            echo "=== logs: ${_name} (tail 60) ==="
+            docker logs --tail 60 "$_cid" 2>&1 || true
+            echo
+          done < <(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -aq 2>/dev/null || true)
+        } >"${RUN_DIR}/compose.logs.txt" 2>&1 || true
+        rep_file "compose logs (tail)" "${RUN_DIR}/compose.logs.txt" 100
+
         if [[ "${running:-0}" -lt 1 ]]; then
           STACK_OK="fail"
           rbv_check_add stack fail "после up: $STACK_DETAIL"
@@ -686,6 +843,20 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
           if ! rbv_check_stability "${COMPOSE_PROJECT}" "$COMPOSE_FILE" "$stab"; then
             STACK_OK="fail"
             fail_add "stack stability"
+            # обновить логи после падения
+            {
+              echo "=== compose ps (after stability fail) ==="
+              docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -a 2>&1 || true
+              echo
+              while IFS= read -r _cid; do
+                [[ -n "$_cid" ]] || continue
+                _name="$(docker inspect -f '{{.Name}}' "$_cid" 2>/dev/null | sed 's#^/##')"
+                echo "=== logs: ${_name} (tail 80) ==="
+                docker logs --tail 80 "$_cid" 2>&1 || true
+                echo
+              done < <(docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" ps -aq 2>/dev/null || true)
+            } >"${RUN_DIR}/compose.logs.txt" 2>&1 || true
+            rep_file "compose logs after fail" "${RUN_DIR}/compose.logs.txt" 120
           fi
         fi
 

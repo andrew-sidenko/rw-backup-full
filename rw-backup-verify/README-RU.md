@@ -111,7 +111,11 @@ bash test/unit_logic_full.sh
 Ручной `run` пишет шаги в stderr и в `work_dir/logs/run_*.log`
 (по умолчанию `/var/lib/rw-backup-verify/logs/`). Отчёты прогонов —
 `work_dir/runs/<id>/`. Архивы кэшируются в `work_dir/cache/archives/`
-(повторный прогон не качает S3). Освободить диск:
+(повторный прогон не качает S3). В `runs/<id>/` также лежат дампы compose
+из бэкапа и isolated-версии (`compose.from-backup*`, `compose.isolated*`,
+`compose.ps.txt`, `compose.logs.txt`) — для ручной корректировки инфры.
+
+Освободить диск:
 
 ```bash
 rw-backup-verify runs prune --keep 0   # архивы остаются в cache
