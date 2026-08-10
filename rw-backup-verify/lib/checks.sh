@@ -139,16 +139,26 @@ rbv_select_app_db() {
 }
 
 rbv_find_users_table() {
-  # stdout: schema.table or empty
-  local t
-  for t in public.users users public.user user public."User"; do
-    local c
+  # stdout: schema.table or empty; всегда rc=0 (иначе set -e рвёт utbl="$(…)")
+  local t c
+  for t in public.users users public.user user; do
     c="$(rbv_psql "SELECT to_regclass('${t}');")"
-    [[ -n "$c" && "$c" != "" ]] && { echo "$c"; return 0; }
+    c="$(echo "$c" | tr -d '[:space:]')"
+    if [[ -n "$c" && "$c" != "null" ]]; then
+      printf '%s\n' "$c"
+      return 0
+    fi
   done
-  # fuzzy
+  c="$(rbv_psql "SELECT to_regclass('public.\"User\"');")"
+  c="$(echo "$c" | tr -d '[:space:]')"
+  if [[ -n "$c" && "$c" != "null" ]]; then
+    printf '%s\n' "$c"
+    return 0
+  fi
   t="$(rbv_psql "SELECT quote_ident(schemaname)||'.'||quote_ident(relname) FROM pg_stat_user_tables WHERE relname ILIKE '%user%' ORDER BY n_live_tup DESC NULLS LAST LIMIT 1;")"
-  [[ -n "$t" ]] && echo "$t"
+  t="$(echo "$t" | tr -d '[:space:]')"
+  [[ -n "$t" && "$t" != "null" ]] && printf '%s\n' "$t"
+  return 0
 }
 
 rbv_count_table() {
@@ -156,7 +166,12 @@ rbv_count_table() {
   local n
   n="$(rbv_psql "SELECT count(*) FROM ${tbl};")"
   n="$(echo "$n" | tr -d '[:space:]')"
-  [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
+  if [[ "$n" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$n"
+  else
+    printf '0\n'
+  fi
+  return 0
 }
 
 # Max epoch of "event-like" columns (best-effort по известным таблицам/полям).
@@ -173,9 +188,12 @@ rbv_max_event_epoch() {
     do
     e="$(rbv_psql "$cand;" 2>/dev/null | tr -d '[:space:]')"
     [[ "$e" =~ ^[0-9]+$ ]] || continue
-    (( e > epoch )) && epoch=$e
+    if (( e > epoch )); then
+      epoch=$e
+    fi
   done
-  echo "$epoch"
+  printf '%s\n' "$epoch"
+  return 0
 }
 
 # --- check results accumulator (JSON lines file) ----------------------------

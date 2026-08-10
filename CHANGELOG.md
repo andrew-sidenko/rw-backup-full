@@ -1,5 +1,12 @@
 # Changelog
 
+## v5.6.22 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Bot обрыв сразу после `user_tables=23`**: `rbv_find_users_table` возвращал rc=1 при отсутствии match → `set -e` убивал скрипт до finished/Telegram.
+- **Panel `FATAL: database system is starting up`**: после `pg_isready` ждём `SELECT 1` + до 5 ретраев restore.
+- **`sql_errors=00`**: `grep -c || echo 0` склеивал два нуля.
+
 ## v5.6.21 (2026-08-10)
 
 ### Исправлено (`rw-backup-verify`)

@@ -199,9 +199,25 @@ if [[ "$ok" == true ]]; then
   if [[ "$ready" != true ]]; then
     fail_add "postgres not ready"
   else
+    # pg_isready ≠ accepts queries (часто «starting up» ещё пару секунд)
+    rep "postgres: жду SELECT 1…"
+    accept=false
+    for i in $(seq 1 45); do
+      if docker exec "$PG_CID" psql -U postgres -d postgres -Atc 'SELECT 1' >/dev/null 2>&1; then
+        accept=true
+        rep "postgres: accepts connections (${i}с)"
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$accept" != true ]]; then
+      fail_add "postgres not accepting connections"
+    fi
+  fi
+
+  if [[ "$ok" == true && "$ready" == true && "${accept:-false}" == true ]]; then
     sql_sz="$(du -h "$SQL" 2>/dev/null | awk '{print $1}')"
     rep "psql restore: $(basename "$SQL") (${sql_sz}) — может занять минуты"
-    # heartbeat пока идёт restore
     (
       t=0
       while sleep 15; do
@@ -210,16 +226,27 @@ if [[ "$ok" == true ]]; then
       done
     ) &
     _hb=$!
-    set +e
-    gzip -dc "$SQL" | docker exec -i "$PG_CID" \
-      psql -q -U postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err"
-    _psql_rc=$?
-    set -e
+    _psql_rc=1
+    for _attempt in 1 2 3 4 5; do
+      : >"${RUN_DIR}/psql.err"
+      set +e
+      gzip -dc "$SQL" | docker exec -i "$PG_CID" \
+        psql -q -U postgres -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err"
+      _psql_rc=$?
+      set -e
+      if grep -qiE 'starting up|connection.*failed|server closed' "${RUN_DIR}/psql.err" 2>/dev/null; then
+        rep "psql restore: БД ещё не готова (попытка ${_attempt}/5), жду…"
+        sleep $((_attempt * 3))
+        continue
+      fi
+      break
+    done
     kill "$_hb" 2>/dev/null || true
     wait "$_hb" 2>/dev/null || true
     rep "psql restore: rc=${_psql_rc}"
-    sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || echo 0)"
-    sql_errs="$(echo "$sql_errs" | tr -d '[:space:]')"
+    # grep -c → 0 + exit 1; НЕ делать «|| echo 0» (склеит 00)
+    sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || true)"
+    sql_errs="$(echo "${sql_errs:-0}" | tr -d '[:space:]')"
     [[ "$sql_errs" =~ ^[0-9]+$ ]] || sql_errs=0
     if (( sql_errs > 0 )); then
       rep "psql restore: ERROR-строк=${sql_errs} (см. ${RUN_DIR}/psql.err)"
@@ -246,11 +273,13 @@ if [[ "$ok" == true ]]; then
 
     # user_rows: не пусто + ≥ предыдущей проверки (один toggle)
     if rbv_check_enabled "$KIND" user_rows; then
-      utbl="$(rbv_find_users_table)"
+      utbl="$(rbv_find_users_table || true)"
       if [[ -z "$utbl" ]]; then
         rbv_check_add user_rows skip "таблица users не найдена"
+        rep "user_rows: skip (нет таблицы)"
       else
-        USER_ROWS="$(rbv_count_table "$utbl")"
+        USER_ROWS="$(rbv_count_table "$utbl" || true)"
+        [[ "$USER_ROWS" =~ ^[0-9]+$ ]] || USER_ROWS=0
         if (( USER_ROWS < 1 )); then
           rbv_check_add user_rows fail "users(${utbl})=0" "${PREV_USER_ROWS:-}" "$USER_ROWS"
           fail_add "users empty"

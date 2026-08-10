@@ -317,6 +317,17 @@ tgline="$(rbv_tg_for_storage s1)"
 proj="$(printf 'rbv_%s' '20260810_X_panel_YTA82294297_remnawave_backup' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/_/g')"
 [[ "$proj" == *yta82294297* && "$proj" != *YTA* ]] && pass "compose project lower" || fail "compose project lower" "$proj"
 
+# find_users_table always rc=0 (set -e safe)
+set +e
+out="$(rbv_find_users_table)"; rc=$?
+set -e
+[[ "$rc" -eq 0 ]] && pass "find_users rc0" || fail "find_users rc0" "rc=$rc"
+# sql_errs counting must not become 00
+: >"$T/empty.err"
+se="$(grep -cE '^ERROR' "$T/empty.err" 2>/dev/null || true)"
+se="$(echo "${se:-0}" | tr -d '[:space:]')"
+[[ "$se" == "0" ]] && pass "sql_errs zero" || fail "sql_errs zero" "se=$se"
+
 echo "==== help / unknown / save config ===="
 expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help
 expect_rc 1 "unknown cmd" "$ROOT/bin/rw-backup-verify" nosuchcmd
