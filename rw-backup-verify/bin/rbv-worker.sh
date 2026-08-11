@@ -41,7 +41,7 @@ for job in "${sorted[@]}"; do
 
   # ключ в S3 может быть с prefix; rbv-run-one ждёт полный key относительно bucket
   set +e
-  "${SCRIPT_DIR}/rbv-run-one.sh" "$sid" "$kind" "$inst" "$key" "$parent"
+  "${SCRIPT_DIR}/rbv-run-one.sh" "$sid" "$kind" "$inst" "$key" "$parent" "$reason"
   rc=$?
   set -e
   ok_json=false

@@ -14,6 +14,9 @@ KIND="${2:?kind}"
 INST="${3:?instance}"
 KEY="${4:?s3-key}"
 PARENT="${5:-}"
+# manual | schedule | queue — при manual полный schema-diag если нет таблиц/полей
+RBV_REASON="${6:-${RBV_REASON:-manual}}"
+export RBV_REASON
 
 rbv_load_config
 need docker
@@ -111,6 +114,11 @@ cleanup() {
     docker volume prune -f >/dev/null 2>&1 || true
     # освободить диск для следующего job: dump/extract убрать, report/compose оставить
     if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR}" ]]; then
+      # schema-diag → logs (runs prune keep=0 снесёт runs/)
+      if [[ -f "${RUN_DIR}/schema-diag.txt" ]]; then
+        cp -f "${RUN_DIR}/schema-diag.txt" \
+          "$(rbv_work_dir)/logs/schema_${RUN_ID}.txt" 2>/dev/null || true
+      fi
       rbv_run_slim "$RUN_DIR"
     fi
     # page cache от dump/archive — иначе avail RAM падает между bot→panel
@@ -124,8 +132,43 @@ export RBV_PROTECT_RUN="$RUN_DIR"
 
 rep "=== rw-backup-verify ==="
 rep "storage=${SID} kind=${KIND} instance=${INST}"
-rep "key=${KEY} parent=${PARENT}"
+rep "key=${KEY} parent=${PARENT} reason=${RBV_REASON}"
 rep "started=$(date -Is)"
+
+# Полный schema-diag в report + logs/ (если нет нужных таблиц/полей).
+# Ручной run — весь дамп в report; schedule — файл + краткая сводка.
+SCHEMA_DIAG_DONE=0
+rbv_emit_schema_diag() {
+  local note="$1" line file_run="" file_log=""
+  local dump
+  if [[ "${SCHEMA_DIAG_DONE}" == "1" ]]; then
+    rep "schema diag: уже снят в этом прогоне (${note})"
+    return 0
+  fi
+  SCHEMA_DIAG_DONE=1
+  dump="$(rbv_write_schema_diag "$note" 2>/dev/null || true)"
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    case "$line" in
+      SCHEMA_DIAG_FILE=*) file_run="${line#SCHEMA_DIAG_FILE=}" ;;
+      SCHEMA_DIAG_LOG=*) file_log="${line#SCHEMA_DIAG_LOG=}" ;;
+    esac
+  done <<<"$dump"
+  if [[ "${RBV_REASON}" == "manual" || "${RBV_REASON}" == "queue" ]]; then
+    rep "===== SCHEMA DIAG (${note}) — все таблицы/поля для доработки ====="
+    while IFS= read -r line || [[ -n "${line:-}" ]]; do
+      case "$line" in
+        SCHEMA_DIAG_FILE=*|SCHEMA_DIAG_LOG=*) continue ;;
+      esac
+      [[ -n "${line:-}" ]] && rep "$line"
+    done <<<"$dump"
+    rep "===== SCHEMA DIAG files: run=${file_run:-?} log=${file_log:-?} ====="
+  else
+    rep "schema diag (${note}): полный дамп → ${file_log:-${file_run:-?}}"
+    echo "$dump" | grep -E '^(  OK|  MISS|TABLE |note:|db=)' | head -n 60 \
+      | while IFS= read -r line; do rep "  ${line}"; done
+  fi
+  [[ -n "$file_log" ]] && rbv_check_add schema_diag ok "см. ${file_log}"
+}
 
 CURR_ARCH_EPOCH="$(rbv_parse_archive_epoch "$(basename "$KEY")")"
 BASELINE_JSON="$(rbv_baseline_load "$SID" "$INST")"
@@ -631,13 +674,11 @@ if [[ "$ok" == true ]]; then
         if [[ "$KIND" == "bot" ]]; then
           rbv_check_add user_rows fail "таблица public.users не найдена"
           fail_add "users table missing"
-          rep "user_rows: FAIL — нет public.users; поля таблиц users / payment_webhook_events:"
-          while IFS= read -r _line || [[ -n "${_line:-}" ]]; do
-            [[ -n "${_line:-}" ]] && rep "  ${_line}"
-          done < <(rbv_dump_table_fields users; rbv_dump_table_fields payment_webhook_events)
+          rbv_emit_schema_diag "bot: нет public.users"
         else
           rbv_check_add user_rows skip "таблица users не найдена"
           rep "user_rows: skip (нет таблицы)"
+          rbv_emit_schema_diag "panel: users table not found"
         fi
       else
         USER_ROWS="$(rbv_count_table "$utbl" || true)"
@@ -674,12 +715,10 @@ if [[ "$ok" == true ]]; then
             rbv_check_add event_freshness fail \
               "payment_webhook_events: ${_ev_out} (нет таблицы или timestamp-полей)"
             fail_add "event_freshness: ${_ev_out}"
-            rep "event_freshness: FAIL (${_ev_out}) — поля таблиц users / payment_webhook_events:"
-            while IFS= read -r _line || [[ -n "${_line:-}" ]]; do
-              [[ -n "${_line:-}" ]] && rep "  ${_line}"
-            done < <(rbv_dump_table_fields users; rbv_dump_table_fields payment_webhook_events)
+            rbv_emit_schema_diag "bot: payment_webhook_events ${_ev_out}"
           else
             rbv_check_add event_freshness skip "нет timestamp-колонок событий"
+            rbv_emit_schema_diag "panel: event timestamp fields missing"
           fi
           ;;
         *)
@@ -693,10 +732,8 @@ if [[ "$ok" == true ]]; then
             if [[ "$KIND" == "bot" ]]; then
               rbv_check_add event_freshness skip \
                 "payment_webhook_events пуста / без дат (src=${_ev_src:-?})"
-              rep "event_freshness: skip — таблица есть, но дат нет (src=${_ev_src:-?}); поля:"
-              while IFS= read -r _line || [[ -n "${_line:-}" ]]; do
-                [[ -n "${_line:-}" ]] && rep "  ${_line}"
-              done < <(rbv_dump_table_fields payment_webhook_events)
+              rep "event_freshness: skip — таблица есть, но дат нет (src=${_ev_src:-?})"
+              rbv_emit_schema_diag "bot: payment_webhook_events empty/no dates src=${_ev_src:-?}"
             else
               rbv_check_add event_freshness skip "нет timestamp-колонок событий"
             fi

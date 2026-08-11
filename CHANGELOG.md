@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.6.38 (2026-08-11)
+
+### Добавлено (`rw-backup-verify`)
+- При отсутствии нужных таблиц/полей (ручной `run`) — **полный schema-diag**:
+  все public-таблицы, колонки, row counts, expected bot-таблицы OK/MISS,
+  timestamp-колонки. Пишется в report + `work_dir/logs/schema_*.txt`
+  (переживает `runs prune`).
+
 ## v5.6.37 (2026-08-11)
 
 ### Исправлено (`rw-backup-verify`)

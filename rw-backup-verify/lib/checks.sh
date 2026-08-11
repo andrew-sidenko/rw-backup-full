@@ -178,6 +178,72 @@ rbv_dump_table_fields() {
   return 0
 }
 
+# Полный дамп схемы для ручной доработки проверок (все таблицы + поля + rows).
+# stdout: текст; rc=0. Нужны PG_CID / RBV_PG_DB.
+rbv_dump_schema_diag() {
+  local t n cols ts_cols expect
+  printf '=== SCHEMA DIAG ===\n'
+  printf 'db=%s  time=%s\n' "${RBV_PG_DB:-postgres}" "$(date -Is)"
+  printf '\n-- databases --\n'
+  rbv_psql "SELECT datname||' | '||pg_catalog.pg_encoding_to_char(encoding)||' | '||datcollate FROM pg_database WHERE NOT datistemplate ORDER BY 1;" \
+    | while IFS= read -r line || [[ -n "${line:-}" ]]; do
+        [[ -n "${line:-}" ]] && printf '  %s\n' "$line"
+      done
+  printf '\n-- expected bot core tables --\n'
+  for expect in users subscriptions tariffs app_settings \
+      cabinet_email_verification_codes cabinet_site_visits \
+      payments payment_intents payment_webhook_events \
+      recurring_yookassa recurring_robokassa; do
+    if [[ -n "$(rbv_regclass "public.${expect}")" ]]; then
+      n="$(rbv_count_table "public.${expect}")"
+      ts_cols="$(rbv_table_ts_columns "$expect" | tr '\n' ',' | sed 's/,$//')"
+      printf '  OK   %-42s rows=%-8s ts=[%s]\n' "$expect" "$n" "${ts_cols:-}"
+    else
+      printf '  MISS %-42s\n' "$expect"
+    fi
+  done
+  printf '\n-- all public user tables --\n'
+  while IFS= read -r t || [[ -n "${t:-}" ]]; do
+    t="$(echo "${t:-}" | tr -d '[:space:]')"
+    [[ -n "$t" ]] || continue
+    n="$(rbv_count_table "public.${t}")"
+    ts_cols="$(rbv_table_ts_columns "$t" | tr '\n' ',' | sed 's/,$//')"
+    printf '\nTABLE %s  rows=%s  ts_cols=[%s]\n' "$t" "$n" "${ts_cols:-}"
+    cols="$(rbv_table_columns "$t")"
+    if [[ -z "$(echo "$cols" | tr -d '[:space:]')" ]]; then
+      printf '  (колонки не прочитались)\n'
+      continue
+    fi
+    while IFS='|' read -r cn ct || [[ -n "${cn:-}" ]]; do
+      [[ -n "${cn:-}" ]] || continue
+      printf '  - %s (%s)\n' "$cn" "${ct:-?}"
+    done <<<"$cols"
+  done < <(rbv_psql "SELECT relname FROM pg_stat_user_tables ORDER BY relname;")
+  printf '\n=== end SCHEMA DIAG ===\n'
+  return 0
+}
+
+# Записать schema diag в RUN_DIR + logs/ (logs переживает runs prune keep=0).
+# Печатает в report через callback-строки на stdout для вызывающего с rep.
+# $1 = optional note
+rbv_write_schema_diag() {
+  local note="${1:-}" out log
+  out="${RUN_DIR:-/tmp}/schema-diag.txt"
+  mkdir -p "$(dirname "$out")" "$(rbv_work_dir)/logs" 2>/dev/null || true
+  {
+    [[ -n "$note" ]] && printf 'note: %s\n' "$note"
+    rbv_dump_schema_diag
+  } >"$out" 2>/dev/null || {
+    printf 'schema diag failed (PG down?)\n' >"$out"
+  }
+  log="$(rbv_work_dir)/logs/schema_${RUN_ID:-diag}_$(date -u +%H%M%S).txt"
+  cp -f "$out" "$log" 2>/dev/null || true
+  printf 'SCHEMA_DIAG_FILE=%s\n' "$out"
+  printf 'SCHEMA_DIAG_LOG=%s\n' "$log"
+  cat "$out"
+  return 0
+}
+
 rbv_find_users_table() {
   # $1 = optional kind (bot → строго public.users; иначе эвристика panel).
   # stdout: schema.table or empty; всегда rc=0 (иначе set -e рвёт utbl="$(…)")

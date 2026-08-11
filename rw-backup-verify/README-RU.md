@@ -62,7 +62,8 @@ rw-backup-verify run --storage cf-oneok     # сейчас
 | `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
 
 **Bot:** если нет `users` / `payment_webhook_events` или у webhook нет timestamp-полей —
-в `runs/<id>/report.txt` печатаются колонки этих таблиц (чтобы увидеть реальную схему).
+при **ручном** `run` в report и в `work_dir/logs/schema_*.txt` печатается **полный
+schema-diag** (все таблицы, поля, rows, OK/MISS по ключевым bot-таблицам).
 
 `timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
 
