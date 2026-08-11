@@ -49,6 +49,54 @@ rw-backup-verify discover cf-oneok          # что будет тестиров
 rw-backup-verify run --storage cf-oneok     # сейчас
 ```
 
+## Один прогон на хост
+
+Таймер тикает **раз в минуту**, но это лишь проверка расписания. Все длительные
+и разрушающие команды (`run`, `tick`, `queue work`, `reclaim`, `runs prune`)
+держат общий лок `work_dir/locks/global.lock`:
+
+- `run --due` при занятом локе тихо пропускает слот (в журнале — одна строка);
+- ручной `run` отказывается с подсказкой (`--wait <сек>` — подождать);
+- `reclaim` отказывается (`--force` — убрать только то, что не принадлежит
+  живому прогону).
+
+Второй рубеж — реестр `work_dir/locks/active/<pid>.json`: пока прогон жив, его
+песочница `rbv_pg_*`, compose-проект и каталог `runs/<id>` **не удаляются**
+никакой уборкой, включая `reclaim --force` и `runs prune --keep 0`.
+
+> Историческая причина: раньше `run` и `reclaim` безусловно делали
+> `docker rm -f rbv_pg_*`, а таймер мог запустить их поверх идущего прогона.
+> Живой restore терял БД и получал `rc=137` — но это был **не OOM**:
+> `OOMKilled=false` + `State.Status=removing` = подпись внешнего `docker rm -f`.
+> Слот расписания теперь занимается в начале прогона, иначе многочасовой run
+> остаётся «due» и таймер дёргает его каждую минуту.
+
+## Restore: чем закончился и почему
+
+`psql` работает с `ON_ERROR_STOP=0`, поэтому его `rc` сам по себе ничего не
+доказывает. Restore пишет внутри контейнера маркер `RBV_PSQL_RC=<rc>`; если
+маркера нет — restore оборвали, и прогон не выдаёт «половину таблиц» за успех.
+
+| class | смысл | что делать |
+|---|---|---|
+| `ok` | дамп применён целиком | — |
+| `external` | песочницу удалили снаружи (`docker rm -f`) | ищите параллельный прогон/уборку; RAM ни при чём |
+| `oom` | `OOMKilled=true` | swap ≥2G на хосте verify |
+| `disk` | ENOSPC во время restore | `rw-backup-verify reclaim --docker` |
+| `dead` / `start_failed` | postgres не поднялся или упал | `docker logs rbv_pg_*` |
+| `psql_error` | psql вернул ошибку | `runs/<id>/psql.err` |
+
+Всё, кроме `ok`, помечает прогон **retryable** (exit 75): архив не попадает в
+`tested/`, следующий запуск возьмёт тот же ключ. При незавершённом restore
+data-проверки помечаются `skip` — раньше они рапортовали «нет таблицы users»,
+хотя дамп был цел.
+
+Роли из дампа (`OWNER TO` / `GRANT … TO` / `AUTHORIZATION`) создаются в
+песочнице заранее, иначе restore сыплет `role "…" does not exist`.
+Параметры Postgres подбираются под доступную RAM, `fsync`/`full_page_writes`/
+`synchronous_commit` выключены — песочница одноразовая, и это кратно ускоряет
+restore крупных дампов.
+
 ## Проверки (включаются/выключаются раздельно для panel и bot)
 
 В `/etc/rw-backup-verify/config.json` → `checks.panel` / `checks.bot`:
@@ -108,8 +156,17 @@ rw-backup-verify tick
 Тесты (без Docker/S3):
 
 ```bash
-bash test/unit_config_queue.sh
-bash test/unit_logic_full.sh
+bash test/unit_config_queue.sh    # конфиг, расписание, очередь
+bash test/unit_logic_full.sh      # discover/tested/CLI/compose rewrite
+bash test/unit_concurrency.sh     # лок, реестр активных, защита от уборки
+bash test/unit_hardening.sh       # errexit/pipefail-ловушки, tunables, пороги
+```
+
+Живой e2e (нужен рабочий Docker; сам собирает синтетический bot-архив,
+поднимает postgres, стек в `--internal` и имитирует внешний `docker rm -f`):
+
+```bash
+bash test/live_pg_restore.sh
 ```
 
 Ручной `run` пишет шаги в stderr и в `work_dir/logs/run_*.log`
@@ -129,6 +186,7 @@ stack будет skip.
 ```bash
 rw-backup-verify disk
 rw-backup-verify reclaim --docker   # runs+cache latest + volumes/containers (образы остаются)
+                                    # во время прогона откажется; --force чистит только чужое
 ```
 
 Политика хранения:
@@ -137,6 +195,8 @@ rw-backup-verify reclaim --docker   # runs+cache latest + volumes/containers (о
 - **контейнеры/volumes** — удаляются после каждого теста (`down -v` + volume prune);
 - **образы** — сохраняются; при смене тега в compose бэкапа — `compose pull`;
 - **PG sandbox** (`rbv_pg_*`) без `-v` на хост; `/var/lib/postgresql` на хосте ≠ rbv.
+- Артефакты **живого** прогона уборка не трогает (см. «Один прогон на хост»);
+  `rc=137` при `OOMKilled=false` — это внешнее удаление контейнера, не нехватка RAM.
 - Хост verify с **~4 GiB RAM**: для dump 200–500 M нужен **swap ≥2G**, иначе SIGKILL 137.
   После тестов rbv сбрасывает page cache (`drop_caches`) — иначе `buff/cache` от
   чтения dump держит RAM, хотя `docker ps` пуст.

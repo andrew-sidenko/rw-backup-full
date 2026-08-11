@@ -1,5 +1,47 @@
 # Changelog
 
+## v5.7.0 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`) — прогон убивал сам себя
+
+- **Параллельный прогон**. Таймер тикает раз в минуту, и `tick → run --due` мог
+  стартовать поверх идущего прогона. И `run`, и `reclaim` начинались с
+  `docker rm -f rbv_pg_*`, а заканчивались `runs prune keep=0` — живой restore
+  терял песочницу и каталог прогона. В логе это выглядело как
+  `OOM/SIGKILL rc=137`, хотя `OOMKilled=false`, а `State.Status=removing` —
+  подпись внешнего `docker rm -f`.
+  Теперь: глобальный лок на `run`/`tick`/`queue work`/`reclaim`/`runs prune`
+  (`run --due` тихо пропускает слот, ручной `run` — с `--wait`), реестр
+  активных прогонов, чьи контейнеры/compose/`runs/<id>` не удаляет никакая
+  уборка (включая `reclaim --force`), и захват слота расписания **в начале**
+  прогона — иначе долгий run остаётся «due» и таймер дёргает его каждую минуту.
+- **Оборванный restore выдавался за успешный**. `psql` идёт с
+  `ON_ERROR_STOP=0`, его `rc` ничего не доказывал: прогон продолжался на
+  половине таблиц и падал с «users table missing» при целом дампе. Теперь
+  restore пишет маркер `RBV_PSQL_RC`, а сбой классифицируется:
+  `ok | psql_error | oom | external | disk | dead`. Всё, кроме `ok`, —
+  retryable (архив не попадает в `tested/`), data-проверки при незавершённом
+  restore помечаются `skip`.
+- **`set -e` внутри библиотечной функции** включал errexit обратно
+  вызывающему — `rbv-run-one` молча умирал сразу после сбоя restore, не
+  записав ни диагноз, ни итог.
+
+### Изменено (`rw-backup-verify`)
+
+- Песочница PG и restore вынесены в `lib/pg.sh`; параметры Postgres
+  подбираются под доступную RAM (было фиксировано `maintenance_work_mem=32MB`),
+  добавлены `fsync/full_page_writes/synchronous_commit=off` — песочница
+  одноразовая, крупные дампы разворачиваются кратно быстрее.
+- Роли из дампа (`OWNER TO` / `GRANT … TO` / `AUTHORIZATION`) создаются
+  заранее — уходят ошибки `role "…" does not exist`.
+- Heartbeat restore показывает прогресс (таблиц, размер БД); в отчёт попадает
+  сводка ERROR-строк с топом различающихся сообщений.
+- Предупреждение, если свободного места меньше реальной потребности (≈15×gz).
+- `systemd`: явный `TimeoutStartSec=infinity`.
+- Тесты: `test/unit_concurrency.sh`, `test/unit_hardening.sh` и живой
+  `test/live_pg_restore.sh` (настоящий Docker: полный цикл bot, внешний
+  `docker rm -f` во время restore, параллельный `reclaim`).
+
 ## v5.6.39 (2026-08-11)
 
 ### Исправлено (`rw-backup-verify`)
