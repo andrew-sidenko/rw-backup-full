@@ -1,11 +1,280 @@
 # Changelog
 
+## v5.8.0 (2026-08-11)
+
+### Изменено (`rw-backup-verify`) — проверки бота двумя группами данных
+
+Вместо одной `public.users` бот проверяется по двум группам, и набор таблиц у
+каждого бота может быть свой:
+
+- **пользователи** — `users`, `subscriptions`, `tariffs`, `app_settings`,
+  `cabinet_email_verification_codes`, `cabinet_site_visits`;
+- **платежи** — `payments`, `payment_intents`, `payment_webhook_events`,
+  `recurring_yookassa`, `recurring_robokassa`.
+
+Правило: **отсутствие таблицы — не ошибка** (у бота просто нет такой функции).
+Ошибка — потеря данных: таблица была в прошлой проверке и исчезла (`gone`) или
+строк стало меньше (`drop`). Пустая таблица без истории — информативно
+(`empty`), кроме `users`: бот без пользователей = бэкап не тот.
+
+- новые toggles `bot_users` / `bot_payments`, состав групп переопределяется
+  через `.checks.bot.tables.{users,payments}`;
+- baseline экземпляра хранит счётчики строк **по каждой таблице** — сравнение
+  идёт с предыдущим проверенным бэкапом именно этого бота;
+- `event_freshness` для бота берёт самую свежую дату среди платёжных таблиц,
+  что есть у бота (если платежей нет — среди пользовательских); отсутствие дат
+  больше не `fail`, а `skip`;
+- если у бота нет ни одной таблицы из обеих групп — это ошибка (выбрана не та
+  БД или дамп пустой) со снятием полного schema-diag;
+- в отчёт и в Telegram идёт построчная сводка: сколько таблиц из скольких,
+  строки по каждой и список отсутствующих.
+
+## v5.7.0 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`) — «users table missing» на целом бэкапе
+
+- **Выбранная БД терялась в подоболочке.** `DB_TABLES="$(rbv_select_app_db …)"` —
+  присваивание `RBV_PG_DB` внутри `$( )` умирает вместе с подоболочкой, поэтому
+  все проверки (`users`, `event_freshness`, schema-diag) уходили в `postgres`.
+  Дамп бота — `pg_dumpall`: приложение живёт в своей БД (на проде `vpnbot`), а в
+  `postgres` пусто. Отсюда «FAIL users table missing» при исправном архиве.
+  Теперь функция выставляет `RBV_PG_DB`/`RBV_PG_TABLES` в текущей оболочке и
+  выбирает **самую содержательную** БД (сначала та, где есть `public.users`),
+  а список кандидатов пишется в отчёт.
+- Прогресс restore показывает все БД кластера (для `pg_dumpall` он всё время
+  показывал «0 таблиц»).
+
+### Исправлено (`rw-backup-verify`) — прогон убивал сам себя
+
+- **Параллельный прогон**. Таймер тикает раз в минуту, и `tick → run --due` мог
+  стартовать поверх идущего прогона. И `run`, и `reclaim` начинались с
+  `docker rm -f rbv_pg_*`, а заканчивались `runs prune keep=0` — живой restore
+  терял песочницу и каталог прогона. В логе это выглядело как
+  `OOM/SIGKILL rc=137`, хотя `OOMKilled=false`, а `State.Status=removing` —
+  подпись внешнего `docker rm -f`.
+  Теперь: глобальный лок на `run`/`tick`/`queue work`/`reclaim`/`runs prune`
+  (`run --due` тихо пропускает слот, ручной `run` — с `--wait`), реестр
+  активных прогонов, чьи контейнеры/compose/`runs/<id>` не удаляет никакая
+  уборка (включая `reclaim --force`), и захват слота расписания **в начале**
+  прогона — иначе долгий run остаётся «due» и таймер дёргает его каждую минуту.
+- **Оборванный restore выдавался за успешный**. `psql` идёт с
+  `ON_ERROR_STOP=0`, его `rc` ничего не доказывал: прогон продолжался на
+  половине таблиц и падал с «users table missing» при целом дампе. Теперь
+  restore пишет маркер `RBV_PSQL_RC`, а сбой классифицируется:
+  `ok | psql_error | oom | external | disk | dead`. Всё, кроме `ok`, —
+  retryable (архив не попадает в `tested/`), data-проверки при незавершённом
+  restore помечаются `skip`.
+- **`set -e` внутри библиотечной функции** включал errexit обратно
+  вызывающему — `rbv-run-one` молча умирал сразу после сбоя restore, не
+  записав ни диагноз, ни итог.
+
+### Изменено (`rw-backup-verify`)
+
+- Песочница PG и restore вынесены в `lib/pg.sh`; параметры Postgres
+  подбираются под доступную RAM (было фиксировано `maintenance_work_mem=32MB`),
+  добавлены `fsync/full_page_writes/synchronous_commit=off` — песочница
+  одноразовая, крупные дампы разворачиваются кратно быстрее.
+- Роли из дампа (`OWNER TO` / `GRANT … TO` / `AUTHORIZATION`) создаются
+  заранее — уходят ошибки `role "…" does not exist`.
+- Heartbeat restore показывает прогресс (таблиц, размер БД); в отчёт попадает
+  сводка ERROR-строк с топом различающихся сообщений.
+- Предупреждение, если свободного места меньше реальной потребности (≈15×gz).
+- `systemd`: явный `TimeoutStartSec=infinity`.
+- Очередь больше не копит дубли одного и того же архива.
+- Тесты: `test/unit_concurrency.sh`, `test/unit_hardening.sh` и живой
+  `test/live_pg_restore.sh` (настоящий Docker: полный цикл bot на дампе
+  кластера, внешний `docker rm -f` во время restore, параллельный `reclaim`).
+  `unit_logic_full.sh` подменяет `docker` заглушкой: раньше он вызывал `run`,
+  а тот — `docker rm -f rbv_pg_*` на настоящем демоне и сносил песочницу
+  реального прогона на том же хосте.
+
+## v5.6.39 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **Restore без pipe host→docker**: `docker cp` + `gzip|psql` внутри контейнера
+  (pipe через `docker exec -i` на 3–4 GiB RAM давал SIGKILL 137).
+- Ещё жёстче low-mem: `shared_buffers=64MB`, `work_mem=2MB`.
+
+## v5.6.38 (2026-08-11)
+
+### Добавлено (`rw-backup-verify`)
+- При отсутствии нужных таблиц/полей (ручной `run`) — **полный schema-diag**:
+  все public-таблицы, колонки, row counts, expected bot-таблицы OK/MISS,
+  timestamp-колонки. Пишется в report + `work_dir/logs/schema_*.txt`
+  (переживает `runs prune`).
+
+## v5.6.37 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **RAM хвосты**: после каждого job и в конце `run`/`reclaim` — сброс page cache
+  (`drop_caches`), kill heartbeat restore, docker containers/volumes.
+  Чтение dump оставляло сотни MiB в buff/cache → `avail` падал между bot→panel
+  при пустом `docker ps`.
+
+## v5.6.36 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **Короткие имена** `rbv_pg_*` / compose project (≤63) — длинный INST ломал
+  старт PG («контейнер сразу не Running»).
+- **Low-mem Postgres**: `shared_buffers=128MB`, `jit=off`, `shm` 256m на хостах
+  <6 GiB avail — иначе restore 200–500 M dump → SIGKILL 137 на ~4 GiB RAM.
+- OOM / postgres not ready → **retryable** (не в tested); подсказка про swap.
+
+## v5.6.35 (2026-08-11)
+
+### Изменено (`rw-backup-verify`)
+- Политика: **образы docker сохраняем**, при смене тега в compose — `pull`;
+  после теста удаляем **контейнеры + volumes** (`down -v` + `volume prune`).
+- `reclaim --docker` больше **не** делает `system prune -af` (не сносит образы).
+- После `run`: cache latest + docker reclaim + `runs prune keep=0`.
+- Кэш архивов — как в S3, без доп. шифрования.
+
+## v5.6.34 (2026-08-11)
+
+### Добавлено / исправлено (`rw-backup-verify`)
+- **`disk` / `reclaim [--docker]`** — обзор места и полная уборка runs+cache+leftover
+  `rbv_*` контейнеров (PGDATA verify живёт в `/var/lib/docker`, не на хосте).
+- PG sandbox **без `-v` на хост**; из isolated compose вырезаются bind’ы
+  `pgdata` / `/var/lib/postgresql` / `pg_wal` (чтобы стек не писал WAL на хост).
+- В начале каждого `run` — `rbv_docker_reclaim`.
+
+## v5.6.33 (2026-08-11)
+
+### Изменено (`rw-backup-verify`)
+- **Кэш архивов жёстко «только latest»** на каждом `run` / `tick` (ручной =
+  по расписанию): старые скачанные удаляются до и после прогона и после каждого
+  download; в `runs/` архив снимается сразу после extract (копия остаётся в
+  `cache/archives/` для ручного прогона без S3).
+
+## v5.6.32 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **Disk gate**: минимум свободно 1.5 GiB (было 3 GiB) + `max(4×sql.gz)`.
+  На хосте ~50G с Docker/кэшем 3 GiB часто блокировали restore при живом 4×dump.
+- При ENOSPC/мало места — **rc=75 retryable**, worker **не** пишет в `tested`
+  (можно повторить тот же архив после prune).
+- При нехватке места: prune runs keep=0 + cache latest перед fail.
+
+## v5.6.31 (2026-08-11)
+
+### Изменено (`rw-backup-verify`)
+- **Bot DB checks**: `user_rows` → строго `public.users`; `event_freshness` →
+  timestamp из `payment_webhook_events`.
+- Если таблицы/нужных полей нет — в report выводятся колонки `users` и
+  `payment_webhook_events` (ручная диагностика схемы).
+
+## v5.6.30 (2026-08-10)
+
+### Изменено (`rw-backup-verify`)
+- **Cache: только latest на экземпляр** — старые архивы в `cache/archives/` удаляются.
+  - `run --storage ID` по умолчанию `--cache-latest`
+  - оставить все: `run --storage ID --keep-cache-all`
+  - вручную: `rw-backup-verify cache prune [--storage ID]`
+
+## v5.6.29 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Panel empty schema / 100+ FK ERROR после bot**: диск забивался extract/sql
+  предыдущего job (1.9 GiB свободно). Теперь:
+  - после каждого job — `rbv_run_slim` (report/compose остаются, dump/extract нет);
+  - slim старых runs при старте;
+  - перед restore — gate ≥max(3 GiB, 4×sql.gz), иначе prune;
+  - retry restore при пустой schema + много ERROR.
+
+## v5.6.28 (2026-08-10)
+
+### Изменено (`rw-backup-verify`)
+- **Isolation preflight** до download/restore/stack: если Docker `--internal`
+  пропускает egress — все тесты останавливаются сразу.
+- В stack: **isolation до stability/ports**; при fail — дальше не идём.
+- Отключается: `checks.preflight_isolation=false`.
+
+## v5.6.27 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Bot `compose config` / `BACKEND_IMAGE is required`**: перед `config` собирается
+  `compose.env.effective` (.env + stub для `${VAR:?…}`); если image=`rbv-missing/*`
+  (теги не в бэкапе, а задаются при деплое) — **stack skip**, не FAIL.
+- Rewrite также `DB_HOST`/`REDIS_HOST`/`DB_NAME` → sandbox; `deploy:` срезается.
+- Маскировка секретов в дампах compose усилена (`METRICS_PASS`, webhook hex и т.п.).
+
+## v5.6.26 (2026-08-10)
+
+### Добавлено (`rw-backup-verify`)
+- В отчёт ручного `run` пишется **compose из бэкапа** (raw + resolved+masked),
+  `.env` (ключи / masked), список infra-файлов, сервисы backup vs isolated,
+  isolated YAML, `compose ps` и логи контейнеров — всё в `runs/<id>/compose.*`
+  и в `report.txt` (чтобы править разворачиваемую инфру).
+
+## v5.6.25 (2026-08-10)
+
+### Добавлено (`rw-backup-verify`)
+- **Кэш архивов** `work_dir/cache/archives/` — повторный `run` не качает S3 при cache hit
+  (hardlink; adopt из старых `runs/` по `key=` в report).
+- **`runs prune [--keep N]`** / **`cache list|clear`**: освободить диск, оставив архивы в cache.
+- Авто-prune старых runs при `run` / `run-one` (`runs_keep`, default 2).
+- Явный FAIL при ENOSPC с подсказкой prune.
+
+## v5.6.24 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Bot `psql restore rc=137` / empty schema `dbs=?`**: soft-retry в ту же полумёртвую БД
+  заменён на recreate PG (до 3 попыток); детект OOM/SIGKILL; `--shm-size=512m`;
+  перед стартом чистятся чужие `rbv_pg_*`.
+- **Panel `postgres not ready` без деталей**: ожидание до 120с, проверка `docker run`,
+  в отчёт — `OOMKilled`/logs/`free`/`df`.
+
+## v5.6.23 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Panel stack: Prisma к прод-IP** (`Can't reach database server at 107…`): в isolated compose
+  `DATABASE_URL`/`DIRECT_URL`/`POSTGRES_HOST` переписываются на `remnawave-db:5432`;
+  `env_file` и mount `.env` убираются, чтобы прод-URL не вернулся.
+- **Bot `compose config failed` без деталей**: config из `PROJ_DIR` + `--env-file .env`,
+  в отчёт печатается tail `compose.cfg.err`.
+- **Ложный FAIL isolation**: DNS на `--internal` часто резолвится — проверка по
+  `network.Internal` + реальному TCP egress (не `getent`).
+
+## v5.6.22 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **Bot обрыв сразу после `user_tables=23`**: `rbv_find_users_table` возвращал rc=1 при отсутствии match → `set -e` убивал скрипт до finished/Telegram.
+- **Panel `FATAL: database system is starting up`**: после `pg_isready` ждём `SELECT 1` + до 5 ретраев restore.
+- **`sql_errors=00`**: `grep -c || echo 0` склеивал два нуля.
+
+## v5.6.21 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`invalid project name … YTA…`**: `docker compose -p` требует lowercase — `COMPOSE_PROJECT` теперь нормализуется.
+- **Telegram «пусты» при заполненном `telegram show`**: jq `// empty` обрывал fallback на глобальный `.telegram`; заменено на `// ""`.
+
+## v5.6.20 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`FAIL empty schema` после успешного restore бота (217M)**: дамп часто создаёт отдельную БД — теперь сканируем все non-template БД (как sandbox verify-backup) + hint `POSTGRES_DB` из PROFILE.env.
+- **Telegram молчит**: раньше пустые creds и `ok:false` от API глотались; теперь WARN с description, HTML-escape полей отчёта.
+
+## v5.6.19 (2026-08-10)
+
+### Исправлено (`rw-backup-verify`)
+- **`cp: checks.json and checks.json are the same file`**: убран бессмысленный `cp` файла сам в себя.
+- **`stack up failed` без деталей**: в отчёт печатается tail `compose.up.err`.
+- **Bot family с `__` в имени** (`…infra__20260810…`) — хвостовой `_` в instance id больше не остаётся.
+- (из 5.6.18) bot **`rc=141` SIGPIPE** от `tar|head`; heartbeat после docker pull.
+
+### Добавлено (`rw-backup-verify`)
+- **`tested list|clear`**: посмотреть/сбросить реестр, чтобы перезапустить failed прогоны.
+
 ## v5.6.18 (2026-08-10)
 
 ### Добавлено (`rw-backup-verify`)
 - **Пошаговый вывод `run`**: start → discover/S3 ls → enqueue count → worker → готово; сессионный лог `work_dir/logs/run_*.log`.
 - Пустая очередь / 0 untested — явный WARN с подсказкой `discover --all` и путём к `tested/`.
 - Ошибки `aws s3 ls` больше не глотаются (раньше `run` молча завершался).
+- **Heartbeat в `rbv-run-one`**: postgres ready, psql restore (каждые 15с), settle, stability — чтобы не казалось «зависло» после `docker pull`.
+
+### Исправлено (`rw-backup-verify`)
+- **Bot `rc=141` (SIGPIPE)**: `tar -tzf | head` под `pipefail` ронял прогон; добавлен `|| true`.
 
 ## v5.6.17 (2026-08-10)
 
