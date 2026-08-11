@@ -84,6 +84,19 @@ set -e
 [[ "$rc" -ne 0 && "$out" == *"убьёт его песочницу"* ]] && pass "reclaim отказывается" \
   || fail "reclaim отказывается" "rc=$rc out=${out:0:200}"
 
+echo "==== очередь без дублей ===="
+rm -f "$(rbv_queue_dir)"/*.job
+rbv_enqueue_instance s1 bot "bot:p:a" "k/a.tar.gz" "k" manual >/dev/null 2>&1
+sleep 0.01
+out="$(rbv_enqueue_instance s1 bot "bot:p:a" "k/a.tar.gz" "k" manual 2>&1)"
+n="$(find "$(rbv_queue_dir)" -name '*.job' | wc -l | tr -d ' ')"
+[[ "$n" == "1" && "$out" == *"уже в очереди"* ]] && pass "тот же архив не дублируется" \
+  || fail "дубль в очереди" "n=$n out=$out"
+rbv_enqueue_instance s1 bot "bot:p:a" "k/b.tar.gz" "k" manual >/dev/null 2>&1
+n="$(find "$(rbv_queue_dir)" -name '*.job' | wc -l | tr -d ' ')"
+[[ "$n" == "2" ]] && pass "другой архив ставится в очередь" || fail "другой архив" "n=$n"
+rm -f "$(rbv_queue_dir)"/*.job
+
 echo "==== реестр активных прогонов ===="
 sleep 300 >/dev/null 2>&1 &
 SLEEPER=$!

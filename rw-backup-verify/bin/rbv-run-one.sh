@@ -475,7 +475,7 @@ if [[ "$ok" == true ]]; then
       rep "psql restore: дамп применён без ошибок, но пользовательских таблиц нет — проверьте сам архив"
     fi
 
-    rep "db_schema: db=${RBV_PG_DB:-postgres} user_tables=${DB_TABLES}"
+    rep "db_schema: db=${RBV_PG_DB:-postgres} user_tables=${DB_TABLES} (кандидаты: ${RBV_PG_DB_LIST:-—})"
     if (( DB_TABLES < 1 )); then
       dbs="?"
       if rbv_pg_alive; then

@@ -321,10 +321,12 @@ rbv_pg_error_summary() {
   return 0
 }
 
-# Прогресс restore: сколько таблиц уже создано и размер БД.
+# Прогресс restore: суммарный размер всех БД кластера, а не только `postgres`.
+# Дампы pg_dumpall создают свою БД и делают \connect — прогресс в `postgres`
+# всё время показывал бы «0 таблиц».
 rbv_pg_progress() {
   docker exec "$PG_CID" psql -U postgres -d postgres -Atc \
-    "SELECT (SELECT count(*) FROM pg_stat_user_tables)||' таблиц, '||pg_size_pretty(pg_database_size(current_database()))" \
+    "SELECT string_agg(datname||' '||pg_size_pretty(pg_database_size(datname)), ', ' ORDER BY pg_database_size(datname) DESC) FROM pg_database WHERE NOT datistemplate" \
     2>/dev/null | tr -d '\r' | head -n1 || true
 }
 

@@ -102,40 +102,54 @@ rbv_psql() {
   docker exec "$PG_CID" psql -U postgres -d "${RBV_PG_DB:-postgres}" -Atc "$1" 2>/dev/null || true
 }
 
-# Выбрать БД с пользовательскими таблицами (дампы ботов часто не в postgres).
-# $1 — подсказка (POSTGRES_DB из PROFILE.env). stdout: число таблиц; RBV_PG_DB выставляется.
+# Выбрать БД приложения. Дампы ботов — как правило pg_dumpall: в `postgres`
+# остаётся служебная мелочь (23 таблицы мониторинга), а приложение живёт в
+# своей БД (vpnbot и т.п.). Раньше брали первую непустую и почти всегда
+# попадали в `postgres` → «users table missing» при целом бэкапе.
+# Берём самую содержательную: сначала та, где есть public.users, затем по числу
+# таблиц; явная подсказка (POSTGRES_DB из PROFILE.env) имеет приоритет.
+# $1 — подсказка. stdout: число таблиц; RBV_PG_DB и RBV_PG_DB_LIST выставляются.
 rbv_select_app_db() {
-  local hint="${1:-}" db tables
+  local hint="${1:-}" db tables users score
+  local best_db="postgres" best_score=-1 best_tables=0
   RBV_PG_DB="postgres"
+  RBV_PG_DB_LIST=""
   _rbv_db_tables() {
     docker exec "$PG_CID" psql -U postgres -d "$1" -Atc \
       "SELECT count(*) FROM pg_stat_user_tables" 2>/dev/null | tr -d '[:space:]' || echo 0
   }
-  if [[ -n "$hint" ]]; then
-    tables="$(_rbv_db_tables "$hint")"
-    if [[ "$tables" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
-      RBV_PG_DB="$hint"
-      printf '%s\n' "$tables"
-      return 0
-    fi
-  fi
-  tables="$(_rbv_db_tables postgres)"
-  if [[ "$tables" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
-    RBV_PG_DB="postgres"
-    printf '%s\n' "$tables"
-    return 0
-  fi
+  _rbv_db_has_users() {
+    local r
+    r="$(docker exec "$PG_CID" psql -U postgres -d "$1" -Atc \
+      "SELECT CASE WHEN to_regclass('public.users') IS NULL THEN 0 ELSE 1 END" 2>/dev/null \
+      | tr -d '[:space:]' || echo 0)"
+    [[ "$r" == "1" ]] && echo 1 || echo 0
+  }
   while IFS= read -r db; do
+    db="$(echo "${db:-}" | tr -d '[:space:]')"
     [[ -n "$db" ]] || continue
     tables="$(_rbv_db_tables "$db")"
-    if [[ "$tables" =~ ^[0-9]+$ ]] && (( tables > 0 )); then
-      RBV_PG_DB="$db"
-      printf '%s\n' "$tables"
-      return 0
+    [[ "$tables" =~ ^[0-9]+$ ]] || tables=0
+    (( tables > 0 )) || continue
+    users="$(_rbv_db_has_users "$db")"
+    score=$(( users * 1000000 + tables ))
+    [[ -n "$hint" && "$db" == "$hint" ]] && score=$(( score + 2000000 ))
+    RBV_PG_DB_LIST+="${db}=${tables}$( ((users)) && printf '+users')  "
+    if (( score > best_score )); then
+      best_score=$score
+      best_db="$db"
+      best_tables=$tables
     fi
   done < <(docker exec "$PG_CID" psql -U postgres -d postgres -Atc \
-    "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1" 2>/dev/null || true)
-  printf '0\n'
+    "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname='postgres' DESC, datname" 2>/dev/null || true)
+  RBV_PG_DB_LIST="${RBV_PG_DB_LIST%  }"
+  if (( best_score < 0 )); then
+    printf '0\n'
+    return 0
+  fi
+  RBV_PG_DB="$best_db"
+  printf '%s\n' "$best_tables"
+  return 0
 }
 
 # to_regclass → schema.table или пусто; всегда rc=0.

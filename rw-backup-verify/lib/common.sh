@@ -899,9 +899,19 @@ rbv_queue_dir() { printf '%s/queue\n' "$(rbv_work_dir)"; }
 # Job = один экземпляр (архив) для теста. FIFO по timestamp в имени файла.
 rbv_enqueue_instance() {
   local sid="$1" kind="$2" inst="$3" key="$4" parent="$5" reason="${6:-manual}"
-  local qd ts f safe
+  local qd ts f safe old
   qd="$(rbv_queue_dir)"
   mkdir -p "$qd"
+  # тот же архив уже в очереди (например, хвост прерванного прогона) —
+  # второй раз его гонять незачем
+  for old in "$qd"/*.job; do
+    [[ -f "$old" ]] || continue
+    if jq -e --arg s "$sid" --arg k "$key" \
+         '.storage == $s and .key == $k' "$old" >/dev/null 2>&1; then
+      msg INFO "уже в очереди, пропуск: ${sid} ${key}"
+      return 0
+    fi
+  done
   ts="$(date +%s%N)"
   safe="$(printf '%s' "$inst" | tr '/:' '__')"
   f="${qd}/${ts}_${sid}_${safe}.job"
