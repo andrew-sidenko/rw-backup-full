@@ -43,8 +43,111 @@ rbv_work_dir() {
   else
     d="$(rbv_cfg '.work_dir // "/var/lib/rw-backup-verify"')"
   fi
-  mkdir -p "$d"/{queue,runs,locks,cache,tested,cache/archives}
+  mkdir -p "$d"/{queue,runs,logs,locks,locks/active,cache,tested,cache/archives}
   printf '%s\n' "$d"
+}
+
+# Вывод шага: rbv-run-one подменяет на `rep` (report.txt + stderr).
+rbv_say() { msg INFO "$*"; }
+
+# --- Глобальный лок: один прогон на хост ------------------------------------
+# Таймер тикает раз в минуту; без общего лока `tick → run --due` стартовал
+# параллельно ручному прогону, а `run` начинается и заканчивается
+# rbv_docker_reclaim → `docker rm -f rbv_pg_*`. Живой restore получал SIGKILL:
+# в логе это выглядело как «OOM rc=137», хотя OOMKilled=false, а
+# State.Status=removing (подпись внешнего docker rm -f).
+# fd 8 наследуется детьми (worker / rbv-run-one) — лок держится весь прогон.
+RBV_LOCK_FD=8
+
+rbv_global_lock_file() { printf '%s/locks/global.lock\n' "$(rbv_work_dir)"; }
+
+# $1 = сколько секунд ждать (0/пусто — не ждать). rc=0 взяли, rc=1 занято.
+rbv_global_lock() {
+  local wait_s="${1:-0}" lock
+  # лок уже взят родителем (worker/run-one наследуют fd и переменную)
+  [[ "${RBV_GLOBAL_LOCK_HELD:-0}" == "1" ]] && return 0
+  need flock
+  lock="$(rbv_global_lock_file)"
+  eval "exec ${RBV_LOCK_FD}>\"\$lock\"" || return 1
+  if [[ "$wait_s" =~ ^[1-9][0-9]*$ ]]; then
+    flock -w "$wait_s" "$RBV_LOCK_FD" || return 1
+  else
+    flock -n "$RBV_LOCK_FD" || return 1
+  fi
+  RBV_GLOBAL_LOCK_HELD=1
+  export RBV_GLOBAL_LOCK_HELD
+  printf '%s %s\n' "$$" "${RBV_LOCK_TAG:-?}" >"$(rbv_work_dir)/locks/global.owner" 2>/dev/null || true
+  return 0
+}
+
+# Кто держит лок (для понятного сообщения вместо тихого выхода).
+rbv_global_lock_owner() {
+  local f
+  f="$(rbv_work_dir)/locks/global.owner"
+  [[ -f "$f" ]] && head -n1 "$f" 2>/dev/null || true
+}
+
+# --- Реестр активных прогонов ----------------------------------------------
+# Второй рубеж на случай ручного `reclaim`/`runs prune` в соседнем терминале:
+# чужой процесс не должен трогать контейнеры, compose-проекты и runs/<id>
+# живого прогона, даже если лок кто-то обошёл.
+
+rbv_active_dir() { printf '%s/locks/active\n' "$(rbv_work_dir)"; }
+
+# $1=run_dir $2=pg_cid $3=compose_project
+rbv_active_register() {
+  local d f
+  d="$(rbv_active_dir)"
+  mkdir -p "$d"
+  f="${d}/$$.json"
+  jq -nc --argjson pid "$$" --arg run "${1:-}" --arg pg "${2:-}" \
+    --arg proj "${3:-}" --argjson ts "$(date +%s)" \
+    '{pid:$pid, run_dir:$run, pg_cid:$pg, compose_project:$proj, started:$ts}' \
+    >"$f" 2>/dev/null || true
+  RBV_ACTIVE_FILE="$f"
+}
+
+rbv_active_unregister() {
+  [[ -n "${RBV_ACTIVE_FILE:-}" ]] && rm -f "$RBV_ACTIVE_FILE" 2>/dev/null || true
+  RBV_ACTIVE_FILE=""
+  return 0
+}
+
+# Записи живых прогонов (файлы мёртвых pid удаляем). stdout: json по строке.
+rbv_active_entries() {
+  local d f pid
+  d="$(rbv_active_dir)"
+  [[ -d "$d" ]] || return 0
+  for f in "$d"/*.json; do
+    [[ -f "$f" ]] || continue
+    pid="$(jq -r '.pid // empty' "$f" 2>/dev/null || true)"
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    # свой же прогон не защищаем от самого себя
+    [[ "$pid" == "$$" ]] && continue
+    cat "$f"
+  done
+  return 0
+}
+
+# $1 = поле (run_dir|pg_cid|compose_project); stdout: значения живых прогонов.
+rbv_active_field() {
+  local k="$1"
+  rbv_active_entries | jq -r --arg k "$k" '.[$k] // empty' 2>/dev/null || true
+  return 0
+}
+
+# rbv_is_protected <значение> <поле> → rc=0 если принадлежит живому прогону.
+rbv_is_protected() {
+  local v="${1:-}" k="${2:-}" x
+  [[ -n "$v" && -n "$k" ]] || return 1
+  while IFS= read -r x; do
+    [[ -n "$x" ]] || continue
+    [[ "${v%/}" == "${x%/}" ]] && return 0
+  done < <(rbv_active_field "$k")
+  return 1
 }
 
 # --- Archive cache / disk ---------------------------------------------------
@@ -263,6 +366,11 @@ rbv_runs_prune() {
       i=$((i + 1))
       continue
     fi
+    # каталог живого прогона (другой процесс) — не трогать даже при keep=0
+    if rbv_is_protected "$d" run_dir; then
+      i=$((i + 1))
+      continue
+    fi
     i=$((i + 1))
     if (( i > keep )); then
       rm -rf "$d"
@@ -282,6 +390,8 @@ rbv_disk_report() {
 rbv_run_slim() {
   local d="${1:?}"
   [[ -d "$d" ]] || return 0
+  # чужой живой прогон: его dump/extract ещё нужны для restore
+  rbv_is_protected "$d" run_dir && return 0
   rm -rf "${d}/extract" "${d}/project_extract" "${d}/project" 2>/dev/null || true
   rm -f "${d}/archive.tar.gz" 2>/dev/null || true
   find "$d" -maxdepth 3 -type f \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.rdb' -o -name '*.tar' \) \
@@ -325,28 +435,41 @@ rbv_mem_reclaim() {
 # PG sandbox без -v → PGDATA в слое контейнера; compose anonymous volumes — через down -v + prune.
 # stdout: число снятых контейнеров/проектов; rc=0.
 rbv_docker_reclaim() {
-  local n=0 id proj
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    docker rm -f "$id" >/dev/null 2>&1 && n=$((n + 1)) || true
-  done < <(docker ps -aq --filter 'name=rbv_pg_' 2>/dev/null || true)
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    docker rm -f "$id" >/dev/null 2>&1 && n=$((n + 1)) || true
-  done < <(docker ps -aq --filter 'name=rbv_probe_' --filter 'name=rbv_iso_' --filter 'name=rbv_preflight_' 2>/dev/null || true)
+  local n=0 name proj net
+  # ВАЖНО: контейнеры/сети/проекты живого прогона не трогаем. Раньше здесь был
+  # безусловный `docker rm -f` по маске rbv_pg_* — параллельный tick сносил
+  # песочницу работающего restore (exit=137, oom=false, status=removing).
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if rbv_is_protected "$name" pg_cid; then
+      msg INFO "reclaim: пропуск ${name} — занят живым прогоном"
+      continue
+    fi
+    docker rm -f "$name" >/dev/null 2>&1 && n=$((n + 1)) || true
+  done < <(docker ps -a --filter 'name=rbv_pg_' --filter 'name=rbv_probe_' \
+    --filter 'name=rbv_iso_' --filter 'name=rbv_preflight_' \
+    --format '{{.Names}}' 2>/dev/null || true)
   while IFS= read -r proj; do
     [[ -n "$proj" ]] || continue
+    if rbv_is_protected "$proj" compose_project; then
+      msg INFO "reclaim: пропуск compose ${proj} — занят живым прогоном"
+      continue
+    fi
     docker compose -p "$proj" down -v --remove-orphans >/dev/null 2>&1 || true
     n=$((n + 1))
   done < <(docker ps -a --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
     | grep -E '^rbv' | sort -u || true)
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    docker network rm "$id" >/dev/null 2>&1 || true
+  while IFS= read -r net; do
+    [[ -n "$net" ]] || continue
+    rbv_is_protected "${net%_net}" compose_project && continue
+    docker network rm "$net" >/dev/null 2>&1 || true
   done < <(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^rbv|_net$' || true)
   # dangling volumes (после down -v / rm контейнеров) — главный потребитель диска
   docker volume prune -f >/dev/null 2>&1 || true
-  docker container prune -f >/dev/null 2>&1 || true
+  # container prune снёс бы упавшие контейнеры чужого стека до сбора логов
+  if [[ -z "$(rbv_active_entries)" ]]; then
+    docker container prune -f >/dev/null 2>&1 || true
+  fi
   echo "$n"
   return 0
 }
@@ -357,7 +480,7 @@ rbv_disk_floor_kb() {
   echo 1572864
 }
 
-# need_kb для sql.gz: max(4×size, floor). stdout KiB.
+# Жёсткий порог (блокирует прогон): max(4×size, floor). stdout KiB.
 rbv_disk_need_for_sql() {
   local sql_b="${1:-0}" floor need
   floor="$(rbv_disk_floor_kb)"
@@ -367,6 +490,19 @@ rbv_disk_need_for_sql() {
     (( need < floor )) && need=$floor
   fi
   echo "$need"
+}
+
+# Реалистичная оценка «сколько съест restore» (KiB): распакованный SQL ≈ 7×gz,
+# плюс данные+индексы в PGDATA и WAL, плюс сам gz внутри контейнера.
+# Меньше этого прогон обычно доходит до ENOSPC уже на индексах — предупреждаем,
+# но НЕ блокируем (блокирует только rbv_disk_need_for_sql).
+rbv_disk_estimate_for_sql() {
+  local sql_b="${1:-0}"
+  if [[ "$sql_b" =~ ^[0-9]+$ ]] && (( sql_b > 0 )); then
+    echo $(( sql_b * 15 / 1024 ))
+  else
+    rbv_disk_floor_kb
+  fi
 }
 
 # Нужно ≥ need_kb свободно под restore. При нехватке — slim + prune(+cache).
@@ -486,9 +622,8 @@ rbv_tg_send() {
   [[ -n "$thread" ]] && form+=(-F "message_thread_id=${thread}")
   local a resp ok
   for a in 1 2 3; do
-    set +e
-    resp="$(curl -sS -m 25 "https://api.telegram.org/bot${token}/sendMessage" "${form[@]}" 2>/dev/null)"
-    set -e
+    resp=""
+    resp="$(curl -sS -m 25 "https://api.telegram.org/bot${token}/sendMessage" "${form[@]}" 2>/dev/null)" || true
     ok="$(jq -r '.ok // false' <<<"$resp" 2>/dev/null || echo false)"
     if [[ "$ok" == "true" ]]; then
       return 0
@@ -592,10 +727,10 @@ rbv_list_all_archive_keys() {
   [[ -n "$base" ]] && uri="s3://${RBV_BUCKET}/${base}/"
   local err out rc
   err="$(mktemp)"; out="$(mktemp)"
-  set +e
-  rbv_aws s3 ls "$uri" --recursive >"$out" 2>"$err"
-  rc=$?
-  set -e
+  # `|| rc=$?`, а не set +e/set -e: функция не должна включать errexit
+  # обратно вызывающему, который его выключил
+  rc=0
+  rbv_aws s3 ls "$uri" --recursive >"$out" 2>"$err" || rc=$?
   if (( rc != 0 )); then
     msg ERR "S3 ls ${uri} rc=${rc}: $(tr '\n' ' ' <"$err" | head -c 400)"
     rm -f "$err" "$out"

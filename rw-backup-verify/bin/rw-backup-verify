@@ -28,6 +28,7 @@ rw-backup-verify — автономная проверка логических 
   discover <storage-id> [--all]     # deep; по умолчанию только untested
   run [--due]                       # все хранилища: discover untested → очередь → work
   run --storage ID                  # только одно хранилище (с пошаговым логом)
+                                    #   --wait N: подождать N сек, если прогон уже идёт
   queue status|clear|work
   tested list <id> | clear <id> [--key KEY]
   runs prune [--keep N]             # удалить старые runs/ (архивы → cache, default keep=2)
@@ -35,7 +36,12 @@ rw-backup-verify — автономная проверка логических 
   disk                              # что занимает место + подсказки
   reclaim [--docker]                # runs keep=0 + cache latest + контейнеры/volumes
                                     #   --docker: volume/container prune (ОБРАЗЫ не трогаем)
+                                    #   во время прогона откажется (--force = только чужое)
   tick                              # systemd: если глобально due → run --due
+
+Все длительные/разрушающие команды (run, tick, queue work, reclaim, runs prune)
+держат один глобальный лок: параллельный прогон невозможен. Контейнеры и
+runs/<id> живого прогона не удаляются даже принудительной уборкой.
 
 Логи: work_dir/logs/run_*.log и work_dir/runs/<id>/
 Кэш (только latest, как в S3, без доп. шифрования): work_dir/cache/archives/
@@ -211,7 +217,7 @@ case "$cmd" in
     ;;
 
   run)
-    DUE=false; ONLY=""
+    DUE=false; ONLY=""; WAIT_LOCK=0
     # Политика всегда: только latest в cache (ручной и auto/tick одинаково).
     # Аварийный обход: --keep-cache-all или RBV_KEEP_CACHE_ALL=1.
     CACHE_LATEST=true
@@ -222,9 +228,25 @@ case "$cmd" in
         --storage) ONLY="$2"; shift 2 ;;
         --cache-latest) CACHE_LATEST=true; shift ;;
         --keep-cache-all) CACHE_LATEST=false; shift ;;
+        --wait) WAIT_LOCK="${2:-600}"; shift 2 ;;
         *) msg ERR "unknown $1"; exit 1 ;;
       esac
     done
+
+    # Один прогон на хост. Без этого systemd-тик (раз в минуту) стартовал
+    # второй `run --due` поверх идущего, а `run` начинается и заканчивается
+    # docker reclaim → живой restore ловил SIGKILL (exit=137, oom=false).
+    RBV_LOCK_TAG="run${ONLY:+ --storage $ONLY}"
+    export RBV_LOCK_TAG
+    if ! rbv_global_lock "$WAIT_LOCK"; then
+      if [[ "$DUE" == true ]]; then
+        msg INFO "Уже идёт прогон ($(rbv_global_lock_owner)) — расписание пропускаем"
+        exit 0
+      fi
+      msg ERR "Уже идёт прогон/уборка: $(rbv_global_lock_owner)"
+      msg INFO "Дождитесь окончания или запустите с --wait <сек>"
+      exit 1
+    fi
 
     # Файловый лог сессии (дублирует msg); дети наследуют RBV_LOG.
     WD="$(rbv_work_dir)"
@@ -263,6 +285,9 @@ case "$cmd" in
       msg INFO "шаг: проверка глобального расписания"
       rbv_global_due || { msg INFO "Ещё не время (глобальное расписание) — выход"; exit 0; }
       msg OK "расписание: due"
+      # слот занимаем СРАЗУ: иначе многочасовой (или упавший) прогон остаётся
+      # «due», и таймер пытается стартовать его каждую минуту
+      rbv_mark_global_done
     fi
 
     enq=0
@@ -324,7 +349,6 @@ case "$cmd" in
 
     msg INFO "шаг 2/3: worker (последовательный drain очереди)"
     "${SCRIPT_DIR}/rbv-worker.sh"
-    [[ "$DUE" == true ]] && rbv_mark_global_done
 
     # финальная уборка: только latest в cache; контейнеры/volumes; runs slim/prune
     if [[ "${RBV_CACHE_LATEST:-true}" == true ]]; then
@@ -358,6 +382,9 @@ case "$cmd" in
         msg OK "Очередь очищена"
         ;;
       work)
+        RBV_LOCK_TAG="queue work"
+        export RBV_LOCK_TAG
+        rbv_global_lock 0 || { msg ERR "Уже идёт прогон/уборка: $(rbv_global_lock_owner)"; exit 1; }
         exec "${SCRIPT_DIR}/rbv-worker.sh"
         ;;
       *) msg ERR "queue: status|clear|work"; exit 1 ;;
@@ -416,6 +443,10 @@ case "$cmd" in
             *) msg ERR "unknown $1"; exit 1 ;;
           esac
         done
+        RBV_LOCK_TAG="runs prune"
+        export RBV_LOCK_TAG
+        rbv_global_lock 0 \
+          || msg WARN "идёт прогон ($(rbv_global_lock_owner)) — его runs/ не трогаю"
         WD="$(rbv_work_dir)"
         before="$(rbv_disk_avail_kb "$WD")"
         n="$(rbv_runs_prune "$keep")"
@@ -502,12 +533,25 @@ case "$cmd" in
 
   reclaim)
     DOCKER_FULL=false
+    FORCE=false
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --docker) DOCKER_FULL=true; shift ;;
-        *) msg ERR "unknown $1 (reclaim [--docker])"; exit 1 ;;
+        --force) FORCE=true; shift ;;
+        *) msg ERR "unknown $1 (reclaim [--docker] [--force])"; exit 1 ;;
       esac
     done
+    # reclaim сносит контейнеры/volumes — во время прогона это ломает restore
+    RBV_LOCK_TAG="reclaim"
+    export RBV_LOCK_TAG
+    if ! rbv_global_lock 0; then
+      msg ERR "Идёт прогон: $(rbv_global_lock_owner) — уборка сейчас убьёт его песочницу"
+      if [[ "$FORCE" != true ]]; then
+        msg INFO "Дождитесь окончания или: rw-backup-verify reclaim --force (артефакты живого прогона всё равно не тронем)"
+        exit 1
+      fi
+      msg WARN "--force: чищу только то, что не принадлежит живому прогону"
+    fi
     WD="$(rbv_work_dir)"
     before="$(rbv_disk_avail_kb "$WD")"
     msg INFO "disk до: $(rbv_disk_report "$WD")"
@@ -519,10 +563,14 @@ case "$cmd" in
     dn="$(rbv_docker_reclaim || echo 0)"
     msg INFO "docker reclaim: контейнеры/volumes ≈${dn} (образы НЕ удаляем)"
     if [[ "$DOCKER_FULL" == true ]]; then
-      msg INFO "docker volume prune + container prune (образы сохраняем)…"
-      docker volume prune -f 2>&1 | tail -n 3 || true
-      docker container prune -f 2>&1 | tail -n 3 || true
-      docker network prune -f >/dev/null 2>&1 || true
+      if [[ -n "$(rbv_active_entries)" ]]; then
+        msg WARN "идёт прогон — общий prune пропускаю (снёс бы его контейнеры/сети)"
+      else
+        msg INFO "docker volume prune + container prune (образы сохраняем)…"
+        docker volume prune -f 2>&1 | tail -n 3 || true
+        docker container prune -f 2>&1 | tail -n 3 || true
+        docker network prune -f >/dev/null 2>&1 || true
+      fi
     fi
     _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
     [[ -n "$_mr" ]] && msg INFO "$_mr"
@@ -540,7 +588,12 @@ case "$cmd" in
     ;;
 
   tick)
-    # единый путь с run --due (логи сессии / шаги)
+    # Таймер тикает раз в минуту. Если прогон уже идёт — молча выходим:
+    # `run --due` сам возьмёт глобальный лок, но лишний старт службы только
+    # засоряет journal.
+    if [[ -n "$(rbv_active_entries)" ]]; then
+      exit 0
+    fi
     if rbv_global_due; then
       exec "${SCRIPT_DIR}/rw-backup-verify" run --due
     fi
