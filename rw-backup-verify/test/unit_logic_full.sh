@@ -59,6 +59,18 @@ echo "unexpected aws: $*" >&2
 exit 1
 AWS
 chmod +x "$T/bin/aws"
+
+# --- mock docker ---
+# ОБЯЗАТЕЛЬНО: `run` вызывает rbv_docker_reclaim, а тот делает `docker rm -f`
+# по маске rbv_pg_*. Без заглушки юнит-тест сносил песочницу настоящего
+# прогона на этом же хосте (ровно тот сбой, который чинится в этой ветке).
+cat > "$T/bin/docker" <<'DOCKER'
+#!/bin/bash
+printf '%s\n' "$*" >>"${T_DOCKER_LOG:-/dev/null}"
+exit 0
+DOCKER
+chmod +x "$T/bin/docker"
+export T_DOCKER_LOG="$T/docker.log"
 export PATH="$T/bin:$PATH"
 
 echo "==== classify ===="
@@ -520,6 +532,18 @@ cpath="$(rbv_cache_ensure s1 'pref/a.tar.gz' || true)"
 [[ -n "$cpath" && -s "$cpath" ]] && pass "cache adopt old archive" || fail "cache adopt" "cpath=$cpath"
 c2="$(rbv_cache_ensure s1 'pref/a.tar.gz')"
 [[ "$c2" == "$cpath" ]] && pass "cache hit path" || fail "cache hit path" "$c2"
+
+echo "==== тесты не трогают настоящий docker ===="
+# страховка: если заглушка перестанет подхватываться, тест это покажет
+if [[ -s "$T/docker.log" ]]; then
+  grep -q 'rm -f' "$T/docker.log" \
+    && pass "docker-вызовы ушли в заглушку (включая rm -f)" \
+    || pass "docker-вызовы ушли в заглушку"
+else
+  pass "docker не вызывался"
+fi
+[[ "$(command -v docker)" == "$T/bin/docker" ]] && pass "в PATH подставлен mock docker" \
+  || fail "mock docker в PATH" "$(command -v docker)"
 
 echo "==== help / unknown / save config ===="
 expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help
