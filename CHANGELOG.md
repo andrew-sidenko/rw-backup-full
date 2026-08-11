@@ -1,5 +1,12 @@
 # Changelog
 
+## v5.6.39 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **Restore без pipe host→docker**: `docker cp` + `gzip|psql` внутри контейнера
+  (pipe через `docker exec -i` на 3–4 GiB RAM давал SIGKILL 137).
+- Ещё жёстче low-mem: `shared_buffers=64MB`, `work_mem=2MB`.
+
 ## v5.6.38 (2026-08-11)
 
 ### Добавлено (`rw-backup-verify`)

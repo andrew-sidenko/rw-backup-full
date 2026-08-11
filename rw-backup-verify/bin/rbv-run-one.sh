@@ -424,11 +424,11 @@ rbv_pg_start() {
   docker run -d --name "$PG_CID" --shm-size="$shm" \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
     "postgres:${PG_VER}-alpine" \
-    -c shared_buffers=128MB \
-    -c work_mem=4MB \
+    -c shared_buffers=64MB \
+    -c work_mem=2MB \
     -c hash_mem_multiplier=1.0 \
-    -c maintenance_work_mem=64MB \
-    -c effective_cache_size=256MB \
+    -c maintenance_work_mem=32MB \
+    -c effective_cache_size=128MB \
     -c max_parallel_workers=0 \
     -c max_parallel_workers_per_gather=0 \
     -c max_parallel_maintenance_workers=0 \
@@ -501,6 +501,24 @@ rbv_pg_start() {
   return 0
 }
 
+# Restore .sql.gz внутрь контейнера (без pipe host→docker exec — он жрёт RAM).
+# $1 = path to .sql.gz on host. Пишет stderr в ${RUN_DIR}/psql.err.
+# stdout: ничего; rc = psql/docker.
+rbv_pg_restore_sql() {
+  local sql="$1"
+  local remote="/tmp/rbv_dump.sql.gz"
+  : >"${RUN_DIR}/psql.err"
+  [[ -n "${PG_CID:-}" && -f "$sql" ]] || return 1
+  docker cp "$sql" "${PG_CID}:${remote}" 2>>"${RUN_DIR}/psql.err" || return 1
+  # restore внутри контейнера: один gzip+psql, без буферов docker attach на хосте
+  docker exec "$PG_CID" sh -c \
+    "gzip -dc '${remote}' | psql -q -U postgres -d postgres -v ON_ERROR_STOP=0" \
+    >/dev/null 2>>"${RUN_DIR}/psql.err"
+  local rc=$?
+  docker exec "$PG_CID" rm -f "$remote" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
 DB_TABLES=0
 if [[ "$ok" == true ]]; then
   # PG_CID уже задан при старте скрипта (короткое имя)
@@ -535,7 +553,7 @@ if [[ "$ok" == true ]]; then
     _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
     [[ -n "$_mr" ]] && rep "$_mr"
     sql_sz="$(du -h "$SQL" 2>/dev/null | awk '{print $1}')"
-    rep "psql restore: $(basename "$SQL") (${sql_sz}) — может занять минуты"
+    rep "psql restore: $(basename "$SQL") (${sql_sz}) — docker cp + psql внутри контейнера"
     (
       t=0
       while sleep 15; do
@@ -557,8 +575,7 @@ if [[ "$ok" == true ]]; then
       fi
       : >"${RUN_DIR}/psql.err"
       set +e
-      gzip -dc "$SQL" | docker exec -i "$PG_CID" \
-        psql -q -U postgres -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err"
+      rbv_pg_restore_sql "$SQL"
       _psql_rc=$?
       set -e
 
@@ -617,8 +634,7 @@ if [[ "$ok" == true ]]; then
       if rbv_pg_start "schema-retry"; then
         : >"${RUN_DIR}/psql.err"
         set +e
-        gzip -dc "$SQL" | docker exec -i "$PG_CID" \
-          psql -q -U postgres -d postgres -v ON_ERROR_STOP=0 >/dev/null 2>"${RUN_DIR}/psql.err"
+        rbv_pg_restore_sql "$SQL"
         _psql_rc=$?
         set -e
         rep "psql restore retry: rc=${_psql_rc}"
