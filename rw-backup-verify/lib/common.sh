@@ -303,37 +303,33 @@ rbv_slim_old_runs() {
   done
 }
 
-# Убрать leftover Docker от verify: rbv_pg_*, rbv_probe_*, rbv_iso_*, сети rbv_*,
-# compose-проекты rbv*. PG verify НЕ монтирует хост — PGDATA только в слое контейнера
-# (/var/lib/docker/…); путь /var/lib/postgresql/data внутри контейнера, не на хосте.
-# stdout: краткий отчёт; rc=0.
+# Убрать leftover Docker от verify после тестов.
+# Политика: контейнеры/сети/volumes удаляем; ОБРАЗЫ оставляем (pull при смене тега).
+# PG sandbox без -v → PGDATA в слое контейнера; compose anonymous volumes — через down -v + prune.
+# stdout: число снятых контейнеров/проектов; rc=0.
 rbv_docker_reclaim() {
-  local n=0 id
-  # postgres sandbox
+  local n=0 id proj
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     docker rm -f "$id" >/dev/null 2>&1 && n=$((n + 1)) || true
   done < <(docker ps -aq --filter 'name=rbv_pg_' 2>/dev/null || true)
-  # probe / preflight
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     docker rm -f "$id" >/dev/null 2>&1 && n=$((n + 1)) || true
   done < <(docker ps -aq --filter 'name=rbv_probe_' --filter 'name=rbv_iso_' --filter 'name=rbv_preflight_' 2>/dev/null || true)
-  # compose projects (имена нижним регистром, префикс rbv)
-  local proj
   while IFS= read -r proj; do
     [[ -n "$proj" ]] || continue
     docker compose -p "$proj" down -v --remove-orphans >/dev/null 2>&1 || true
     n=$((n + 1))
   done < <(docker ps -a --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
     | grep -E '^rbv' | sort -u || true)
-  # сети
   while IFS= read -r id; do
     [[ -n "$id" ]] || continue
     docker network rm "$id" >/dev/null 2>&1 || true
-  done < <(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E 'rbv|_net$' || true)
-  # висячие anonymous volumes (осторожно: только dangling)
+  done < <(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^rbv|_net$' || true)
+  # dangling volumes (после down -v / rm контейнеров) — главный потребитель диска
   docker volume prune -f >/dev/null 2>&1 || true
+  docker container prune -f >/dev/null 2>&1 || true
   echo "$n"
   return 0
 }

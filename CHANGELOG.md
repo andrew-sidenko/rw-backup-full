@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.6.35 (2026-08-11)
+
+### Изменено (`rw-backup-verify`)
+- Политика: **образы docker сохраняем**, при смене тега в compose — `pull`;
+  после теста удаляем **контейнеры + volumes** (`down -v` + `volume prune`).
+- `reclaim --docker` больше **не** делает `system prune -af` (не сносит образы).
+- После `run`: cache latest + docker reclaim + `runs prune keep=0`.
+- Кэш архивов — как в S3, без доп. шифрования.
+
 ## v5.6.34 (2026-08-11)
 
 ### Добавлено / исправлено (`rw-backup-verify`)

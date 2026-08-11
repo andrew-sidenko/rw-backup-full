@@ -75,6 +75,8 @@ cleanup() {
       [[ -n "$_old" ]] || continue
       docker rm -f "$_old" >/dev/null 2>&1 || true
     done < <(docker ps -aq --filter 'name=rbv_pg_' --filter 'name=rbv_probe_' 2>/dev/null || true)
+    # anonymous volumes от stack (redis/pgdata) — иначе копятся в /var/lib/docker/volumes
+    docker volume prune -f >/dev/null 2>&1 || true
     # освободить диск для следующего job: dump/extract убрать, report/compose оставить
     if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR}" ]]; then
       rbv_run_slim "$RUN_DIR"
@@ -172,7 +174,7 @@ else
       mark_retryable
       rep "  ${_err}"
       rep "  → rw-backup-verify runs prune --keep 0"
-      rep "  → docker system prune -af"
+      rep "  → rw-backup-verify reclaim --docker"
     else
       fail_add "download failed"
       rbv_check_add download fail "не скачался ${S3_URI}"
@@ -406,7 +408,7 @@ if [[ "$ok" == true ]]; then
     rbv_check_add db_schema fail "ENOSPC: свободно ${_av:-?} KiB, нужно ≥${_need_kb}"
     mark_retryable
     rep "FAIL disk: $(rbv_disk_report "$WD") — НЕ в tested (retryable)"
-    rep "  → rw-backup-verify runs prune --keep 0 && docker system prune -af"
+    rep "  → rw-backup-verify reclaim --docker"
   fi
 
   if [[ "$ok" == true ]] && rbv_pg_start init; then
@@ -946,12 +948,18 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
         "$NET_NAME" "$PG_CID" 2>/dev/null \
         || docker network connect "$NET_NAME" "$PG_CID" || true
 
-      rep "stack: compose up -d (project=${COMPOSE_PROJECT}, сеть ${NET_NAME})…"
+      rep "stack: compose pull (новые теги из бэкапа) + up -d (project=${COMPOSE_PROJECT}, сеть ${NET_NAME})…"
       set +e
+      # образы храним; при смене тега в compose — докачиваем (не prune images)
+      docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" pull \
+        >"${RUN_DIR}/compose.pull.out" 2>"${RUN_DIR}/compose.pull.err"
       docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" up -d --no-build \
         >"${RUN_DIR}/compose.up.out" 2>"${RUN_DIR}/compose.up.err"
       up_rc=$?
       set -e
+      if [[ -s "${RUN_DIR}/compose.pull.out" ]]; then
+        rep_file "compose pull" "${RUN_DIR}/compose.pull.out" 20
+      fi
       if [[ -s "${RUN_DIR}/compose.up.out" ]]; then
         rep_file "compose up stdout" "${RUN_DIR}/compose.up.out" 40
       fi

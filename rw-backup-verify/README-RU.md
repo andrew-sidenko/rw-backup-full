@@ -126,19 +126,16 @@ stack будет skip.
 Освободить диск:
 
 ```bash
-rw-backup-verify disk                 # куда ушло место
-rw-backup-verify reclaim --docker     # runs+cache latest + rbv_* + docker prune
-# вручную то же по частям:
-rw-backup-verify runs prune --keep 0
-rw-backup-verify cache prune
-docker ps -a --filter name=rbv_
-docker system prune -af
+rw-backup-verify disk
+rw-backup-verify reclaim --docker   # runs+cache latest + volumes/containers (образы остаются)
 ```
 
-**Важно:** sandbox Postgres (`rbv_pg_*`) стартует **без `-v`** — каталог
-`/var/lib/postgresql/data` (и `pg_wal`) это путь *внутри контейнера*, данные
-лежат в `/var/lib/docker/`. Если на **хосте** есть `/var/lib/postgresql` —
-это не rbv (пакет postgresql / чужой bind-mount).
+Политика хранения:
+- **архивы** в `cache/archives/` — только latest на экземпляр, как скачаны из S3
+  (без доп. шифрования); остальное удаляется на каждом run/tick;
+- **контейнеры/volumes** — удаляются после каждого теста (`down -v` + volume prune);
+- **образы** — сохраняются; при смене тега в compose бэкапа — `compose pull`;
+- **PG sandbox** (`rbv_pg_*`) без `-v` на хост; `/var/lib/postgresql` на хосте ≠ rbv.
 
 После каждого job тяжёлые `extract/`/sql из `runs/<id>/` удаляются автоматически
 (остаются report + compose.*); перед большим restore — gate ≥max(1.5 GiB, 4×sql.gz).

@@ -33,16 +33,17 @@ rw-backup-verify — автономная проверка логических 
   runs prune [--keep N]             # удалить старые runs/ (архивы → cache, default keep=2)
   cache list | prune | clear        # prune = только последний архив на экземпляр
   disk                              # что занимает место + подсказки
-  reclaim [--docker]                # runs keep=0 + cache latest + rbv_* контейнеры
-                                    #   --docker: ещё docker system prune -af
+  reclaim [--docker]                # runs keep=0 + cache latest + контейнеры/volumes
+                                    #   --docker: volume/container prune (ОБРАЗЫ не трогаем)
   tick                              # systemd: если глобально due → run --due
 
 Логи: work_dir/logs/run_*.log и work_dir/runs/<id>/
-Кэш (только latest на экземпляр): work_dir/cache/archives/
-  — при каждом run/tick старые скачанные архивы удаляются;
-  — остаётся последняя копия для ручного прогона без повторного S3.
-PG verify: контейнер rbv_pg_* БЕЗ mount на хост (PGDATA в /var/lib/docker);
-путь /var/lib/postgresql/data — внутри контейнера, не каталог хоста.
+Кэш (только latest, как в S3, без доп. шифрования): work_dir/cache/archives/
+  — при каждом run/tick старые скачанные удаляются;
+  — остаётся последняя копия на экземпляр для ручного прогона без S3.
+После теста: контейнеры/volumes удаляются; docker-образы сохраняются
+(при смене тега в compose — pull новых).
+PG verify: контейнер rbv_pg_* БЕЗ mount на хост (PGDATA в /var/lib/docker).
 Глубокий обход: любые вложенные папки; в каждой — экземпляры panel/bot
 (по семейству имён). Тестируется только latest каждого экземпляра,
 если этот архив ещё не был в tested/.
@@ -325,16 +326,23 @@ case "$cmd" in
     "${SCRIPT_DIR}/rbv-worker.sh"
     [[ "$DUE" == true ]] && rbv_mark_global_done
 
-    # финальная уборка скачанных: в cache только latest (ручной = auto)
+    # финальная уборка: только latest в cache; контейнеры/volumes; runs slim/prune
     if [[ "${RBV_CACHE_LATEST:-true}" == true ]]; then
       _cn="$(rbv_cache_prune_latest "${ONLY}" || echo 0)"
       _cn="$(echo "$_cn" | tr -d '[:space:]')"
       [[ "$_cn" =~ ^[0-9]+$ ]] || _cn=0
-      msg INFO "cache: после прогона — только latest на экземпляр (удалено старых=${_cn})"
+      msg INFO "cache: после прогона — только latest на экземпляр (удалено старых=${_cn}; как в S3, без шифрования)"
     fi
+    _dn="$(rbv_docker_reclaim || echo 0)"
+    _dn="$(echo "$_dn" | tr -d '[:space:]')"
+    [[ "$_dn" =~ ^[0-9]+$ ]] || _dn=0
+    msg INFO "docker: контейнеры/volumes после тестов убраны (≈${_dn}; образы сохранены)"
+    _rn="$(rbv_runs_prune 0 || echo 0)"
+    _rn="$(echo "$_rn" | tr -d '[:space:]')"
+    [[ "$_rn" =~ ^[0-9]+$ ]] || _rn=0
+    (( _rn > 0 )) && msg INFO "runs: удалено ${_rn} (отчёты уже в TG/logs; архивы в cache)"
     msg OK "шаг 3/3: готово"
-    msg INFO "отчёты: ${WD}/runs/  ·  кэш latest: ${WD}/cache/archives/"
-    msg INFO "лог сессии: ${RBV_LOG}"
+    msg INFO "кэш latest: ${WD}/cache/archives/  ·  лог: ${RBV_LOG}"
     ;;
 
   queue)
@@ -505,12 +513,14 @@ case "$cmd" in
     msg INFO "runs prune keep=0: удалено ${n}"
     export RBV_CACHE_LATEST=true
     cn="$(rbv_cache_prune_latest "" || echo 0)"
-    msg INFO "cache prune latest: удалено ${cn}"
+    msg INFO "cache prune latest: удалено ${cn} (архивы как в S3, без доп. шифрования)"
     dn="$(rbv_docker_reclaim || echo 0)"
-    msg INFO "docker reclaim rbv_*: ≈${dn}"
+    msg INFO "docker reclaim: контейнеры/volumes ≈${dn} (образы НЕ удаляем)"
     if [[ "$DOCKER_FULL" == true ]]; then
-      msg WARN "docker system prune -af (образы/stopped)…"
-      docker system prune -af 2>&1 | tail -n 5 || true
+      msg INFO "docker volume prune + container prune (образы сохраняем)…"
+      docker volume prune -f 2>&1 | tail -n 3 || true
+      docker container prune -f 2>&1 | tail -n 3 || true
+      docker network prune -f >/dev/null 2>&1 || true
     fi
     after="$(rbv_disk_avail_kb "$WD")"
     msg OK "disk после: $(rbv_disk_report "$WD")"
