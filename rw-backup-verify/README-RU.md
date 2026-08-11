@@ -91,6 +91,16 @@ rw-backup-verify run --storage cf-oneok     # сейчас
 data-проверки помечаются `skip` — раньше они рапортовали «нет таблицы users»,
 хотя дамп был цел.
 
+**Какая БД проверяется.** Дампы ботов — обычно `pg_dumpall`: приложение живёт в
+своей базе (`vpnbot` и т.п.), а в `postgres` пусто или лежит служебная мелочь.
+Выбирается самая содержательная БД — сначала та, где есть `public.users`, затем
+по числу таблиц; `POSTGRES_DB` из `PROFILE.env` имеет приоритет. Список
+кандидатов пишется в отчёт:
+
+```
+db_schema: db=vpnbot user_tables=23 (кандидаты: vpnbot=23+users)
+```
+
 Роли из дампа (`OWNER TO` / `GRANT … TO` / `AUTHORIZATION`) создаются в
 песочнице заранее, иначе restore сыплет `role "…" does not exist`.
 Параметры Postgres подбираются под доступную RAM, `fsync`/`full_page_writes`/
