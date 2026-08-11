@@ -108,11 +108,17 @@ rbv_psql() {
 # попадали в `postgres` → «users table missing» при целом бэкапе.
 # Берём самую содержательную: сначала та, где есть public.users, затем по числу
 # таблиц; явная подсказка (POSTGRES_DB из PROFILE.env) имеет приоритет.
-# $1 — подсказка. stdout: число таблиц; RBV_PG_DB и RBV_PG_DB_LIST выставляются.
+# ВАЖНО: вызывать БЕЗ подстановки `$(…)`. Функция выставляет RBV_PG_DB /
+# RBV_PG_TABLES / RBV_PG_DB_LIST в текущей оболочке, а в подоболочке они
+# умирают вместе с ней — из-за этого выбранная БД («vpnbot») терялась, все
+# дальнейшие запросы шли в пустую `postgres`, и целый бэкап получал
+# «users table missing».
+# $1 — подсказка. stdout: число таблиц (для логов).
 rbv_select_app_db() {
   local hint="${1:-}" db tables users score
   local best_db="postgres" best_score=-1 best_tables=0
   RBV_PG_DB="postgres"
+  RBV_PG_TABLES=0
   RBV_PG_DB_LIST=""
   _rbv_db_tables() {
     docker exec "$PG_CID" psql -U postgres -d "$1" -Atc \
@@ -148,6 +154,7 @@ rbv_select_app_db() {
     return 0
   fi
   RBV_PG_DB="$best_db"
+  RBV_PG_TABLES="$best_tables"
   printf '%s\n' "$best_tables"
   return 0
 }

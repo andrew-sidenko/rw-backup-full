@@ -87,6 +87,34 @@ reason_for() {
 [[ "$(reason_for 'exited|false|false|1')" == "crash" ]] && pass "exited(1) → crash" || fail "crash" "$(reason_for 'exited|false|false|1')"
 [[ "$(reason_for 'x|x|x|x' 1)" == "external" ]] && pass "контейнер исчез → external" || fail "gone" "$(reason_for 'x|x|x|x' 1)"
 
+echo "==== выбор БД приложения ===="
+# 1) выбранная БД обязана пережить вызов (никаких $(…) у вызывающего)
+# 2) берём БД с public.users, а не первую непустую (pg_dumpall: postgres пустой,
+#    приложение живёт в vpnbot)
+cat >"$T/bin/docker" <<'DOCKER'
+#!/bin/bash
+q="${*: -1}"
+case "$q" in
+  *"FROM pg_database WHERE NOT datistemplate ORDER BY"*) printf 'postgres\nvpnbot\n' ;;
+  *"pg_stat_user_tables"*)
+      case "$*" in *"-d vpnbot"*) echo 23 ;; *) echo 0 ;; esac ;;
+  *"to_regclass('public.users')"*)
+      case "$*" in *"-d vpnbot"*) echo 1 ;; *) echo 0 ;; esac ;;
+esac
+exit 0
+DOCKER
+chmod +x "$T/bin/docker"
+out="$(PATH="$T/bin:$PATH" bash -c '
+  set -euo pipefail
+  export RBV_CONFIG="'"$RBV_CONFIG"'" RBV_STATE_DIR="'"$RBV_STATE_DIR"'"
+  source "'"$ROOT"'/lib/common.sh"; source "'"$ROOT"'/lib/checks.sh"
+  PG_CID=rbv_pg_x
+  rbv_select_app_db "" >/dev/null
+  echo "db=${RBV_PG_DB} tables=${RBV_PG_TABLES} list=${RBV_PG_DB_LIST}"')"
+[[ "$out" == *"db=vpnbot"* ]] && pass "выбрана БД с public.users" || fail "выбор БД" "$out"
+[[ "$out" == *"tables=23"* ]] && pass "число таблиц из выбранной БД" || fail "число таблиц" "$out"
+[[ "$out" == *"vpnbot=23+users"* ]] && pass "список кандидатов в отчёт" || fail "кандидаты" "$out"
+
 echo "==== rbv_pg_tunables ===="
 out="$(bash -c '
   set -euo pipefail

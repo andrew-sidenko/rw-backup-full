@@ -460,8 +460,9 @@ if [[ "$ok" == true ]]; then
         ;;
     esac
     if rbv_pg_alive; then
-      DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
-      DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
+      # без $(…): выбранная БД должна остаться в текущей оболочке
+      rbv_select_app_db "${RBV_PG_DB_HINT}" >/dev/null
+      DB_TABLES="${RBV_PG_TABLES:-0}"
       [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
     else
       DB_TABLES=0

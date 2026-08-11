@@ -86,6 +86,10 @@ mkdir -p "$B/swarm"
   echo "SET statement_timeout = 0;"
   echo "SET client_encoding = 'UTF8';"
   echo "SET standard_conforming_strings = on;"
+  # как на проде: дамп кластера (pg_dumpall) — приложение живёт в своей БД,
+  # а `postgres` остаётся пустым. Проверяем, что выбирается именно vpnbot.
+  echo "CREATE DATABASE vpnbot;"
+  echo "\\connect vpnbot"
   # владелец, которого нет в песочнице → проверяем rbv_pg_precreate_roles
   echo "CREATE TABLE public.users (id bigint NOT NULL, telegram_id bigint, username text, created_at timestamp with time zone, updated_at timestamp with time zone);"
   echo "ALTER TABLE public.users OWNER TO botuser;"
@@ -109,7 +113,9 @@ mkdir -p "$B/swarm"
   echo "GRANT ALL ON TABLE public.users TO botuser;"
 } | gzip -1 >"$B/postgres_dump.sql.gz"
 
-printf 'POSTGRES_SERVICE=postgres\nREDIS_SERVICE=redis\nPOSTGRES_DB=postgres\n' >"$B/PROFILE.env"
+# без POSTGRES_DB: на проде PROFILE.env в архиве бота вообще нет — БД должна
+# определяться по содержимому кластера, а не по подсказке
+printf 'POSTGRES_SERVICE=postgres\nREDIS_SERVICE=redis\n' >"$B/PROFILE.env"
 printf 'REDIS0011fake' >"$B/redis_dump.rdb"
 
 cat >"$B/swarm/docker-compose.yml" <<'YML'
@@ -167,6 +173,12 @@ dt(){ jq -r --arg n "$1" '[.[]|select(.name==$n)][-1].detail // "—"' "$checks"
 [[ "$(st isolation)" == "ok" ]] && pass "isolation ok" || fail "isolation" "$(dt isolation)"
 [[ "$(st stack)" == "ok" ]] && pass "stack ok" || fail "stack" "$(dt stack)"
 
+grep -q 'db_schema: db=vpnbot' "${run_dir}/report.txt" \
+  && pass "выбрана БД приложения (vpnbot), а не пустая postgres" \
+  || fail "выбор БД" "$(grep 'db_schema:' "${run_dir}/report.txt" || true)"
+grep -q 'кандидаты: .*vpnbot=3+users' "${run_dir}/report.txt" \
+  && pass "кандидаты БД в отчёте" || fail "кандидаты БД" "$(grep 'db_schema:' "${run_dir}/report.txt" || true)"
+
 users="$(jq -r '.user_rows' "${run_dir}/summary.json" 2>/dev/null || echo 0)"
 [[ "$users" == "$ROWS" ]] && pass "user_rows=${ROWS}" || fail "user_rows count" "got=$users"
 tables="$(jq -r '.db_tables' "${run_dir}/summary.json" 2>/dev/null || echo 0)"
@@ -193,7 +205,7 @@ echo "==== B) внешний docker rm -f во время restore ===="
 rm -rf "${RBV_STATE_DIR:?}/runs"
 
 # дамп побольше: restore должен идти несколько секунд, чтобы попасть в него
-ROWS_B="${RBV_TEST_ROWS_BIG:-300000}"
+ROWS_B="${RBV_TEST_ROWS_BIG:-800000}"
 {
   echo "CREATE TABLE public.users (id bigint NOT NULL, telegram_id bigint, username text, created_at timestamp with time zone, updated_at timestamp with time zone);"
   echo "ALTER TABLE public.users OWNER TO botuser;"
@@ -212,14 +224,13 @@ tar -czf "${T}/s3/${KEY_B}" -C "$B" postgres_dump.sql.gz PROFILE.env redis_dump.
 
 (
   # ждём, пока restore реально начнётся (строка в report), и сносим песочницу
-  for _ in $(seq 1 1200); do
+  for _ in $(seq 1 2400); do
     if grep -rqs 'psql restore: postgres_dump' "${RBV_STATE_DIR}/runs" 2>/dev/null; then
-      sleep 1
       docker ps -q --filter 'name=rbv_pg_' 2>/dev/null \
         | while IFS= read -r c; do [[ -n "$c" ]] && docker rm -f "$c" >/dev/null 2>&1; done
       exit 0
     fi
-    sleep 0.25
+    sleep 0.1
   done
 ) >/dev/null 2>&1 &
 killer=$!
