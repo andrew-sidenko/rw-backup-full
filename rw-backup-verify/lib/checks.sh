@@ -138,20 +138,63 @@ rbv_select_app_db() {
   printf '0\n'
 }
 
+# to_regclass → schema.table или пусто; всегда rc=0.
+rbv_regclass() {
+  local name="$1" c
+  c="$(rbv_psql "SELECT to_regclass('${name}');")"
+  c="$(echo "$c" | tr -d '[:space:]')"
+  if [[ -n "$c" && "$c" != "null" ]]; then
+    printf '%s\n' "$c"
+  fi
+  return 0
+}
+
+# Колонки таблицы: name|udt_name (по одной на строку). $1 = bare table name (public).
+rbv_table_columns() {
+  local tbl="$1"
+  rbv_psql "SELECT column_name||'|'||udt_name FROM information_schema.columns WHERE table_schema='public' AND table_name='${tbl}' ORDER BY ordinal_position;"
+  return 0
+}
+
+# В отчёт: список полей таблицы (или «таблица отсутствует»).
+# Печатает в stdout; вызывающий пишет в report.
+rbv_dump_table_fields() {
+  local bare="$1" reg cols
+  reg="$(rbv_regclass "public.${bare}")"
+  if [[ -z "$reg" ]]; then
+    printf '%s: (таблица отсутствует)\n' "$bare"
+    return 0
+  fi
+  cols="$(rbv_table_columns "$bare")"
+  if [[ -z "$(echo "$cols" | tr -d '[:space:]')" ]]; then
+    printf '%s (%s): (колонки не прочитались)\n' "$bare" "$reg"
+    return 0
+  fi
+  printf '%s (%s) columns:\n' "$bare" "$reg"
+  while IFS='|' read -r n t || [[ -n "${n:-}" ]]; do
+    [[ -n "${n:-}" ]] || continue
+    printf '  - %s (%s)\n' "$n" "${t:-?}"
+  done <<<"$cols"
+  return 0
+}
+
 rbv_find_users_table() {
+  # $1 = optional kind (bot → строго public.users; иначе эвристика panel).
   # stdout: schema.table or empty; всегда rc=0 (иначе set -e рвёт utbl="$(…)")
-  local t c
+  local kind="${1:-}" t c
+  if [[ "$kind" == "bot" ]]; then
+    rbv_regclass "public.users"
+    return 0
+  fi
   for t in public.users users public.user user; do
-    c="$(rbv_psql "SELECT to_regclass('${t}');")"
-    c="$(echo "$c" | tr -d '[:space:]')"
-    if [[ -n "$c" && "$c" != "null" ]]; then
+    c="$(rbv_regclass "$t")"
+    if [[ -n "$c" ]]; then
       printf '%s\n' "$c"
       return 0
     fi
   done
-  c="$(rbv_psql "SELECT to_regclass('public.\"User\"');")"
-  c="$(echo "$c" | tr -d '[:space:]')"
-  if [[ -n "$c" && "$c" != "null" ]]; then
+  c="$(rbv_regclass 'public."User"')"
+  if [[ -n "$c" ]]; then
     printf '%s\n' "$c"
     return 0
   fi
@@ -174,9 +217,71 @@ rbv_count_table() {
   return 0
 }
 
-# Max epoch of "event-like" columns (best-effort по известным таблицам/полям).
+# Timestamp/date колонки public.$1 (имена, по одной строке).
+rbv_table_ts_columns() {
+  local bare="$1"
+  rbv_psql "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='${bare}' AND (data_type IN ('timestamp without time zone','timestamp with time zone','date') OR udt_name IN ('timestamp','timestamptz','date')) ORDER BY ordinal_position;"
+  return 0
+}
+
+# Max epoch по timestamp-колонкам таблицы.
+# stdout:
+#   nofields          — нет timestamp/date колонок
+#   0|<table>         — колонки есть, но MAX пуст
+#   <epoch>|<table.col>
+rbv_max_epoch_in_table() {
+  local bare="$1" col e epoch=0 best="" tried=0 has
+  while IFS= read -r col || [[ -n "${col:-}" ]]; do
+    col="$(echo "${col:-}" | tr -d '[:space:]')"
+    [[ -n "$col" ]] || continue
+    tried=$((tried + 1))
+    e="$(rbv_psql "SELECT EXTRACT(EPOCH FROM MAX(${col}))::bigint FROM public.${bare};" | tr -d '[:space:]')"
+    [[ "$e" =~ ^[0-9]+$ ]] || continue
+    if (( e > epoch )); then
+      epoch=$e
+      best="${bare}.${col}"
+    fi
+  done < <(rbv_table_ts_columns "$bare")
+  # fallback: известные имена, если information_schema пуст/не отдал типы
+  if (( tried == 0 )); then
+    for col in created_at updated_at processed_at received_at event_at timestamp \
+               '"createdAt"' '"updatedAt"' '"processedAt"'; do
+      has="$(rbv_psql "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='${bare}' AND column_name='${col//\"/}' LIMIT 1;" | tr -d '[:space:]')"
+      [[ "$has" == "1" ]] || continue
+      tried=$((tried + 1))
+      e="$(rbv_psql "SELECT EXTRACT(EPOCH FROM MAX(${col}))::bigint FROM public.${bare};" | tr -d '[:space:]')"
+      [[ "$e" =~ ^[0-9]+$ ]] || continue
+      if (( e > epoch )); then
+        epoch=$e
+        best="${bare}.${col//\"/}"
+      fi
+    done
+  fi
+  if (( tried == 0 )); then
+    printf 'nofields\n'
+    return 0
+  fi
+  if [[ -n "$best" ]]; then
+    printf '%s|%s\n' "$epoch" "$best"
+  else
+    printf '0|%s\n' "$bare"
+  fi
+  return 0
+}
+
+# Max epoch of "event-like" columns.
+# $1 = optional kind: bot → payment_webhook_events; иначе users/nodes (panel).
+# stdout: см. rbv_max_epoch_in_table; panel — "epoch" или "epoch|table".
 rbv_max_event_epoch() {
-  local epoch=0 cand e
+  local kind="${1:-}" epoch=0 cand e best=""
+  if [[ "$kind" == "bot" ]]; then
+    if [[ -z "$(rbv_regclass "public.payment_webhook_events")" ]]; then
+      printf 'missing\n'
+      return 0
+    fi
+    rbv_max_epoch_in_table payment_webhook_events
+    return 0
+  fi
   for cand in \
     "SELECT EXTRACT(EPOCH FROM MAX(updated_at))::bigint FROM users" \
     "SELECT EXTRACT(EPOCH FROM MAX(created_at))::bigint FROM users" \
@@ -190,9 +295,17 @@ rbv_max_event_epoch() {
     [[ "$e" =~ ^[0-9]+$ ]] || continue
     if (( e > epoch )); then
       epoch=$e
+      case "$cand" in
+        *FROM\ users*) best="users" ;;
+        *FROM\ nodes*) best="nodes" ;;
+      esac
     fi
   done
-  printf '%s\n' "$epoch"
+  if [[ -n "$best" ]]; then
+    printf '%s|%s\n' "$epoch" "$best"
+  else
+    printf '%s\n' "$epoch"
+  fi
   return 0
 }
 

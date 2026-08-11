@@ -390,6 +390,38 @@ set +e
 out="$(rbv_find_users_table)"; rc=$?
 set -e
 [[ "$rc" -eq 0 ]] && pass "find_users rc0" || fail "find_users rc0" "rc=$rc"
+
+# bot: users строго public.users; events из payment_webhook_events
+_orig_psql="$(declare -f rbv_psql)"
+rbv_psql() {
+  case "$1" in
+    *"to_regclass('public.users')"*) printf 'public.users\n' ;;
+    *"to_regclass('public.payment_webhook_events')"*) printf '\n' ;;
+    *) printf '\n' ;;
+  esac
+  return 0
+}
+[[ "$(rbv_find_users_table bot)" == "public.users" ]] && pass "bot find_users strict" || fail "bot find_users" "$(rbv_find_users_table bot)"
+[[ "$(rbv_max_event_epoch bot | head -n1)" == "missing" ]] && pass "bot event missing tbl" || fail "bot event missing" "$(rbv_max_event_epoch bot)"
+_dump="$(rbv_dump_table_fields payment_webhook_events)"
+echo "$_dump" | grep -q 'отсутствует' && pass "dump missing table" || fail "dump missing" "$_dump"
+
+rbv_psql() {
+  case "$1" in
+    *"to_regclass('public.payment_webhook_events')"*) printf 'public.payment_webhook_events\n' ;;
+    *"column_name FROM information_schema"*timestamp*) printf 'created_at\n' ;;
+    *"EXTRACT(EPOCH FROM MAX(created_at))"*) printf '1700000000\n' ;;
+    *"column_name||'*|*"*) printf 'id|int4\ncreated_at|timestamptz\n' ;;
+    *"column_name||'|'||udt_name"*) printf 'id|int4\ncreated_at|timestamptz\n' ;;
+    *) printf '\n' ;;
+  esac
+  return 0
+}
+_ev="$(rbv_max_event_epoch bot | head -n1)"
+[[ "$_ev" == "1700000000|payment_webhook_events.created_at" ]] && pass "bot event from webhook" || fail "bot event webhook" "$_ev"
+_dump="$(rbv_dump_table_fields payment_webhook_events)"
+echo "$_dump" | grep -q 'created_at' && pass "dump webhook columns" || fail "dump webhook cols" "$_dump"
+eval "$_orig_psql"
 # sql_errs counting must not become 00
 : >"$T/empty.err"
 se="$(grep -cE '^ERROR' "$T/empty.err" 2>/dev/null || true)"

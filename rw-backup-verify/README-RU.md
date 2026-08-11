@@ -55,11 +55,14 @@ rw-backup-verify run --storage cf-oneok     # сейчас
 
 | Ключ | Смысл |
 |---|---|
-| `user_rows` | users не пуста и ≥ предыдущей проверки (baseline) |
-| `event_freshness` | max(created/updated/…) в окне [prev_backup − skew … curr_backup + skew] |
+| `user_rows` | **bot:** строго `public.users`; **panel:** эвристика. Не пуста и ≥ предыдущей проверки (baseline) |
+| `event_freshness` | **bot:** max(timestamp) из `payment_webhook_events`; **panel:** users/nodes. Окно [prev_backup − skew … curr_backup + skew] |
 | `stack` | поднять compose в `--internal` + без падений `stability_seconds` |
 | `isolation` | сеть `Internal=true` + нет внешнего TCP egress (DNS на internal часто резолвится — это не leak). **Preflight** до download: если хост не изолирует — все тесты стоп. В stack — до stability/ports. |
 | `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
+
+**Bot:** если нет `users` / `payment_webhook_events` или у webhook нет timestamp-полей —
+в `runs/<id>/report.txt` печатаются колонки этих таблиц (чтобы увидеть реальную схему).
 
 `timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
 

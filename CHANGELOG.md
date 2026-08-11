@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.6.31 (2026-08-11)
+
+### Изменено (`rw-backup-verify`)
+- **Bot DB checks**: `user_rows` → строго `public.users`; `event_freshness` →
+  timestamp из `payment_webhook_events`.
+- Если таблицы/нужных полей нет — в report выводятся колонки `users` и
+  `payment_webhook_events` (ручная диагностика схемы).
+
 ## v5.6.30 (2026-08-10)
 
 ### Изменено (`rw-backup-verify`)

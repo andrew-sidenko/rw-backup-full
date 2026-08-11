@@ -518,11 +518,21 @@ if [[ "$ok" == true ]]; then
     fi
 
     # user_rows: не пусто + ≥ предыдущей проверки (один toggle)
+    # bot → строго public.users; panel → эвристика.
     if rbv_check_enabled "$KIND" user_rows; then
-      utbl="$(rbv_find_users_table || true)"
+      utbl="$(rbv_find_users_table "$KIND" || true)"
       if [[ -z "$utbl" ]]; then
-        rbv_check_add user_rows skip "таблица users не найдена"
-        rep "user_rows: skip (нет таблицы)"
+        if [[ "$KIND" == "bot" ]]; then
+          rbv_check_add user_rows fail "таблица public.users не найдена"
+          fail_add "users table missing"
+          rep "user_rows: FAIL — нет public.users; поля таблиц users / payment_webhook_events:"
+          while IFS= read -r _line || [[ -n "${_line:-}" ]]; do
+            [[ -n "${_line:-}" ]] && rep "  ${_line}"
+          done < <(rbv_dump_table_fields users; rbv_dump_table_fields payment_webhook_events)
+        else
+          rbv_check_add user_rows skip "таблица users не найдена"
+          rep "user_rows: skip (нет таблицы)"
+        fi
       else
         USER_ROWS="$(rbv_count_table "$utbl" || true)"
         [[ "$USER_ROWS" =~ ^[0-9]+$ ]] || USER_ROWS=0
@@ -547,33 +557,67 @@ if [[ "$ok" == true ]]; then
     fi
 
     # event freshness (relative to backup window + skew)
+    # bot → даты из payment_webhook_events; panel → users/nodes.
     if rbv_check_enabled "$KIND" event_freshness; then
-      LAST_EVENT="$(rbv_max_event_epoch)"
-      skew="$(rbv_skew_sec)"
-      if [[ "${LAST_EVENT:-0}" -eq 0 ]]; then
-        rbv_check_add event_freshness skip "нет timestamp-колонок событий"
-      elif [[ "${CURR_ARCH_EPOCH:-0}" -eq 0 ]]; then
-        rbv_check_add event_freshness skip "не разобрать TS архива"
-      else
-        if [[ "${PREV_ARCH_EPOCH:-0}" -gt 0 ]]; then
-          local_lo=$(( PREV_ARCH_EPOCH - skew ))
-        else
-          local_lo=$(( CURR_ARCH_EPOCH - skew - 86400*30 ))
-        fi
-        local_hi=$(( CURR_ARCH_EPOCH + skew ))
-        if (( LAST_EVENT < local_lo || LAST_EVENT > local_hi )); then
-          rbv_check_add event_freshness fail \
-            "событие вне окна [prev−skew … curr+skew] (skew=${skew}s)" \
-            "$(date -u -d "@${PREV_ARCH_EPOCH}" +%F_%T 2>/dev/null || echo "$PREV_ARCH_EPOCH")" \
-            "event=$(date -u -d "@${LAST_EVENT}" +%F_%T 2>/dev/null || echo "$LAST_EVENT"); arch=$(date -u -d "@${CURR_ARCH_EPOCH}" +%F_%T 2>/dev/null || echo "$CURR_ARCH_EPOCH")"
-          fail_add "event_freshness out of window"
-        else
-          rbv_check_add event_freshness ok \
-            "событие в окне бекапов (±${skew}s TZ lag)" \
-            "prev_arch=${PREV_ARCH_EPOCH}" "event=${LAST_EVENT}/arch=${CURR_ARCH_EPOCH}"
-        fi
-      fi
-      rep "event_freshness: last_event=${LAST_EVENT:-0}"
+      _ev_out="$(rbv_max_event_epoch "$KIND" | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      _ev_src=""
+      LAST_EVENT=0
+      case "$_ev_out" in
+        missing|nofields)
+          if [[ "$KIND" == "bot" ]]; then
+            rbv_check_add event_freshness fail \
+              "payment_webhook_events: ${_ev_out} (нет таблицы или timestamp-полей)"
+            fail_add "event_freshness: ${_ev_out}"
+            rep "event_freshness: FAIL (${_ev_out}) — поля таблиц users / payment_webhook_events:"
+            while IFS= read -r _line || [[ -n "${_line:-}" ]]; do
+              [[ -n "${_line:-}" ]] && rep "  ${_line}"
+            done < <(rbv_dump_table_fields users; rbv_dump_table_fields payment_webhook_events)
+          else
+            rbv_check_add event_freshness skip "нет timestamp-колонок событий"
+          fi
+          ;;
+        *)
+          LAST_EVENT="${_ev_out%%|*}"
+          if [[ "$_ev_out" == *"|"* ]]; then
+            _ev_src="${_ev_out#*|}"
+          fi
+          [[ "$LAST_EVENT" =~ ^[0-9]+$ ]] || LAST_EVENT=0
+          skew="$(rbv_skew_sec)"
+          if [[ "${LAST_EVENT:-0}" -eq 0 ]]; then
+            if [[ "$KIND" == "bot" ]]; then
+              rbv_check_add event_freshness skip \
+                "payment_webhook_events пуста / без дат (src=${_ev_src:-?})"
+              rep "event_freshness: skip — таблица есть, но дат нет (src=${_ev_src:-?}); поля:"
+              while IFS= read -r _line || [[ -n "${_line:-}" ]]; do
+                [[ -n "${_line:-}" ]] && rep "  ${_line}"
+              done < <(rbv_dump_table_fields payment_webhook_events)
+            else
+              rbv_check_add event_freshness skip "нет timestamp-колонок событий"
+            fi
+          elif [[ "${CURR_ARCH_EPOCH:-0}" -eq 0 ]]; then
+            rbv_check_add event_freshness skip "не разобрать TS архива"
+          else
+            if [[ "${PREV_ARCH_EPOCH:-0}" -gt 0 ]]; then
+              local_lo=$(( PREV_ARCH_EPOCH - skew ))
+            else
+              local_lo=$(( CURR_ARCH_EPOCH - skew - 86400*30 ))
+            fi
+            local_hi=$(( CURR_ARCH_EPOCH + skew ))
+            if (( LAST_EVENT < local_lo || LAST_EVENT > local_hi )); then
+              rbv_check_add event_freshness fail \
+                "событие вне окна [prev−skew … curr+skew] (skew=${skew}s, src=${_ev_src:-?})" \
+                "$(date -u -d "@${PREV_ARCH_EPOCH}" +%F_%T 2>/dev/null || echo "$PREV_ARCH_EPOCH")" \
+                "event=$(date -u -d "@${LAST_EVENT}" +%F_%T 2>/dev/null || echo "$LAST_EVENT"); arch=$(date -u -d "@${CURR_ARCH_EPOCH}" +%F_%T 2>/dev/null || echo "$CURR_ARCH_EPOCH")"
+              fail_add "event_freshness out of window"
+            else
+              rbv_check_add event_freshness ok \
+                "событие в окне бекапов (±${skew}s TZ lag, src=${_ev_src:-?})" \
+                "prev_arch=${PREV_ARCH_EPOCH}" "event=${LAST_EVENT}/arch=${CURR_ARCH_EPOCH}"
+            fi
+          fi
+          ;;
+      esac
+      rep "event_freshness: last_event=${LAST_EVENT:-0} src=${_ev_src:-?} raw=${_ev_out}"
     fi
   fi
 fi
