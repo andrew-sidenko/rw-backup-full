@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.6.34 (2026-08-11)
+
+### Добавлено / исправлено (`rw-backup-verify`)
+- **`disk` / `reclaim [--docker]`** — обзор места и полная уборка runs+cache+leftover
+  `rbv_*` контейнеров (PGDATA verify живёт в `/var/lib/docker`, не на хосте).
+- PG sandbox **без `-v` на хост**; из isolated compose вырезаются bind’ы
+  `pgdata` / `/var/lib/postgresql` / `pg_wal` (чтобы стек не писал WAL на хост).
+- В начале каждого `run` — `rbv_docker_reclaim`.
+
 ## v5.6.33 (2026-08-11)
 
 ### Изменено (`rw-backup-verify`)

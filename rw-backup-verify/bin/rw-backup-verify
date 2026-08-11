@@ -32,12 +32,17 @@ rw-backup-verify — автономная проверка логических 
   tested list <id> | clear <id> [--key KEY]
   runs prune [--keep N]             # удалить старые runs/ (архивы → cache, default keep=2)
   cache list | prune | clear        # prune = только последний архив на экземпляр
+  disk                              # что занимает место + подсказки
+  reclaim [--docker]                # runs keep=0 + cache latest + rbv_* контейнеры
+                                    #   --docker: ещё docker system prune -af
   tick                              # systemd: если глобально due → run --due
 
 Логи: work_dir/logs/run_*.log и work_dir/runs/<id>/
 Кэш (только latest на экземпляр): work_dir/cache/archives/
   — при каждом run/tick старые скачанные архивы удаляются;
   — остаётся последняя копия для ручного прогона без повторного S3.
+PG verify: контейнер rbv_pg_* БЕЗ mount на хост (PGDATA в /var/lib/docker);
+путь /var/lib/postgresql/data — внутри контейнера, не каталог хоста.
 Глубокий обход: любые вложенные папки; в каждой — экземпляры panel/bot
 (по семейству имён). Тестируется только latest каждого экземпляра,
 если этот архив ещё не был в tested/.
@@ -239,6 +244,10 @@ case "$cmd" in
     [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
     (( _n > 0 )) && msg INFO "очистка runs: удалено ${_n} (keep=${_keep}; архивы → cache, затем prune)"
     export RBV_CACHE_LATEST="$CACHE_LATEST"
+    _dn="$(rbv_docker_reclaim || echo 0)"
+    _dn="$(echo "$_dn" | tr -d '[:space:]')"
+    [[ "$_dn" =~ ^[0-9]+$ ]] || _dn=0
+    (( _dn > 0 )) && msg INFO "docker reclaim: убрано leftover rbv_* ≈${_dn}"
     if [[ "$CACHE_LATEST" == true ]]; then
       _cn="$(rbv_cache_prune_latest "${ONLY}" || echo 0)"
       _cn="$(echo "$_cn" | tr -d '[:space:]')"
@@ -453,6 +462,64 @@ case "$cmd" in
         ;;
       *) msg ERR "cache: list|prune|clear"; exit 1 ;;
     esac
+    ;;
+
+  disk)
+    WD="$(rbv_work_dir)"
+    msg INFO "work_dir: $WD"
+    msg INFO "df work_dir: $(rbv_disk_report "$WD")"
+    df -h /var/lib/docker 2>/dev/null | tail -n1 | while IFS= read -r l; do msg INFO "df docker: $l"; done || true
+    echo
+    echo "=== rw-backup-verify ==="
+    du -sh "$WD" "$WD"/runs "$WD"/cache "$WD"/logs "$WD"/tested 2>/dev/null || true
+    echo
+    echo "=== docker (здесь реально лежит PGDATA verify-контейнеров) ==="
+    docker system df 2>/dev/null || true
+    echo
+    echo "=== leftover rbv_* ==="
+    docker ps -a --filter 'name=rbv_' --format 'table {{.Names}}\t{{.Status}}\t{{.Size}}' 2>/dev/null || true
+    echo
+    echo "=== /var/lib/postgresql на ХОСТЕ (rbv НЕ пишет сюда) ==="
+    if [[ -d /var/lib/postgresql ]]; then
+      du -sh /var/lib/postgresql /var/lib/postgresql/data /var/lib/postgresql/data/pg_wal 2>/dev/null || true
+      msg WARN "каталог есть на хосте — это НЕ sandbox rbv_pg (у него нет -v). Ищите host postgres / чужой compose bind."
+    else
+      echo "(нет /var/lib/postgresql на хосте — норма)"
+    fi
+    echo
+    msg INFO "освободить: rw-backup-verify reclaim [--docker]"
+    ;;
+
+  reclaim)
+    DOCKER_FULL=false
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --docker) DOCKER_FULL=true; shift ;;
+        *) msg ERR "unknown $1 (reclaim [--docker])"; exit 1 ;;
+      esac
+    done
+    WD="$(rbv_work_dir)"
+    before="$(rbv_disk_avail_kb "$WD")"
+    msg INFO "disk до: $(rbv_disk_report "$WD")"
+    n="$(rbv_runs_prune 0 || echo 0)"
+    msg INFO "runs prune keep=0: удалено ${n}"
+    export RBV_CACHE_LATEST=true
+    cn="$(rbv_cache_prune_latest "" || echo 0)"
+    msg INFO "cache prune latest: удалено ${cn}"
+    dn="$(rbv_docker_reclaim || echo 0)"
+    msg INFO "docker reclaim rbv_*: ≈${dn}"
+    if [[ "$DOCKER_FULL" == true ]]; then
+      msg WARN "docker system prune -af (образы/stopped)…"
+      docker system prune -af 2>&1 | tail -n 5 || true
+    fi
+    after="$(rbv_disk_avail_kb "$WD")"
+    msg OK "disk после: $(rbv_disk_report "$WD")"
+    if [[ -n "$before" && -n "$after" ]]; then
+      msg INFO "свободно было ${before} KiB → стало ${after} KiB"
+    fi
+    if [[ -d /var/lib/postgresql ]]; then
+      msg WARN "на хосте есть /var/lib/postgresql — rbv его не создаёт. Проверьте: dpkg -l postgresql*; docker ps -a; findmnt /var/lib/postgresql"
+    fi
     ;;
 
   tick)

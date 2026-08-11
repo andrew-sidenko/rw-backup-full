@@ -70,6 +70,11 @@ cleanup() {
     fi
     [[ -n "${NET_NAME}" ]] && docker network rm "$NET_NAME" >/dev/null 2>&1 || true
     [[ -n "${PG_CID}" ]] && docker rm -f "$PG_CID" >/dev/null 2>&1 || true
+    # любые rbv_pg_* / probe после kill/OOM
+    while IFS= read -r _old; do
+      [[ -n "$_old" ]] || continue
+      docker rm -f "$_old" >/dev/null 2>&1 || true
+    done < <(docker ps -aq --filter 'name=rbv_pg_' --filter 'name=rbv_probe_' 2>/dev/null || true)
     # освободить диск для следующего job: dump/extract убрать, report/compose оставить
     if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR}" ]]; then
       rbv_run_slim "$RUN_DIR"
@@ -320,6 +325,8 @@ rbv_pg_start() {
 
   rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID} (${why})"
   set +e
+  # БЕЗ -v: PGDATA только в слое контейнера (/var/lib/docker/…), не на хосте.
+  # Путь /var/lib/postgresql/data внутри контейнера — норма; на хост не монтируем.
   # shm: крупные COPY/CREATE INDEX в restore без --shm-size часто падают
   docker run -d --name "$PG_CID" --shm-size=512m \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
@@ -851,9 +858,12 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
               | if .volumes then
                   .volumes |= map(select(
                     (type=="object" and ((.source // "") | contains("docker.sock") | not)
-                      and ((.source // "") | test("(^|/)\\.env$") | not))
+                      and ((.source // "") | test("(^|/)\\.env$") | not)
+                      and ((.source // "") | test("(?i)(^|/)pgdata(/|$)|/var/lib/postgresql|pg_wal") | not)
+                      and ((.target // .destination // "") | test("(?i)/var/lib/postgresql|pg_wal|(^|/)pgdata(/|$)") | not))
                     or (type=="string" and (contains("docker.sock") | not)
-                      and (test("(^|:)/\\.env$|\\.env:") | not))
+                      and (test("(^|:)/\\.env$|\\.env:") | not)
+                      and (test("(?i)(^|/)pgdata(/|:|$)|/var/lib/postgresql|pg_wal") | not))
                   ))
                 else . end
             )
