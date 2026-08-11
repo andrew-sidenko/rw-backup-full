@@ -303,6 +303,23 @@ rbv_slim_old_runs() {
   done
 }
 
+# Освободить RAM после тестов: контейнеры уже сняты; сбросить page cache
+# (чтение dump 200–500M оставляет данные в buff/cache — free «avail» падает,
+# хотя процессов rbv нет). stdout: краткий статус; rc=0.
+rbv_mem_reclaim() {
+  sync 2>/dev/null || true
+  if [[ -w /proc/sys/vm/drop_caches ]]; then
+    # 1=pagecache 2=dentries/inodes 3=оба
+    echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || true
+  fi
+  if command -v free >/dev/null 2>&1; then
+    free -m | awk '/Mem:/{printf "mem reclaim: avail=%sMi total=%sMi buff/cache=%sMi\n", $7, $2, $6}'
+  else
+    echo "mem reclaim: ok"
+  fi
+  return 0
+}
+
 # Убрать leftover Docker от verify после тестов.
 # Политика: контейнеры/сети/volumes удаляем; ОБРАЗЫ оставляем (pull при смене тега).
 # PG sandbox без -v → PGDATA в слое контейнера; compose anonymous volumes — через down -v + prune.

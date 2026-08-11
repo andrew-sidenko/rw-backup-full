@@ -1,5 +1,13 @@
 # Changelog
 
+## v5.6.37 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **RAM хвосты**: после каждого job и в конце `run`/`reclaim` — сброс page cache
+  (`drop_caches`), kill heartbeat restore, docker containers/volumes.
+  Чтение dump оставляло сотни MiB в buff/cache → `avail` падал между bot→panel
+  при пустом `docker ps`.
+
 ## v5.6.36 (2026-08-11)
 
 ### Исправлено (`rw-backup-verify`)

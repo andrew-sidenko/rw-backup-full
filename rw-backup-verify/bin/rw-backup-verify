@@ -337,6 +337,8 @@ case "$cmd" in
     _dn="$(echo "$_dn" | tr -d '[:space:]')"
     [[ "$_dn" =~ ^[0-9]+$ ]] || _dn=0
     msg INFO "docker: контейнеры/volumes после тестов убраны (≈${_dn}; образы сохранены)"
+    _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
+    [[ -n "$_mr" ]] && msg INFO "$_mr"
     _rn="$(rbv_runs_prune 0 || echo 0)"
     _rn="$(echo "$_rn" | tr -d '[:space:]')"
     [[ "$_rn" =~ ^[0-9]+$ ]] || _rn=0
@@ -522,10 +524,15 @@ case "$cmd" in
       docker container prune -f 2>&1 | tail -n 3 || true
       docker network prune -f >/dev/null 2>&1 || true
     fi
+    _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
+    [[ -n "$_mr" ]] && msg INFO "$_mr"
     after="$(rbv_disk_avail_kb "$WD")"
     msg OK "disk после: $(rbv_disk_report "$WD")"
     if [[ -n "$before" && -n "$after" ]]; then
       msg INFO "свободно было ${before} KiB → стало ${after} KiB"
+    fi
+    if command -v free >/dev/null 2>&1; then
+      msg INFO "RAM: $(free -h | awk '/Mem:/{printf "avail=%s total=%s", $7, $2}')"
     fi
     if [[ -d /var/lib/postgresql ]]; then
       msg WARN "на хосте есть /var/lib/postgresql — rbv его не создаёт. Проверьте: dpkg -l postgresql*; docker ps -a; findmnt /var/lib/postgresql"

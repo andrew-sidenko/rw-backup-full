@@ -87,8 +87,15 @@ CURR_ARCH_EPOCH=0
 PREV_ARCH_EPOCH=0
 BASELINE_JSON="{}"
 RBV_RETRYABLE=0
+RBV_HB_PID=""
 
 cleanup() {
+  # heartbeat restore (иначе sleep-цикл живёт после EXIT)
+  if [[ -n "${RBV_HB_PID:-}" ]]; then
+    kill "$RBV_HB_PID" 2>/dev/null || true
+    wait "$RBV_HB_PID" 2>/dev/null || true
+    RBV_HB_PID=""
+  fi
   if [[ "$KEEP" != "true" ]]; then
     if [[ -n "${COMPOSE_FILE}" && -f "${COMPOSE_FILE}" ]]; then
       docker compose -f "$COMPOSE_FILE" -p "${COMPOSE_PROJECT}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -106,6 +113,8 @@ cleanup() {
     if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR}" ]]; then
       rbv_run_slim "$RUN_DIR"
     fi
+    # page cache от dump/archive — иначе avail RAM падает между bot→panel
+    rbv_mem_reclaim >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -354,11 +363,14 @@ rbv_pg_start() {
     shm=512m
   fi
 
+  # чужие rbv_pg_* после OOM/crash занимают RAM — снять до старта
   docker rm -f "$PG_CID" >/dev/null 2>&1 || true
   while IFS= read -r _old; do
     [[ -n "$_old" && "$_old" != "$PG_CID" ]] || continue
     docker rm -f "$_old" >/dev/null 2>&1 || true
   done < <(docker ps -aq --filter "name=rbv_pg_" 2>/dev/null || true)
+  # page cache перед initdb/restore
+  rbv_mem_reclaim >/dev/null 2>&1 || true
 
   rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID} shm=${shm} mem_avail=${mem_avail}Mi (${why})"
   if (( mem_avail > 0 && mem_avail < 1500 )); then
@@ -476,6 +488,9 @@ if [[ "$ok" == true ]]; then
   fi
 
   if [[ "$ok" == true && "$ready" == true && "$accept" == true ]]; then
+    # сбросить page cache перед тяжёлым restore (после extract архива)
+    _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
+    [[ -n "$_mr" ]] && rep "$_mr"
     sql_sz="$(du -h "$SQL" 2>/dev/null | awk '{print $1}')"
     rep "psql restore: $(basename "$SQL") (${sql_sz}) — может занять минуты"
     (
@@ -485,7 +500,8 @@ if [[ "$ok" == true ]]; then
         printf '%s\n' "psql restore: ещё работает… ${t}с" | tee -a "$REPORT" >&2
       done
     ) &
-    _hb=$!
+    RBV_HB_PID=$!
+    _hb=$RBV_HB_PID
     _psql_rc=1
     _max_restore=3
     for _attempt in $(seq 1 "$_max_restore"); do
@@ -510,6 +526,7 @@ if [[ "$ok" == true ]]; then
         rbv_pg_diag "oom-${_attempt}"
         if (( _attempt < _max_restore )); then
           rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR" || true
+          rbv_mem_reclaim >/dev/null 2>&1 || true
           rep "psql restore: recreate PG и повтор…"
           rbv_pg_start "retry-${_attempt}" || true
           continue
@@ -522,6 +539,7 @@ if [[ "$ok" == true ]]; then
         rbv_pg_diag "conn-${_attempt}"
         if (( _attempt < _max_restore )); then
           rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR" || true
+          rbv_mem_reclaim >/dev/null 2>&1 || true
           rbv_pg_start "retry-${_attempt}" || true
           continue
         fi
@@ -531,6 +549,7 @@ if [[ "$ok" == true ]]; then
     done
     kill "$_hb" 2>/dev/null || true
     wait "$_hb" 2>/dev/null || true
+    RBV_HB_PID=""
     rep "psql restore: rc=${_psql_rc}"
     sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || true)"
     sql_errs="$(echo "${sql_errs:-0}" | tr -d '[:space:]')"
