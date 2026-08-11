@@ -420,10 +420,11 @@ echo "$_dump" | grep -q 'отсутствует' && pass "dump missing table" ||
 
 rbv_psql() {
   case "$1" in
+    # свежесть бота: список существующих таблиц группы → ts-колонки → max(epoch)
+    *"to_regclass('public.'||quote_ident(t))"*) printf 'payment_webhook_events\n' ;;
+    *"table_name||'|'||column_name"*) printf 'payment_webhook_events|created_at\n' ;;
+    *"EXTRACT(EPOCH"*) printf '1700000000|payment_webhook_events.created_at\n' ;;
     *"to_regclass('public.payment_webhook_events')"*) printf 'public.payment_webhook_events\n' ;;
-    *"column_name FROM information_schema"*timestamp*) printf 'created_at\n' ;;
-    *"EXTRACT(EPOCH FROM MAX(created_at))"*) printf '1700000000\n' ;;
-    *"column_name||'*|*"*) printf 'id|int4\ncreated_at|timestamptz\n' ;;
     *"column_name||'|'||udt_name"*) printf 'id|int4\ncreated_at|timestamptz\n' ;;
     *) printf '\n' ;;
   esac

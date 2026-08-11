@@ -95,6 +95,10 @@ mkdir -p "$B/swarm"
   echo "ALTER TABLE public.users OWNER TO botuser;"
   echo "CREATE TABLE public.subscriptions (id bigint NOT NULL, user_id bigint, tariff text, created_at timestamp with time zone);"
   echo "ALTER TABLE public.subscriptions OWNER TO botuser;"
+  # у этого «бота» есть не все таблицы групп — это норма
+  echo "CREATE TABLE public.tariffs (id bigint NOT NULL, name text);"
+  echo "INSERT INTO public.tariffs VALUES (1,'base'),(2,'pro');"
+  echo "CREATE TABLE public.recurring_yookassa (id bigint NOT NULL, user_id bigint);"
   echo "CREATE TABLE public.payment_webhook_events (id bigint NOT NULL, provider text, payload text, created_at timestamp with time zone, processed_at timestamp with time zone);"
   echo "ALTER TABLE public.payment_webhook_events OWNER TO botuser;"
   echo "COPY public.users (id, telegram_id, username, created_at, updated_at) FROM stdin;"
@@ -168,7 +172,16 @@ dt(){ jq -r --arg n "$1" '[.[]|select(.name==$n)][-1].detail // "—"' "$checks"
 [[ "$(st download)" == "ok" ]] && pass "download ok" || fail "download" "$(dt download)"
 [[ "$(st db_restore)" == "ok" ]] && pass "db_restore ok" || fail "db_restore" "$(dt db_restore)"
 [[ "$(st db_schema)" == "ok" ]] && pass "db_schema ok" || fail "db_schema" "$(dt db_schema)"
-[[ "$(st user_rows)" == "ok" ]] && pass "user_rows ok" || fail "user_rows" "$(dt user_rows)"
+[[ "$(st bot_users)" == "ok" ]] && pass "bot_users ok" || fail "bot_users" "$(dt bot_users)"
+[[ "$(st bot_payments)" == "ok" ]] && pass "bot_payments ok" || fail "bot_payments" "$(dt bot_payments)"
+[[ "$(dt bot_users)" == *"3/6 таблиц"* ]] && pass "неполный набор users-таблиц не ошибка" \
+  || fail "неполный набор users" "$(dt bot_users)"
+[[ "$(dt bot_users)" == *"нет: app_settings"* ]] && pass "отсутствующие таблицы перечислены" \
+  || fail "список отсутствующих" "$(dt bot_users)"
+[[ "$(dt bot_payments)" == *"2/5 таблиц"* ]] && pass "неполный набор payments-таблиц не ошибка" \
+  || fail "неполный набор payments" "$(dt bot_payments)"
+[[ "$(dt bot_payments)" == *"recurring_yookassa=0"* ]] && pass "пустая таблица платежей не ошибка" \
+  || fail "пустая payments-таблица" "$(dt bot_payments)"
 [[ "$(st event_freshness)" == "ok" ]] && pass "event_freshness ok" || fail "event_freshness" "$(dt event_freshness)"
 [[ "$(st isolation)" == "ok" ]] && pass "isolation ok" || fail "isolation" "$(dt isolation)"
 [[ "$(st stack)" == "ok" ]] && pass "stack ok" || fail "stack" "$(dt stack)"
@@ -176,13 +189,21 @@ dt(){ jq -r --arg n "$1" '[.[]|select(.name==$n)][-1].detail // "—"' "$checks"
 grep -q 'db_schema: db=vpnbot' "${run_dir}/report.txt" \
   && pass "выбрана БД приложения (vpnbot), а не пустая postgres" \
   || fail "выбор БД" "$(grep 'db_schema:' "${run_dir}/report.txt" || true)"
-grep -q 'кандидаты: .*vpnbot=3+users' "${run_dir}/report.txt" \
+grep -q 'кандидаты: .*vpnbot=5+users' "${run_dir}/report.txt" \
   && pass "кандидаты БД в отчёте" || fail "кандидаты БД" "$(grep 'db_schema:' "${run_dir}/report.txt" || true)"
 
 users="$(jq -r '.user_rows' "${run_dir}/summary.json" 2>/dev/null || echo 0)"
 [[ "$users" == "$ROWS" ]] && pass "user_rows=${ROWS}" || fail "user_rows count" "got=$users"
 tables="$(jq -r '.db_tables' "${run_dir}/summary.json" 2>/dev/null || echo 0)"
-[[ "$tables" == "3" ]] && pass "db_tables=3" || fail "db_tables" "got=$tables"
+[[ "$tables" == "5" ]] && pass "db_tables=5" || fail "db_tables" "got=$tables"
+
+# baseline должен запомнить строки по каждой таблице — иначе пропажу
+# данных не с чем сравнивать на следующей проверке
+bl="${RBV_STATE_DIR}/baselines/live/$(printf '%s' 'bot:bots/live:custom_bot_livetest' | sha256sum | awk '{print $1}').json"
+[[ -n "$bl" && -f "$bl" ]] && pass "baseline записан" || fail "baseline" "нет файла"
+jq -e --argjson n "$ROWS" '.tables.users == $n and .tables.subscriptions == $n
+   and .tables.tariffs == 2 and .tables.recurring_yookassa == 0' "$bl" >/dev/null 2>&1 \
+  && pass "в baseline строки по каждой таблице" || fail "baseline tables" "$(jq -c '.tables' "$bl" 2>/dev/null)"
 
 grep -q 'заранее созданы роли из дампа' "${run_dir}/report.txt" \
   && pass "роли из дампа созданы заранее" || fail "precreate roles" "нет строки в report"
@@ -198,6 +219,49 @@ jq -e '(.services|keys) == ["bot"]' "${run_dir}/compose.isolated.yml" >/dev/null
 jq -e '[.services.bot.volumes[]? | (.source? // .)] | map(select(test("pgdata"))) | length == 0' \
   "${run_dir}/compose.isolated.yml" >/dev/null \
   && pass "pgdata-бинды вырезаны" || fail "pgdata бинды" "остались"
+
+# --- A2) следующий бэкап того же бота: данные пропали -----------------------
+# Отсутствие таблицы у бота — норма, но если таблица БЫЛА с данными и исчезла,
+# или строк стало меньше — это потеря данных, и прогон обязан упасть.
+echo "==== A2) пропажа данных относительно прошлой проверки ===="
+{
+  echo "CREATE DATABASE vpnbot;"
+  echo "\\connect vpnbot"
+  echo "CREATE TABLE public.users (id bigint NOT NULL, telegram_id bigint, username text, created_at timestamp with time zone, updated_at timestamp with time zone);"
+  echo "ALTER TABLE public.users OWNER TO botuser;"
+  echo "COPY public.users (id, telegram_id, username, created_at, updated_at) FROM stdin;"
+  awk -v n="$(( ROWS / 2 ))" -v ts="$EVENT_TS" 'BEGIN{for(i=1;i<=n;i++) printf "%d\t%d\tuser%d\t%s+00\t%s+00\n", i, 100000+i, i, ts, ts}'
+  echo '\.'
+  echo "CREATE TABLE public.tariffs (id bigint NOT NULL, name text);"
+  echo "INSERT INTO public.tariffs VALUES (1,'base'),(2,'pro');"
+  echo "CREATE TABLE public.payment_webhook_events (id bigint NOT NULL, provider text, created_at timestamp with time zone);"
+  echo "COPY public.payment_webhook_events (id, provider, created_at) FROM stdin;"
+  awk -v n="$ROWS" -v ts="$EVENT_TS" 'BEGIN{for(i=1;i<=n;i++) printf "%d\tyookassa\t%s+00\n", i, ts}'
+  echo '\.'
+} | gzip -1 >"$B/postgres_dump.sql.gz"
+KEY_LOSS="bots/live/custom_bot_livetest_$(date -u -d '+2 minutes' +%Y%m%d_%H%M%S).tar.gz"
+tar -czf "${T}/s3/${KEY_LOSS}" -C "$B" postgres_dump.sql.gz PROFILE.env redis_dump.rdb project_dir.tar.gz
+set +e
+"$ROOT/bin/rbv-run-one.sh" live bot "bot:bots/live:custom_bot_livetest" \
+  "$KEY_LOSS" "bots/live" manual >"$T/a2.log" 2>&1
+rc_a2=$?
+set -e
+run_a2="$(ls -1dt "$RBV_STATE_DIR"/runs/*/ 2>/dev/null | head -n1)"
+run_a2="${run_a2%/}"
+checks_a2="${run_a2}/checks.json"
+st2(){ jq -r --arg n "$1" '[.[]|select(.name==$n)][-1].status // "—"' "$checks_a2" 2>/dev/null; }
+dt2(){ jq -r --arg n "$1" '[.[]|select(.name==$n)][-1].detail // "—"' "$checks_a2" 2>/dev/null; }
+
+[[ "$rc_a2" -ne 0 ]] && pass "пропажа данных → прогон FAIL" || fail "пропажа данных" "rc=$rc_a2"
+[[ "$(st2 bot_users)" == "fail" ]] && pass "bot_users fail" || fail "bot_users fail" "$(st2 bot_users)"
+grep -q "subscriptions: таблица исчезла" "${run_a2}/report.txt" \
+  && pass "исчезнувшая таблица названа" || fail "исчезнувшая таблица" "$(grep -c subscriptions "${run_a2}/report.txt")"
+grep -qE "users: строк $(( ROWS / 2 )) \(было ${ROWS}\)" "${run_a2}/report.txt" \
+  && pass "падение строк users показано с прошлым значением" \
+  || fail "падение строк" "$(grep -E '  ❌|  ✅' "${run_a2}/report.txt" | head -5)"
+# платежи выросли — их группа обязана остаться зелёной
+[[ "$(st2 bot_payments)" == "ok" ]] && pass "выросшая группа платежей осталась ok" \
+  || fail "bot_payments" "$(dt2 bot_payments)"
 
 # --- B) внешний kill песочницы ---------------------------------------------
 # Ровно то, что делал параллельный `run`/`reclaim` из systemd-тика.

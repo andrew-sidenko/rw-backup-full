@@ -113,15 +113,51 @@ restore крупных дампов.
 
 | Ключ | Смысл |
 |---|---|
-| `user_rows` | **bot:** строго `public.users`; **panel:** эвристика. Не пуста и ≥ предыдущей проверки (baseline) |
-| `event_freshness` | **bot:** max(timestamp) из `payment_webhook_events`; **panel:** users/nodes. Окно [prev_backup − skew … curr_backup + skew] |
+| `bot_users` | **bot:** группа «пользователи» — `users`, `subscriptions`, `tariffs`, `app_settings`, `cabinet_email_verification_codes`, `cabinet_site_visits` |
+| `bot_payments` | **bot:** группа «платежи» — `payments`, `payment_intents`, `payment_webhook_events`, `recurring_yookassa`, `recurring_robokassa` |
+| `user_rows` | **panel:** таблица пользователей по эвристике; не пуста и ≥ предыдущей проверки |
+| `event_freshness` | **bot:** самая свежая дата среди платёжных таблиц бота (если платежей нет — среди пользовательских); **panel:** users/nodes. Окно [prev_backup − skew … curr_backup + skew] |
 | `stack` | поднять compose в `--internal` + без падений `stability_seconds` |
 | `isolation` | сеть `Internal=true` + нет внешнего TCP egress (DNS на internal часто резолвится — это не leak). **Preflight** до download: если хост не изолирует — все тесты стоп. В stack — до stability/ports. |
 | `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
 
-**Bot:** если нет `users` / `payment_webhook_events` или у webhook нет timestamp-полей —
-при **ручном** `run` в report и в `work_dir/logs/schema_*.txt` печатается **полный
-schema-diag** (все таблицы, поля, rows, OK/MISS по ключевым bot-таблицам).
+### Данные бота: две группы
+
+Набор таблиц у ботов разный, поэтому **отсутствие таблицы — не ошибка**: у бота
+просто нет такой функции. Ошибка — это **пропажа данных**:
+
+| Ситуация | Итог |
+|---|---|
+| таблицы нет и раньше не было | ⚪ `absent` — норма |
+| таблица есть, строк столько же или больше | ✅ `ok` |
+| таблица есть впервые | ✅ `new` — записывается в baseline |
+| таблица пустая, истории нет | ⚪ `empty` (кроме `users` — бот без пользователей это ❌) |
+| **строк стало меньше, чем в прошлой проверке** | ❌ `drop` |
+| **таблица была с данными и исчезла** | ❌ `gone` |
+
+В отчёт попадает построчная сводка и итог по группе:
+
+```
+✅ bot_users — 4/6 таблиц, строк=2169420 · users=2169069 subscriptions=320 … · нет: cabinet_site_visits
+✅ bot_payments — 3/5 таблиц, строк=88214 · payments=51120 payment_webhook_events=37094 …
+```
+
+Счётчики строк по каждой таблице хранятся в baseline экземпляра, поэтому
+сравнение идёт с предыдущим **проверенным** бэкапом именно этого бота.
+
+Переопределить состав групп (например, у бота свои имена таблиц):
+
+```json
+"checks": { "bot": { "tables": {
+  "users":    ["users", "subscriptions"],
+  "payments": ["payments"]
+} } }
+```
+
+Если у бота нет ни одной таблицы из обеих групп — это ошибка (значит выбрана не
+та БД или дамп пустой), и при **ручном** `run` в report и в
+`work_dir/logs/schema_*.txt` печатается **полный schema-diag** (все таблицы,
+поля, rows).
 
 `timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
 
@@ -170,6 +206,7 @@ bash test/unit_config_queue.sh    # конфиг, расписание, очер
 bash test/unit_logic_full.sh      # discover/tested/CLI/compose rewrite
 bash test/unit_concurrency.sh     # лок, реестр активных, защита от уборки
 bash test/unit_hardening.sh       # errexit/pipefail-ловушки, tunables, пороги
+bash test/unit_bot_groups.sh      # группы данных бота, сверка с baseline
 ```
 
 Живой e2e (нужен рабочий Docker; сам собирает синтетический bot-архив,

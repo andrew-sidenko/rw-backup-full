@@ -96,6 +96,9 @@ BASELINE_JSON="{}"
 RBV_RETRYABLE=0
 RBV_HB_PID=""
 RBV_DISK_NEED_KB=0
+# строки по таблицам бота → baseline (сравнение на следующей проверке)
+TABLE_ROWS_PAIRS=()
+TABLE_ROWS_JSON="{}"
 
 # Реестр живого прогона: чужой reclaim/prune (ручной или из параллельного
 # tick'а) не должен снести нашу песочницу, compose-проект и runs/<id>.
@@ -509,6 +512,66 @@ if [[ "$ok" == true ]]; then
         && rbv_check_add user_rows skip "restore не завершён (${RBV_RESTORE_CLASS})"
       rbv_check_enabled "$KIND" event_freshness \
         && rbv_check_add event_freshness skip "restore не завершён (${RBV_RESTORE_CLASS})"
+    elif [[ "$KIND" == "bot" ]]; then
+      # Бот: две группы данных вместо одной public.users.
+      # Нет таблицы — не ошибка (у бота нет такой функции); ошибка — если
+      # таблица была в прошлой проверке и исчезла или строк стало меньше.
+      _groups_found=0
+      for _grp in users payments; do
+        _chk="bot_${_grp}"
+        rbv_check_enabled bot "$_chk" || { rbv_check_add "$_chk" skip "отключено"; continue; }
+        _gstatus=""; _gdetail=""; _gsum=0; _gfound=""
+        rep "----- ${_grp}: таблицы бота -----"
+        while IFS='|' read -r _kind1 _f2 _f3 _f4 _f5; do
+          case "$_kind1" in
+            TABLE)
+              case "$_f5" in
+                gone) rep "  ❌ ${_f2}: таблица исчезла (было строк: ${_f4})" ;;
+                drop) rep "  ❌ ${_f2}: строк ${_f3} (было ${_f4})" ;;
+                ok)   rep "  ✅ ${_f2}: строк ${_f3} (было ${_f4})" ;;
+                new)  rep "  ✅ ${_f2}: строк ${_f3} (первая проверка)" ;;
+                empty) rep "  ⚪ ${_f2}: пустая" ;;
+                absent) rep "  ⚪ ${_f2}: нет у этого бота" ;;
+              esac
+              if [[ "$_f3" =~ ^[0-9]+$ ]]; then
+                TABLE_ROWS_PAIRS+=("${_f2}=${_f3}")
+                # users отдельно — им же меряется монотонность в TG-отчёте
+                [[ "$_f2" == "users" ]] && USER_ROWS="$_f3"
+              fi
+              ;;
+            SUMMARY)
+              _gstatus="$_f2"; _gfound="$_f3"; _gsum="$_f4"; _gdetail="$_f5"
+              ;;
+          esac
+        done < <(rbv_bot_group_report "$_grp" "$BASELINE_JSON")
+        rep "----- end ${_grp} -----"
+        case "$_gstatus" in
+          ok)
+            _groups_found=$((_groups_found + 1))
+            rbv_check_add "$_chk" ok "$_gdetail" "" "$_gsum"
+            ;;
+          fail)
+            _groups_found=$((_groups_found + 1))
+            rbv_check_add "$_chk" fail "$_gdetail" "" "$_gsum"
+            fail_add "${_grp}: данные пропали (${_gfound})"
+            ;;
+          *)
+            rbv_check_add "$_chk" skip "нет таблиц группы у этого бота (${_gfound})"
+            rep "${_grp}: таблиц этой группы нет — для этого бота это норма"
+            ;;
+        esac
+      done
+      # ни одной таблицы из обеих групп = не тот дамп / не та БД
+      if (( _groups_found == 0 )); then
+        fail_add "нет ни одной таблицы бота (ни users-, ни payments-группы)"
+        rbv_emit_schema_diag "bot: ни одной таблицы из групп users/payments"
+      fi
+      rep "bot: users=${USER_ROWS} (было ${PREV_USER_ROWS:-—})"
+      if (( ${#TABLE_ROWS_PAIRS[@]} > 0 )); then
+        TABLE_ROWS_JSON="$(printf '%s\n' "${TABLE_ROWS_PAIRS[@]}" \
+          | jq -R -s 'split("\n") | map(select(length > 0) | split("="))
+                      | map({(.[0]): (.[1] | tonumber)}) | add // {}')"
+      fi
     elif rbv_check_enabled "$KIND" user_rows; then
       utbl="$(rbv_find_users_table "$KIND" || true)"
       if [[ -z "$utbl" ]]; then
@@ -545,7 +608,8 @@ if [[ "$ok" == true ]]; then
     fi
 
     # event freshness (relative to backup window + skew)
-    # bot → даты из payment_webhook_events; panel → users/nodes.
+    # bot → самая свежая дата среди платёжных таблиц, что есть у бота
+    # (иначе среди пользовательских); panel → users/nodes.
     if [[ "${RBV_RESTORE_CLASS}" == "ok" ]] && rbv_check_enabled "$KIND" event_freshness; then
       _ev_out="$(rbv_max_event_epoch "$KIND" | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       _ev_src=""
@@ -553,10 +617,11 @@ if [[ "$ok" == true ]]; then
       case "$_ev_out" in
         missing|nofields)
           if [[ "$KIND" == "bot" ]]; then
-            rbv_check_add event_freshness fail \
-              "payment_webhook_events: ${_ev_out} (нет таблицы или timestamp-полей)"
-            fail_add "event_freshness: ${_ev_out}"
-            rbv_emit_schema_diag "bot: payment_webhook_events ${_ev_out}"
+            # нет ни одной даты ни в платежах, ни у пользователей — у такого
+            # бота свежесть просто нечем мерить, это не потеря данных
+            rbv_check_add event_freshness skip \
+              "нет timestamp-колонок в таблицах бота"
+            rep "event_freshness: skip — у этого бота нет дат в users/payments"
           else
             rbv_check_add event_freshness skip "нет timestamp-колонок событий"
             rbv_emit_schema_diag "panel: event timestamp fields missing"
@@ -572,9 +637,8 @@ if [[ "$ok" == true ]]; then
           if [[ "${LAST_EVENT:-0}" -eq 0 ]]; then
             if [[ "$KIND" == "bot" ]]; then
               rbv_check_add event_freshness skip \
-                "payment_webhook_events пуста / без дат (src=${_ev_src:-?})"
-              rep "event_freshness: skip — таблица есть, но дат нет (src=${_ev_src:-?})"
-              rbv_emit_schema_diag "bot: payment_webhook_events empty/no dates src=${_ev_src:-?}"
+                "таблицы бота есть, но дат в них нет (src=${_ev_src:-?})"
+              rep "event_freshness: skip — таблицы есть, дат нет (src=${_ev_src:-?})"
             else
               rbv_check_add event_freshness skip "нет timestamp-колонок событий"
             fi
@@ -1031,7 +1095,8 @@ if [[ "$ok" == true || "$USER_ROWS" -gt 0 ]]; then
     --arg key "$KEY" \
     --argjson ts "$(date +%s)" \
     --argjson tables "${DB_TABLES:-0}" \
-    '{user_rows:$ur, archive_ts:$at, last_event_epoch:$le, archive_key:$key, tested_at:$ts, db_tables:$tables}')"
+    --argjson rows "${TABLE_ROWS_JSON:-\{\}}" \
+    '{user_rows:$ur, archive_ts:$at, last_event_epoch:$le, archive_key:$key, tested_at:$ts, db_tables:$tables, tables:$rows}')"
   # обновляем baseline всегда при успешном DB restore (даже если stack fail) —
   # иначе монотонность users не сдвинется после починки стека
   if [[ "${DB_TABLES:-0}" -gt 0 ]]; then

@@ -265,6 +265,151 @@ rbv_write_schema_diag() {
   return 0
 }
 
+# --- Группы данных бота -----------------------------------------------------
+# Набор таблиц у ботов разный: отсутствие таблицы — НЕ ошибка (у бота просто нет
+# такой функции). Ошибка — когда данные пропали: таблица была в прошлой
+# проверке и исчезла, или строк стало меньше.
+# Переопределить набор: .checks.bot.tables.users / .checks.bot.tables.payments.
+
+rbv_bot_tables() {
+  local group="$1" def cfg
+  case "$group" in
+    users)
+      def="users subscriptions tariffs app_settings cabinet_email_verification_codes cabinet_site_visits" ;;
+    payments)
+      def="payments payment_intents payment_webhook_events recurring_yookassa recurring_robokassa" ;;
+    *) return 0 ;;
+  esac
+  cfg="$(jq -r --arg g "$group" '
+    (.checks.bot.tables[$g] // empty) | if type=="array" then join(" ") else empty end
+  ' "$RBV_CONFIG" 2>/dev/null || true)"
+  if [[ -n "$cfg" && "$cfg" != "null" ]]; then
+    printf '%s\n' "$cfg"
+  else
+    printf '%s\n' "$def"
+  fi
+  return 0
+}
+
+# Какие из перечисленных таблиц есть в БД (одним запросом). $1 = список.
+rbv_tables_present() {
+  local list="${1:-}" arr
+  [[ -n "${list// /}" ]] || return 0
+  # shellcheck disable=SC2086 # список имён — нужен word splitting
+  arr="$(printf '%s\n' $list | sed "s/'/''/g; s/^/'/; s/\$/'/" | paste -sd, -)"
+  [[ -n "$arr" ]] || return 0
+  rbv_psql "SELECT t FROM unnest(ARRAY[${arr}]::text[]) AS t WHERE to_regclass('public.'||quote_ident(t)) IS NOT NULL ORDER BY 1;"
+  return 0
+}
+
+# Число строк по каждой таблице одним запросом. stdout: name|rows
+rbv_tables_counts() {
+  local list="${1:-}" t sql=""
+  for t in $list; do
+    [[ -n "$t" ]] || continue
+    [[ -n "$sql" ]] && sql+=" UNION ALL "
+    sql+="SELECT '${t}'::text AS t, count(*)::bigint AS n FROM public.\"${t}\""
+  done
+  [[ -n "$sql" ]] || return 0
+  rbv_psql "SELECT t||'|'||n FROM (${sql}) s ORDER BY t;"
+  return 0
+}
+
+# Самая свежая дата среди всех timestamp/date-колонок перечисленных таблиц.
+# stdout: <epoch>|<таблица.колонка> (пусто, если дат нет)
+rbv_tables_max_epoch() {
+  local list="${1:-}" arr pairs sql="" tbl col
+  [[ -n "${list// /}" ]] || return 0
+  # shellcheck disable=SC2086 # список имён — нужен word splitting
+  arr="$(printf '%s\n' $list | sed "s/'/''/g; s/^/'/; s/\$/'/" | paste -sd, -)"
+  [[ -n "$arr" ]] || return 0
+  pairs="$(rbv_psql "SELECT table_name||'|'||column_name FROM information_schema.columns WHERE table_schema='public' AND table_name = ANY(ARRAY[${arr}]::text[]) AND (data_type IN ('timestamp without time zone','timestamp with time zone','date') OR udt_name IN ('timestamp','timestamptz','date'));")"
+  while IFS='|' read -r tbl col; do
+    [[ -n "${tbl:-}" && -n "${col:-}" ]] || continue
+    [[ -n "$sql" ]] && sql+=" UNION ALL "
+    sql+="SELECT '${tbl}.${col}'::text AS src, EXTRACT(EPOCH FROM MAX(\"${col}\"))::bigint AS e FROM public.\"${tbl}\""
+  done <<<"$pairs"
+  [[ -n "$sql" ]] || return 0
+  rbv_psql "SELECT e||'|'||src FROM (${sql}) s WHERE e IS NOT NULL ORDER BY e DESC LIMIT 1;"
+  return 0
+}
+
+# Сверка группы с baseline. $1 = группа, $2 = baseline JSON.
+# stdout (для отчёта и для вызывающего):
+#   TABLE|<имя>|<строк или ->|<было или ->|<ok|new|empty|drop|gone|absent>
+#   SUMMARY|<ok|fail|skip>|<есть>/<всего>|<сумма строк>|<краткая сводка>
+rbv_bot_group_report() {
+  local group="$1" base="${2:-\{\}}"
+  local list present t rows prev status
+  local found=0 all=0 sum=0 bad=0
+  local brief="" missing=""
+  local -A cnt=() prevmap=()
+  list="$(rbv_bot_tables "$group")"
+  present="$(rbv_tables_present "$list" | tr '\n' ' ')"
+  while IFS='|' read -r t rows; do
+    [[ -n "${t:-}" ]] || continue
+    cnt["$t"]="$rows"
+  done < <(rbv_tables_counts "$present")
+  while IFS='|' read -r t rows; do
+    [[ -n "${t:-}" ]] || continue
+    prevmap["$t"]="$rows"
+  done < <(jq -r '.tables // {} | to_entries[] | "\(.key)|\(.value)"' <<<"$base" 2>/dev/null || true)
+
+  for t in $list; do
+    [[ -n "$t" ]] || continue
+    all=$((all + 1))
+    rows="${cnt[$t]:-}"
+    prev="${prevmap[$t]:-}"
+    if [[ -z "$rows" ]]; then
+      if [[ "$prev" =~ ^[0-9]+$ ]] && (( prev > 0 )); then
+        status="gone"
+        bad=$((bad + 1))
+      else
+        status="absent"
+        missing+="${t}, "
+      fi
+      printf 'TABLE|%s|-|%s|%s\n' "$t" "${prev:--}" "$status"
+      continue
+    fi
+    found=$((found + 1))
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows=0
+    sum=$((sum + rows))
+    if [[ "$prev" =~ ^[0-9]+$ ]]; then
+      if (( rows < prev )); then
+        status="drop"
+        bad=$((bad + 1))
+      else
+        status="ok"
+      fi
+    elif (( rows == 0 )); then
+      # пустая таблица без истории — информативно (у бота просто нет данных),
+      # кроме users: бот без пользователей = бэкап не тот
+      if [[ "$t" == "users" ]]; then
+        status="drop"
+        bad=$((bad + 1))
+      else
+        status="empty"
+      fi
+    else
+      status="new"
+    fi
+    brief+="${t}=${rows} "
+    printf 'TABLE|%s|%s|%s|%s\n' "$t" "$rows" "${prev:--}" "$status"
+  done
+
+  local gstatus="ok"
+  if (( bad > 0 )); then
+    gstatus="fail"
+  elif (( found == 0 )); then
+    gstatus="skip"
+  fi
+  local detail="${found}/${all} таблиц, строк=${sum}"
+  [[ -n "$brief" ]] && detail+=" · ${brief% }"
+  [[ -n "$missing" ]] && detail+=" · нет: ${missing%, }"
+  printf 'SUMMARY|%s|%s/%s|%s|%s\n' "$gstatus" "$found" "$all" "$sum" "$detail"
+  return 0
+}
+
 rbv_find_users_table() {
   # $1 = optional kind (bot → строго public.users; иначе эвристика panel).
   # stdout: schema.table or empty; всегда rc=0 (иначе set -e рвёт utbl="$(…)")
@@ -362,11 +507,15 @@ rbv_max_epoch_in_table() {
 rbv_max_event_epoch() {
   local kind="${1:-}" epoch=0 cand e best=""
   if [[ "$kind" == "bot" ]]; then
-    if [[ -z "$(rbv_regclass "public.payment_webhook_events")" ]]; then
-      printf 'missing\n'
-      return 0
-    fi
-    rbv_max_epoch_in_table payment_webhook_events
+    # свежесть по всем платёжным таблицам, что есть у бота; если платежей
+    # нет вовсе — по пользовательским
+    local out g
+    for g in payments users; do
+      out="$(rbv_tables_max_epoch "$(rbv_tables_present "$(rbv_bot_tables "$g")" | tr '\n' ' ')")"
+      out="$(printf '%s' "$out" | tr -d '\r')"
+      [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+    done
+    printf 'missing\n'
     return 0
   fi
   for cand in \

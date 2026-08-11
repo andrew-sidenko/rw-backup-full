@@ -20,11 +20,29 @@
       "backend_ports": true
     },
     "bot": {
-      "user_rows": true,
+      "bot_users": true,
+      "bot_payments": true,
       "event_freshness": true,
       "stack": true,
       "isolation": true,
-      "backend_ports": true
+      "backend_ports": true,
+      "tables": {
+        "users": [
+          "users",
+          "subscriptions",
+          "tariffs",
+          "app_settings",
+          "cabinet_email_verification_codes",
+          "cabinet_site_visits"
+        ],
+        "payments": [
+          "payments",
+          "payment_intents",
+          "payment_webhook_events",
+          "recurring_yookassa",
+          "recurring_robokassa"
+        ]
+      }
     }
   },
   "telegram": {
