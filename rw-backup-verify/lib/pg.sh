@@ -40,25 +40,32 @@ rbv_pg_state() {
 # exit=137 при OOMKilled=false и Status=removing/removed — это внешний
 # `docker rm -f` (параллельный reclaim/run/чужие руки), а не OOM.
 rbv_pg_kill_reason() {
-  local st status running oom
+  local st status running oom code
   if rbv_pg_gone; then
     printf 'external\n'
     return 0
   fi
   st="$(rbv_pg_state)"
-  IFS='|' read -r status running oom _ <<<"${st:-||| }"
+  IFS='|' read -r status running oom code <<<"${st:-|||}"
   if [[ "$running" == "true" ]]; then
     printf 'alive\n'
     return 0
   fi
+  # kernel OOM killer — единственный источник OOMKilled=true
   if [[ "$oom" == "true" ]]; then
     printf 'oom\n'
     return 0
   fi
   case "$status" in
-    removing|removed|dead) printf 'external\n' ;;
-    *) printf 'crash\n' ;;
+    removing|removed|dead) printf 'external\n'; return 0 ;;
   esac
+  # SIGKILL/SIGTERM без OOMKilled = контейнер прибили снаружи
+  # (`docker rm -f` успевает мелькнуть в статусе exited до удаления).
+  # Падение самого postgres даёт другой код выхода.
+  case "$code" in
+    137|143) printf 'external\n'; return 0 ;;
+  esac
+  printf 'crash\n'
   return 0
 }
 

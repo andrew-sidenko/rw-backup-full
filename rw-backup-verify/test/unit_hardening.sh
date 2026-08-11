@@ -57,6 +57,36 @@ out="$(bash -c '
 [[ "$out" == *external* ]] && pass "исчезнувший контейнер = external" \
   || fail "kill_reason external" "$out"
 
+echo "==== классификация смерти песочницы ===="
+# `docker rm -f` успевает мелькнуть статусом exited(137) до удаления —
+# это внешний kill, а не OOM и не падение postgres
+mkdir -p "$T/bin"
+cat >"$T/bin/docker" <<'DOCKER'
+#!/bin/bash
+[[ "$1" == "inspect" && "$*" != *"-f"* ]] && exit "${RBV_MOCK_MISSING:-0}"
+if [[ "$1" == "inspect" ]]; then
+  [[ "${RBV_MOCK_MISSING:-0}" != "0" ]] && exit 1
+  printf '%s\n' "${RBV_MOCK_STATE}"
+  exit 0
+fi
+exit 0
+DOCKER
+chmod +x "$T/bin/docker"
+reason_for() {
+  RBV_MOCK_STATE="$1" RBV_MOCK_MISSING="${2:-0}" PATH="$T/bin:$PATH" bash -c '
+    set -euo pipefail
+    export RBV_CONFIG="'"$RBV_CONFIG"'" RBV_STATE_DIR="'"$RBV_STATE_DIR"'"
+    source "'"$ROOT"'/lib/common.sh"; source "'"$ROOT"'/lib/pg.sh"
+    PG_CID=rbv_pg_x; rbv_pg_kill_reason'
+}
+[[ "$(reason_for 'running|true|false|0')" == "alive" ]] && pass "жив → alive" || fail "alive" "$(reason_for 'running|true|false|0')"
+[[ "$(reason_for 'exited|false|true|137')" == "oom" ]] && pass "OOMKilled → oom" || fail "oom" "$(reason_for 'exited|false|true|137')"
+[[ "$(reason_for 'removing|false|false|137')" == "external" ]] && pass "removing → external" || fail "removing" "$(reason_for 'removing|false|false|137')"
+[[ "$(reason_for 'exited|false|false|137')" == "external" ]] && pass "exited(137) без OOM → external" \
+  || fail "exited 137" "$(reason_for 'exited|false|false|137')"
+[[ "$(reason_for 'exited|false|false|1')" == "crash" ]] && pass "exited(1) → crash" || fail "crash" "$(reason_for 'exited|false|false|1')"
+[[ "$(reason_for 'x|x|x|x' 1)" == "external" ]] && pass "контейнер исчез → external" || fail "gone" "$(reason_for 'x|x|x|x' 1)"
+
 echo "==== rbv_pg_tunables ===="
 out="$(bash -c '
   set -euo pipefail
