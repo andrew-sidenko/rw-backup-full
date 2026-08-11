@@ -132,13 +132,14 @@ rw-backup-verify cache list
 ```
 
 После каждого job тяжёлые `extract/`/sql из `runs/<id>/` удаляются автоматически
-(остаются report + compose.*); перед большим restore проверяется ≥3 GiB свободно.
+(остаются report + compose.*); перед большим restore — gate ≥max(1.5 GiB, 4×sql.gz).
 
-Кэш S3-архивов — **только последний на экземпляр** (`dirname` ключа):
+**Кэш архивов** (`work_dir/cache/archives/`): при **каждом** `run` и `tick`
+(ручной = по расписанию) старые скачанные удаляются; остаётся **только последний
+на экземпляр** — для повторного ручного прогона без S3.
 
 ```bash
-rw-backup-verify run --storage tw-oneok                 # --cache-latest по умолчанию
-rw-backup-verify run --storage tw-oneok --keep-cache-all
-rw-backup-verify cache prune [--storage tw-oneok]
+rw-backup-verify run --storage tw-oneok
 rw-backup-verify cache list
+rw-backup-verify cache prune [--storage tw-oneok]   # вручную то же правило
 ```

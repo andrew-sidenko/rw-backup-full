@@ -174,16 +174,18 @@ else
       [[ -n "$_err" ]] && rep "  ${_err}"
     fi
     rm -f "$_cache" 2>/dev/null || true
+    _cache=""
   else
     printf '%s\n' "$KEY" >"${_cache}.key"
     ln -f "$_cache" "$ARCH_PATH" 2>/dev/null || cp -f "$_cache" "$ARCH_PATH"
     rbv_check_add download ok "$(basename "$KEY")"
-    if [[ "${RBV_CACHE_LATEST:-true}" == true ]]; then
-      _cn="$(rbv_cache_prune_latest "$SID" || echo 0)"
-      _cn="$(echo "$_cn" | tr -d '[:space:]')"
-      [[ "$_cn" =~ ^[0-9]+$ && "$_cn" -gt 0 ]] && rep "cache: prune latest — удалено старых=${_cn}"
-    fi
   fi
+fi
+# после любого удачного получения архива — в cache только latest (ручной = auto)
+if [[ "$ok" == true && -n "${_cache:-}" && -s "${_cache:-}" && "${RBV_CACHE_LATEST:-true}" == true ]]; then
+  _cn="$(rbv_cache_prune_latest "$SID" || echo 0)"
+  _cn="$(echo "$_cn" | tr -d '[:space:]')"
+  [[ "$_cn" =~ ^[0-9]+$ && "$_cn" -gt 0 ]] && rep "cache: prune latest — удалено старых=${_cn}"
 fi
 
 base_name="$(basename "$KEY")"
@@ -207,6 +209,12 @@ mkdir -p "$EXTRACT"
 if [[ "$ok" == true ]]; then
   if ! tar -xzf "$ARCH_PATH" -C "$EXTRACT" 2>"${RUN_DIR}/tar.err"; then
     fail_add "tar extract failed"
+  else
+    # архив оставляем только в cache/ — из runs/ убрать сразу (ручной повтор = cache hit)
+    if [[ -n "${_cache:-}" && -s "$_cache" ]]; then
+      rm -f "$ARCH_PATH" 2>/dev/null || true
+      rep "archive: только в cache (${_cache#"$WD"/}), из run удалён"
+    fi
   fi
 fi
 

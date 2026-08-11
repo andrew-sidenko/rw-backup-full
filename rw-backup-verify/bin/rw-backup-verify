@@ -32,12 +32,12 @@ rw-backup-verify — автономная проверка логических 
   tested list <id> | clear <id> [--key KEY]
   runs prune [--keep N]             # удалить старые runs/ (архивы → cache, default keep=2)
   cache list | prune | clear        # prune = только последний архив на экземпляр
-  run --storage ID [--cache-latest|--keep-cache-all]
   tick                              # systemd: если глобально due → run --due
 
-Логи ручного run: work_dir/logs/run_*.log и work_dir/runs/<id>/
-Кэш архивов: work_dir/cache/archives/ — по умолчанию только latest на экземпляр
-(--cache-latest; отключить: --keep-cache-all).
+Логи: work_dir/logs/run_*.log и work_dir/runs/<id>/
+Кэш (только latest на экземпляр): work_dir/cache/archives/
+  — при каждом run/tick старые скачанные архивы удаляются;
+  — остаётся последняя копия для ручного прогона без повторного S3.
 Глубокий обход: любые вложенные папки; в каждой — экземпляры panel/bot
 (по семейству имён). Тестируется только latest каждого экземпляра,
 если этот архив ещё не был в tested/.
@@ -206,7 +206,10 @@ case "$cmd" in
 
   run)
     DUE=false; ONLY=""
+    # Политика всегда: только latest в cache (ручной и auto/tick одинаково).
+    # Аварийный обход: --keep-cache-all или RBV_KEEP_CACHE_ALL=1.
     CACHE_LATEST=true
+    case "${RBV_KEEP_CACHE_ALL:-}" in 1|true|TRUE|yes|on) CACHE_LATEST=false ;; esac
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --due) DUE=true; shift ;;
@@ -234,16 +237,16 @@ case "$cmd" in
     _n="$(rbv_runs_prune "$_keep" || echo 0)"
     _n="$(echo "$_n" | tr -d '[:space:]')"
     [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
-    (( _n > 0 )) && msg INFO "очистка runs: удалено ${_n} (keep=${_keep}, архивы в cache)"
+    (( _n > 0 )) && msg INFO "очистка runs: удалено ${_n} (keep=${_keep}; архивы → cache, затем prune)"
+    export RBV_CACHE_LATEST="$CACHE_LATEST"
     if [[ "$CACHE_LATEST" == true ]]; then
       _cn="$(rbv_cache_prune_latest "${ONLY}" || echo 0)"
       _cn="$(echo "$_cn" | tr -d '[:space:]')"
       [[ "$_cn" =~ ^[0-9]+$ ]] || _cn=0
-      msg INFO "cache: только latest на экземпляр (удалено старых=${_cn}; отключить: --keep-cache-all)"
+      msg INFO "cache: политика latest — старые скачанные удалены (${_cn}); остаётся 1 копия на экземпляр"
     else
-      msg INFO "cache: keep-all (--keep-cache-all)"
+      msg WARN "cache: keep-all (аварийный режим --keep-cache-all)"
     fi
-    export RBV_CACHE_LATEST="$CACHE_LATEST"
     msg INFO "disk: $(rbv_disk_report "$WD")"
 
     if [[ "$DUE" == true ]]; then
@@ -313,8 +316,15 @@ case "$cmd" in
     "${SCRIPT_DIR}/rbv-worker.sh"
     [[ "$DUE" == true ]] && rbv_mark_global_done
 
+    # финальная уборка скачанных: в cache только latest (ручной = auto)
+    if [[ "${RBV_CACHE_LATEST:-true}" == true ]]; then
+      _cn="$(rbv_cache_prune_latest "${ONLY}" || echo 0)"
+      _cn="$(echo "$_cn" | tr -d '[:space:]')"
+      [[ "$_cn" =~ ^[0-9]+$ ]] || _cn=0
+      msg INFO "cache: после прогона — только latest на экземпляр (удалено старых=${_cn})"
+    fi
     msg OK "шаг 3/3: готово"
-    msg INFO "отчёты прогонов: ${WD}/runs/"
+    msg INFO "отчёты: ${WD}/runs/  ·  кэш latest: ${WD}/cache/archives/"
     msg INFO "лог сессии: ${RBV_LOG}"
     ;;
 
