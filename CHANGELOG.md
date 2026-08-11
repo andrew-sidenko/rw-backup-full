@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.6.36 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **Короткие имена** `rbv_pg_*` / compose project (≤63) — длинный INST ломал
+  старт PG («контейнер сразу не Running»).
+- **Low-mem Postgres**: `shared_buffers=128MB`, `jit=off`, `shm` 256m на хостах
+  <6 GiB avail — иначе restore 200–500 M dump → SIGKILL 137 на ~4 GiB RAM.
+- OOM / postgres not ready → **retryable** (не в tested); подсказка про swap.
+
 ## v5.6.35 (2026-08-11)
 
 ### Изменено (`rw-backup-verify`)

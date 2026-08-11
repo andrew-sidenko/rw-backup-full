@@ -433,6 +433,8 @@ bash -n "$ROOT/bin/rbv-run-one.sh" && pass "rbv-run-one bash -n" || fail "rbv-ru
 grep -q 'shm-size' "$ROOT/bin/rbv-run-one.sh" && pass "pg shm-size" || fail "pg shm-size" "missing"
 grep -q 'OOMKilled' "$ROOT/bin/rbv-run-one.sh" && pass "pg OOM diag" || fail "pg OOM diag" "missing"
 grep -q 'rbv_pg_start' "$ROOT/bin/rbv-run-one.sh" && pass "pg start helper" || fail "pg start helper" "missing"
+grep -q 'shared_buffers=128MB' "$ROOT/bin/rbv-run-one.sh" && pass "pg low-mem tunables" || fail "pg low-mem" "missing"
+grep -q '_RBV_SHORT' "$ROOT/bin/rbv-run-one.sh" && pass "short pg container names" || fail "short names" "missing"
 grep -q 'compose.from-backup' "$ROOT/bin/rbv-run-one.sh" && pass "compose from backup dump" || fail "compose from backup dump" "missing"
 grep -q 'compose.isolated.masked' "$ROOT/bin/rbv-run-one.sh" && pass "compose isolated dump" || fail "compose isolated dump" "missing"
 grep -q 'compose.logs.txt' "$ROOT/bin/rbv-run-one.sh" && pass "compose logs dump" || fail "compose logs dump" "missing"

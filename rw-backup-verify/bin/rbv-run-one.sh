@@ -24,10 +24,16 @@ need gzip
 J="$(rbv_storage_json "$SID")"
 rbv_aws_env "$J"
 WD="$(rbv_work_dir)"
-RUN_ID="$(date -u +%Y%m%d_%H%M%S)_$(printf '%s' "$INST" | tr '/:' '__' | cut -c1-80)"
+# Короткие id: docker hostname ≤63 символов; длинный INST ломал rbv_pg_* (bot «not Running»).
+_RBV_SHORT="$(printf '%s' "${KIND}:${INST}" | sha256sum | awk '{print substr($1,1,10)}')"
+_RBV_TS="$(date -u +%Y%m%d_%H%M%S)"
+RUN_ID="${_RBV_TS}_${KIND}_${_RBV_SHORT}"
 RUN_DIR="${WD}/runs/${RUN_ID}"
-# docker compose -p: только [a-z0-9_-], иначе "invalid project name"
-COMPOSE_PROJECT="$(printf 'rbv_%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/_/g' | cut -c1-60)"
+# docker compose -p: только [a-z0-9_-], длина ≤50
+COMPOSE_PROJECT="$(printf 'rbv_%s_%s' "$KIND" "$_RBV_SHORT" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/_/g' | cut -c1-50)"
+PG_CID="rbv_pg_${_RBV_SHORT}_${_RBV_TS##*_}"
+# запас: если всё же длиннее 63 — обрезать
+PG_CID="$(printf '%s' "$PG_CID" | cut -c1-63)"
 mkdir -p "$RUN_DIR"
 REPORT="${RUN_DIR}/report.txt"
 CHECKS_JSON="${RUN_DIR}/checks.json"
@@ -35,6 +41,25 @@ CHECKS_JSON="${RUN_DIR}/checks.json"
 rbv_checks_init "$CHECKS_JSON"
 
 rep() { printf '%s\n' "$*" | tee -a "$REPORT" >&2; }
+rep_file() {
+  # rep_file <title> <path> [max_lines]
+  local title="$1" path="$2" max="${3:-120}"
+  local lines=0
+  rep "----- ${title} (${path}) -----"
+  if [[ ! -f "$path" ]]; then
+    rep "  (нет файла)"
+    rep "----- end ${title} -----"
+    return 0
+  fi
+  lines="$(wc -l <"$path" 2>/dev/null | tr -d ' ' || echo 0)"
+  head -n "$max" "$path" | while IFS= read -r _line || [[ -n "$_line" ]]; do
+    rep "  ${_line}"
+  done
+  if [[ "$lines" =~ ^[0-9]+$ ]] && (( lines > max )); then
+    rep "  … (+$((lines - max)) строк; полный файл: ${path})"
+  fi
+  rep "----- end ${title} -----"
+}
 ok=true
 fail_reasons=()
 
@@ -44,13 +69,13 @@ fail_add() {
   rep "FAIL $1"
 }
 
-# Временный сбой (диск) — worker НЕ пишет в tested, можно повторить тот же key.
+# Временный сбой (диск/OOM) — worker НЕ пишет в tested, можно повторить тот же key.
 mark_retryable() {
   RBV_RETRYABLE=1
   [[ -n "${RUN_DIR:-}" ]] && mkdir -p "$RUN_DIR" && : >"${RUN_DIR}/.retryable"
 }
 
-PG_CID=""
+# PG_CID задан выше (короткое имя ≤63)
 COMPOSE_FILE=""
 NET_NAME=""
 KEEP="${KEEP:-false}"
@@ -318,30 +343,60 @@ rbv_pg_start() {
   # $1 — причина (init|retry)
   local why="${1:-init}"
   local wait_s=120
+  local shm=256m
+  local mem_avail=0
+  if command -v free >/dev/null 2>&1; then
+    mem_avail="$(free -m | awk '/Mem:/{print $7}')"
+    [[ "$mem_avail" =~ ^[0-9]+$ ]] || mem_avail=0
+  fi
+  # на хостах ~4GiB shm=512m + initdb часто = мгновенный OOM
+  if (( mem_avail >= 6000 )); then
+    shm=512m
+  fi
+
   docker rm -f "$PG_CID" >/dev/null 2>&1 || true
-  # чужие rbv_pg_* после OOM/crash занимают RAM
   while IFS= read -r _old; do
     [[ -n "$_old" && "$_old" != "$PG_CID" ]] || continue
     docker rm -f "$_old" >/dev/null 2>&1 || true
   done < <(docker ps -aq --filter "name=rbv_pg_" 2>/dev/null || true)
 
-  rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID} (${why})"
+  rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID} shm=${shm} mem_avail=${mem_avail}Mi (${why})"
+  if (( mem_avail > 0 && mem_avail < 1500 )); then
+    rep "WARN: мало RAM (${mem_avail}Mi) — restore крупных dump может получить SIGKILL(137); нужен swap ≥2G"
+  fi
   set +e
-  # БЕЗ -v: PGDATA только в слое контейнера (/var/lib/docker/…), не на хосте.
-  # Путь /var/lib/postgresql/data внутри контейнера — норма; на хост не монтируем.
-  # shm: крупные COPY/CREATE INDEX в restore без --shm-size часто падают
-  docker run -d --name "$PG_CID" --shm-size=512m \
+  # БЕЗ -v: PGDATA в слое контейнера. Low-mem настройки — хост verify часто 2–4 GiB.
+  docker run -d --name "$PG_CID" --shm-size="$shm" \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
-    "postgres:${PG_VER}-alpine" >/dev/null
+    "postgres:${PG_VER}-alpine" \
+    -c shared_buffers=128MB \
+    -c work_mem=4MB \
+    -c hash_mem_multiplier=1.0 \
+    -c maintenance_work_mem=64MB \
+    -c effective_cache_size=256MB \
+    -c max_parallel_workers=0 \
+    -c max_parallel_workers_per_gather=0 \
+    -c max_parallel_maintenance_workers=0 \
+    -c max_wal_size=256MB \
+    -c min_wal_size=32MB \
+    -c checkpoint_completion_target=0.9 \
+    -c wal_buffers=16MB \
+    -c jit=off \
+    >"${RUN_DIR}/pg.run.out" 2>"${RUN_DIR}/pg.run.err"
   local run_rc=$?
   set -e
   if [[ $run_rc -ne 0 ]]; then
     rep "postgres: docker run rc=${run_rc}"
+    rep_file "pg.run.err" "${RUN_DIR}/pg.run.err" 30
     rbv_pg_diag "run-fail"
     return 1
   fi
+  # дать daemon зарегистрировать контейнер
+  sleep 1
   if ! rbv_pg_alive; then
     rep "postgres: контейнер сразу не Running"
+    rep_file "pg.run.err" "${RUN_DIR}/pg.run.err" 30
+    docker logs "$PG_CID" 2>&1 | tail -n 40 | while IFS= read -r _line; do rep "  log: ${_line}"; done || true
     rbv_pg_diag "not-running"
     return 1
   fi
@@ -393,7 +448,7 @@ rbv_pg_start() {
 
 DB_TABLES=0
 if [[ "$ok" == true ]]; then
-  PG_CID="rbv_pg_${RUN_ID}"
+  # PG_CID уже задан при старте скрипта (короткое имя)
   ready=false
   accept=false
 
@@ -416,6 +471,8 @@ if [[ "$ok" == true ]]; then
     accept=true
   elif [[ "$ok" == true ]]; then
     fail_add "postgres not ready"
+    mark_retryable
+    rep "  → проверьте RAM/swap (free -h) и: docker logs ${PG_CID}"
   fi
 
   if [[ "$ok" == true && "$ready" == true && "$accept" == true ]]; then
@@ -530,6 +587,13 @@ if [[ "$ok" == true ]]; then
       _av="$(rbv_disk_avail_kb "$WD")"
       fail_add "empty schema (dbs=${dbs} sql_errors=${sql_errs}${_extra})"
       rbv_check_add db_schema fail "user tables=0 (dbs=${dbs}, sql_errors=${sql_errs}${_extra}, disk=${_av:-?}KiB)"
+      if [[ ${_psql_rc:-1} -eq 137 ]] || echo "$_extra" | grep -q OOM; then
+        mark_retryable
+        rep "  → OOM: добавьте swap ≥2G на хосте verify (fallocate/swapon) и повторите run"
+      fi
+      if echo "$_extra" | grep -q ENOSPC; then
+        mark_retryable
+      fi
       if [[ -s "${RUN_DIR}/psql.err" ]]; then
         rep "----- psql.err (tail) -----"
         tail -n 15 "${RUN_DIR}/psql.err" | while IFS= read -r _line; do rep "  ${_line}"; done
@@ -679,25 +743,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
     rep "stack: compose project=${COMPOSE_PROJECT}"
 
     # --- дамп compose из бэкапа (оригинал) + вспомогательные файлы ---
-    rep_file() {
-      # rep_file <title> <path> [max_lines]
-      local title="$1" path="$2" max="${3:-120}"
-      local lines=0
-      rep "----- ${title} (${path}) -----"
-      if [[ ! -f "$path" ]]; then
-        rep "  (нет файла)"
-        rep "----- end ${title} -----"
-        return 0
-      fi
-      lines="$(wc -l <"$path" 2>/dev/null | tr -d ' ' || echo 0)"
-      head -n "$max" "$path" | while IFS= read -r _line || [[ -n "$_line" ]]; do
-        rep "  ${_line}"
-      done
-      if [[ "$lines" =~ ^[0-9]+$ ]] && (( lines > max )); then
-        rep "  … (+$((lines - max)) строк; полный файл: ${path})"
-      fi
-      rep "----- end ${title} -----"
-    }
+    # (rep_file определён выше)
 
     # копия оригинального compose из архива
     _bext="yml"

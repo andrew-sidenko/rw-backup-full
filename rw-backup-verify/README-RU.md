@@ -136,6 +136,13 @@ rw-backup-verify reclaim --docker   # runs+cache latest + volumes/containers (о
 - **контейнеры/volumes** — удаляются после каждого теста (`down -v` + volume prune);
 - **образы** — сохраняются; при смене тега в compose бэкапа — `compose pull`;
 - **PG sandbox** (`rbv_pg_*`) без `-v` на хост; `/var/lib/postgresql` на хосте ≠ rbv.
+- Хост verify с **~4 GiB RAM**: для dump 200–500 M нужен **swap ≥2G**, иначе SIGKILL 137:
+
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+free -h
+```
 
 После каждого job тяжёлые `extract/`/sql из `runs/<id>/` удаляются автоматически
 (остаются report + compose.*); перед большим restore — gate ≥max(1.5 GiB, 4×sql.gz).
