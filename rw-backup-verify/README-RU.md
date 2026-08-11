@@ -49,21 +49,115 @@ rw-backup-verify discover cf-oneok          # что будет тестиров
 rw-backup-verify run --storage cf-oneok     # сейчас
 ```
 
+## Один прогон на хост
+
+Таймер тикает **раз в минуту**, но это лишь проверка расписания. Все длительные
+и разрушающие команды (`run`, `tick`, `queue work`, `reclaim`, `runs prune`)
+держат общий лок `work_dir/locks/global.lock`:
+
+- `run --due` при занятом локе тихо пропускает слот (в журнале — одна строка);
+- ручной `run` отказывается с подсказкой (`--wait <сек>` — подождать);
+- `reclaim` отказывается (`--force` — убрать только то, что не принадлежит
+  живому прогону).
+
+Второй рубеж — реестр `work_dir/locks/active/<pid>.json`: пока прогон жив, его
+песочница `rbv_pg_*`, compose-проект и каталог `runs/<id>` **не удаляются**
+никакой уборкой, включая `reclaim --force` и `runs prune --keep 0`.
+
+> Историческая причина: раньше `run` и `reclaim` безусловно делали
+> `docker rm -f rbv_pg_*`, а таймер мог запустить их поверх идущего прогона.
+> Живой restore терял БД и получал `rc=137` — но это был **не OOM**:
+> `OOMKilled=false` + `State.Status=removing` = подпись внешнего `docker rm -f`.
+> Слот расписания теперь занимается в начале прогона, иначе многочасовой run
+> остаётся «due» и таймер дёргает его каждую минуту.
+
+## Restore: чем закончился и почему
+
+`psql` работает с `ON_ERROR_STOP=0`, поэтому его `rc` сам по себе ничего не
+доказывает. Restore пишет внутри контейнера маркер `RBV_PSQL_RC=<rc>`; если
+маркера нет — restore оборвали, и прогон не выдаёт «половину таблиц» за успех.
+
+| class | смысл | что делать |
+|---|---|---|
+| `ok` | дамп применён целиком | — |
+| `external` | песочницу удалили снаружи (`docker rm -f`) | ищите параллельный прогон/уборку; RAM ни при чём |
+| `oom` | `OOMKilled=true` | swap ≥2G на хосте verify |
+| `disk` | ENOSPC во время restore | `rw-backup-verify reclaim --docker` |
+| `dead` / `start_failed` | postgres не поднялся или упал | `docker logs rbv_pg_*` |
+| `psql_error` | psql вернул ошибку | `runs/<id>/psql.err` |
+
+Всё, кроме `ok`, помечает прогон **retryable** (exit 75): архив не попадает в
+`tested/`, следующий запуск возьмёт тот же ключ. При незавершённом restore
+data-проверки помечаются `skip` — раньше они рапортовали «нет таблицы users»,
+хотя дамп был цел.
+
+**Какая БД проверяется.** Дампы ботов — обычно `pg_dumpall`: приложение живёт в
+своей базе (`vpnbot` и т.п.), а в `postgres` пусто или лежит служебная мелочь.
+Выбирается самая содержательная БД — сначала та, где есть `public.users`, затем
+по числу таблиц; `POSTGRES_DB` из `PROFILE.env` имеет приоритет. Список
+кандидатов пишется в отчёт:
+
+```
+db_schema: db=vpnbot user_tables=23 (кандидаты: vpnbot=23+users)
+```
+
+Роли из дампа (`OWNER TO` / `GRANT … TO` / `AUTHORIZATION`) создаются в
+песочнице заранее, иначе restore сыплет `role "…" does not exist`.
+Параметры Postgres подбираются под доступную RAM, `fsync`/`full_page_writes`/
+`synchronous_commit` выключены — песочница одноразовая, и это кратно ускоряет
+restore крупных дампов.
+
 ## Проверки (включаются/выключаются раздельно для panel и bot)
 
 В `/etc/rw-backup-verify/config.json` → `checks.panel` / `checks.bot`:
 
 | Ключ | Смысл |
 |---|---|
-| `user_rows` | **bot:** строго `public.users`; **panel:** эвристика. Не пуста и ≥ предыдущей проверки (baseline) |
-| `event_freshness` | **bot:** max(timestamp) из `payment_webhook_events`; **panel:** users/nodes. Окно [prev_backup − skew … curr_backup + skew] |
+| `bot_users` | **bot:** группа «пользователи» — `users`, `subscriptions`, `tariffs`, `app_settings`, `cabinet_email_verification_codes`, `cabinet_site_visits` |
+| `bot_payments` | **bot:** группа «платежи» — `payments`, `payment_intents`, `payment_webhook_events`, `recurring_yookassa`, `recurring_robokassa` |
+| `user_rows` | **panel:** таблица пользователей по эвристике; не пуста и ≥ предыдущей проверки |
+| `event_freshness` | **bot:** самая свежая дата среди платёжных таблиц бота (если платежей нет — среди пользовательских); **panel:** users/nodes. Окно [prev_backup − skew … curr_backup + skew] |
 | `stack` | поднять compose в `--internal` + без падений `stability_seconds` |
 | `isolation` | сеть `Internal=true` + нет внешнего TCP egress (DNS на internal часто резолвится — это не leak). **Preflight** до download: если хост не изолирует — все тесты стоп. В stack — до stability/ports. |
 | `backend_ports` | TCP/HTTP к портам сервисов, ответ не пустой |
 
-**Bot:** если нет `users` / `payment_webhook_events` или у webhook нет timestamp-полей —
-при **ручном** `run` в report и в `work_dir/logs/schema_*.txt` печатается **полный
-schema-diag** (все таблицы, поля, rows, OK/MISS по ключевым bot-таблицам).
+### Данные бота: две группы
+
+Набор таблиц у ботов разный, поэтому **отсутствие таблицы — не ошибка**: у бота
+просто нет такой функции. Ошибка — это **пропажа данных**:
+
+| Ситуация | Итог |
+|---|---|
+| таблицы нет и раньше не было | ⚪ `absent` — норма |
+| таблица есть, строк столько же или больше | ✅ `ok` |
+| таблица есть впервые | ✅ `new` — записывается в baseline |
+| таблица пустая, истории нет | ⚪ `empty` (кроме `users` — бот без пользователей это ❌) |
+| **строк стало меньше, чем в прошлой проверке** | ❌ `drop` |
+| **таблица была с данными и исчезла** | ❌ `gone` |
+
+В отчёт попадает построчная сводка и итог по группе:
+
+```
+✅ bot_users — 4/6 таблиц, строк=2169420 · users=2169069 subscriptions=320 … · нет: cabinet_site_visits
+✅ bot_payments — 3/5 таблиц, строк=88214 · payments=51120 payment_webhook_events=37094 …
+```
+
+Счётчики строк по каждой таблице хранятся в baseline экземпляра, поэтому
+сравнение идёт с предыдущим **проверенным** бэкапом именно этого бота.
+
+Переопределить состав групп (например, у бота свои имена таблиц):
+
+```json
+"checks": { "bot": { "tables": {
+  "users":    ["users", "subscriptions"],
+  "payments": ["payments"]
+} } }
+```
+
+Если у бота нет ни одной таблицы из обеих групп — это ошибка (значит выбрана не
+та БД или дамп пустой), и при **ручном** `run` в report и в
+`work_dir/logs/schema_*.txt` печатается **полный schema-diag** (все таблицы,
+поля, rows).
 
 `timezone_skew_hours` (по умолчанию 14) — допуск на разные TZ серверов.
 
@@ -108,8 +202,18 @@ rw-backup-verify tick
 Тесты (без Docker/S3):
 
 ```bash
-bash test/unit_config_queue.sh
-bash test/unit_logic_full.sh
+bash test/unit_config_queue.sh    # конфиг, расписание, очередь
+bash test/unit_logic_full.sh      # discover/tested/CLI/compose rewrite
+bash test/unit_concurrency.sh     # лок, реестр активных, защита от уборки
+bash test/unit_hardening.sh       # errexit/pipefail-ловушки, tunables, пороги
+bash test/unit_bot_groups.sh      # группы данных бота, сверка с baseline
+```
+
+Живой e2e (нужен рабочий Docker; сам собирает синтетический bot-архив,
+поднимает postgres, стек в `--internal` и имитирует внешний `docker rm -f`):
+
+```bash
+bash test/live_pg_restore.sh
 ```
 
 Ручной `run` пишет шаги в stderr и в `work_dir/logs/run_*.log`
@@ -129,6 +233,7 @@ stack будет skip.
 ```bash
 rw-backup-verify disk
 rw-backup-verify reclaim --docker   # runs+cache latest + volumes/containers (образы остаются)
+                                    # во время прогона откажется; --force чистит только чужое
 ```
 
 Политика хранения:
@@ -137,6 +242,8 @@ rw-backup-verify reclaim --docker   # runs+cache latest + volumes/containers (о
 - **контейнеры/volumes** — удаляются после каждого теста (`down -v` + volume prune);
 - **образы** — сохраняются; при смене тега в compose бэкапа — `compose pull`;
 - **PG sandbox** (`rbv_pg_*`) без `-v` на хост; `/var/lib/postgresql` на хосте ≠ rbv.
+- Артефакты **живого** прогона уборка не трогает (см. «Один прогон на хост»);
+  `rc=137` при `OOMKilled=false` — это внешнее удаление контейнера, не нехватка RAM.
 - Хост verify с **~4 GiB RAM**: для dump 200–500 M нужен **swap ≥2G**, иначе SIGKILL 137.
   После тестов rbv сбрасывает page cache (`drop_caches`) — иначе `buff/cache` от
   чтения dump держит RAM, хотя `docker ps` пуст.

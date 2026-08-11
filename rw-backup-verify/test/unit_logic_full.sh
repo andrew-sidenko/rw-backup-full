@@ -59,6 +59,18 @@ echo "unexpected aws: $*" >&2
 exit 1
 AWS
 chmod +x "$T/bin/aws"
+
+# --- mock docker ---
+# ОБЯЗАТЕЛЬНО: `run` вызывает rbv_docker_reclaim, а тот делает `docker rm -f`
+# по маске rbv_pg_*. Без заглушки юнит-тест сносил песочницу настоящего
+# прогона на этом же хосте (ровно тот сбой, который чинится в этой ветке).
+cat > "$T/bin/docker" <<'DOCKER'
+#!/bin/bash
+printf '%s\n' "$*" >>"${T_DOCKER_LOG:-/dev/null}"
+exit 0
+DOCKER
+chmod +x "$T/bin/docker"
+export T_DOCKER_LOG="$T/docker.log"
 export PATH="$T/bin:$PATH"
 
 echo "==== classify ===="
@@ -408,10 +420,11 @@ echo "$_dump" | grep -q 'отсутствует' && pass "dump missing table" ||
 
 rbv_psql() {
   case "$1" in
+    # свежесть бота: список существующих таблиц группы → ts-колонки → max(epoch)
+    *"to_regclass('public.'||quote_ident(t))"*) printf 'payment_webhook_events\n' ;;
+    *"table_name||'|'||column_name"*) printf 'payment_webhook_events|created_at\n' ;;
+    *"EXTRACT(EPOCH"*) printf '1700000000|payment_webhook_events.created_at\n' ;;
     *"to_regclass('public.payment_webhook_events')"*) printf 'public.payment_webhook_events\n' ;;
-    *"column_name FROM information_schema"*timestamp*) printf 'created_at\n' ;;
-    *"EXTRACT(EPOCH FROM MAX(created_at))"*) printf '1700000000\n' ;;
-    *"column_name||'*|*"*) printf 'id|int4\ncreated_at|timestamptz\n' ;;
     *"column_name||'|'||udt_name"*) printf 'id|int4\ncreated_at|timestamptz\n' ;;
     *) printf '\n' ;;
   esac
@@ -430,11 +443,11 @@ se="$(echo "${se:-0}" | tr -d '[:space:]')"
 
 # OOM/rc=137 messaging helpers exist in rbv-run-one (bash -n covered below)
 bash -n "$ROOT/bin/rbv-run-one.sh" && pass "rbv-run-one bash -n" || fail "rbv-run-one bash -n" "syntax"
-grep -q 'shm-size' "$ROOT/bin/rbv-run-one.sh" && pass "pg shm-size" || fail "pg shm-size" "missing"
-grep -q 'OOMKilled' "$ROOT/bin/rbv-run-one.sh" && pass "pg OOM diag" || fail "pg OOM diag" "missing"
+grep -q 'shm-size' "$ROOT/lib/pg.sh" && pass "pg shm-size" || fail "pg shm-size" "missing"
+grep -q 'OOMKilled' "$ROOT/lib/pg.sh" && pass "pg OOM diag" || fail "pg OOM diag" "missing"
 grep -q 'rbv_pg_start' "$ROOT/bin/rbv-run-one.sh" && pass "pg start helper" || fail "pg start helper" "missing"
-grep -q 'rbv_pg_restore_sql\|docker cp' "$ROOT/bin/rbv-run-one.sh" && pass "restore via docker cp" || fail "restore docker cp" "missing"
-grep -q 'shared_buffers=64MB' "$ROOT/bin/rbv-run-one.sh" && pass "pg 64MB buffers" || fail "pg 64MB" "missing"
+grep -q 'docker cp' "$ROOT/lib/pg.sh" && pass "restore via docker cp" || fail "restore docker cp" "missing"
+grep -q 'shared_buffers=' "$ROOT/lib/pg.sh" && pass "pg tunables" || fail "pg tunables" "missing"
 grep -q '_RBV_SHORT' "$ROOT/bin/rbv-run-one.sh" && pass "short pg container names" || fail "short names" "missing"
 grep -q 'rbv_mem_reclaim' "$ROOT/lib/common.sh" && pass "mem reclaim fn" || fail "mem reclaim fn" "missing"
 grep -q 'drop_caches' "$ROOT/lib/common.sh" && pass "drop_caches" || fail "drop_caches" "missing"
@@ -521,6 +534,18 @@ cpath="$(rbv_cache_ensure s1 'pref/a.tar.gz' || true)"
 c2="$(rbv_cache_ensure s1 'pref/a.tar.gz')"
 [[ "$c2" == "$cpath" ]] && pass "cache hit path" || fail "cache hit path" "$c2"
 
+echo "==== тесты не трогают настоящий docker ===="
+# страховка: если заглушка перестанет подхватываться, тест это покажет
+if [[ -s "$T/docker.log" ]]; then
+  grep -q 'rm -f' "$T/docker.log" \
+    && pass "docker-вызовы ушли в заглушку (включая rm -f)" \
+    || pass "docker-вызовы ушли в заглушку"
+else
+  pass "docker не вызывался"
+fi
+[[ "$(command -v docker)" == "$T/bin/docker" ]] && pass "в PATH подставлен mock docker" \
+  || fail "mock docker в PATH" "$(command -v docker)"
+
 echo "==== help / unknown / save config ===="
 expect_rc 0 "help" "$ROOT/bin/rw-backup-verify" help
 expect_rc 1 "unknown cmd" "$ROOT/bin/rw-backup-verify" nosuchcmd
@@ -532,7 +557,18 @@ set -e
 
 echo "==== install.sh syntax / non-root ===="
 bash -n "$ROOT/install.sh" && pass "install bash -n" || fail "install bash -n" "syntax"
-expect_rc 1 "install non-root" bash "$ROOT/install.sh"
+# под root install.sh реально поставил бы systemd-таймер прямо из теста —
+# сбрасываем привилегии, чтобы проверять именно guard «нужен root»
+if [[ ${EUID:-0} -eq 0 ]]; then
+  _inst="$(mktemp /tmp/rbv_install_XXXXXX.sh)"
+  cp "$ROOT/install.sh" "$_inst"
+  chmod 755 "$_inst"
+  expect_rc 1 "install non-root" \
+    setpriv --reuid=65534 --regid=65534 --clear-groups bash "$_inst"
+  rm -f "$_inst"
+else
+  expect_rc 1 "install non-root" bash "$ROOT/install.sh"
+fi
 
 echo
 echo "==== ${PASS} passed, ${FAIL} failed ===="

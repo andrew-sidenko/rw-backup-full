@@ -1,5 +1,8 @@
 [Unit]
 Description=rw-backup-verify schedule tick (every minute)
+# Тик частый специально: он лишь смотрит, наступило ли глобальное расписание.
+# Реальный прогон защищён глобальным локом (locks/global.lock), поэтому
+# параллельно с идущим run ничего не стартует.
 
 [Timer]
 OnCalendar=*-*-* *:*:00
