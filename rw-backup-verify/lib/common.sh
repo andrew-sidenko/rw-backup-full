@@ -303,14 +303,33 @@ rbv_slim_old_runs() {
   done
 }
 
-# Нужно ≥ need_kb свободно под restore. При нехватке — slim + prune.
+# Минимум свободно под restore (KiB). 1.5 GiB — на хостах ~50G с кэшем/Docker
+# жёсткие 3 GiB часто блокировали прогон при живом 4×sql.gz.
+rbv_disk_floor_kb() {
+  echo 1572864
+}
+
+# need_kb для sql.gz: max(4×size, floor). stdout KiB.
+rbv_disk_need_for_sql() {
+  local sql_b="${1:-0}" floor need
+  floor="$(rbv_disk_floor_kb)"
+  need="$floor"
+  if [[ "$sql_b" =~ ^[0-9]+$ ]] && (( sql_b > 0 )); then
+    need=$(( sql_b * 4 / 1024 ))
+    (( need < floor )) && need=$floor
+  fi
+  echo "$need"
+}
+
+# Нужно ≥ need_kb свободно под restore. При нехватке — slim + prune(+cache).
 # $1=need_kb $2=protect_run_dir
 # rc=0 если после попыток хватает (или need неизвестен); rc=1 если всё ещё мало.
 rbv_ensure_disk_kb() {
-  local need="${1:-3145728}" protect="${2:-}"
-  local wd avail
+  local need="${1:-}" protect="${2:-}"
+  local wd avail floor
   wd="$(rbv_work_dir)"
-  [[ "$need" =~ ^[0-9]+$ ]] || need=3145728
+  floor="$(rbv_disk_floor_kb)"
+  [[ "$need" =~ ^[0-9]+$ ]] || need="$floor"
   avail="$(rbv_disk_avail_kb "$wd")"
   [[ "$avail" =~ ^[0-9]+$ ]] || return 0
   if (( avail >= need )); then
@@ -318,9 +337,11 @@ rbv_ensure_disk_kb() {
   fi
   msg WARN "disk: свободно ${avail} KiB < нужно ${need} KiB — slim/prune"
   rbv_slim_old_runs "$protect"
-  # оставить только текущий run (+0 старых)
-  rbv_runs_prune 1 >/dev/null || true
-  # если protect не самый новый — prune мог его удалить; не удаляем protect явно в prune
+  # только текущий run (protect через RBV_PROTECT_RUN / $2)
+  rbv_runs_prune 0 "$protect" >/dev/null || true
+  if [[ "${RBV_CACHE_LATEST:-true}" == true ]]; then
+    rbv_cache_prune_latest "" >/dev/null || true
+  fi
   avail="$(rbv_disk_avail_kb "$wd")"
   [[ "$avail" =~ ^[0-9]+$ ]] || return 0
   if (( avail >= need )); then

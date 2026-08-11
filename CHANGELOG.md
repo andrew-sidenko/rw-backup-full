@@ -1,5 +1,14 @@
 # Changelog
 
+## v5.6.32 (2026-08-11)
+
+### Исправлено (`rw-backup-verify`)
+- **Disk gate**: минимум свободно 1.5 GiB (было 3 GiB) + `max(4×sql.gz)`.
+  На хосте ~50G с Docker/кэшем 3 GiB часто блокировали restore при живом 4×dump.
+- При ENOSPC/мало места — **rc=75 retryable**, worker **не** пишет в `tested`
+  (можно повторить тот же архив после prune).
+- При нехватке места: prune runs keep=0 + cache latest перед fail.
+
 ## v5.6.31 (2026-08-11)
 
 ### Изменено (`rw-backup-verify`)

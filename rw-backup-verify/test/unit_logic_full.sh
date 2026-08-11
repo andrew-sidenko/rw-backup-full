@@ -452,6 +452,13 @@ grep -q 'preflight: isolation' "$ROOT/bin/rbv-run-one.sh" && pass "preflight in 
 grep -q 'check isolation (до stability)' "$ROOT/bin/rbv-run-one.sh" && pass "isolation before stability" || fail "isolation before stability" "missing"
 grep -q 'rbv_run_slim' "$ROOT/bin/rbv-run-one.sh" && pass "run slim on cleanup" || fail "run slim on cleanup" "missing"
 grep -q 'rbv_ensure_disk_kb' "$ROOT/bin/rbv-run-one.sh" && pass "disk gate before restore" || fail "disk gate" "missing"
+grep -q 'mark_retryable\|RBV_RETRYABLE\|exit 75' "$ROOT/bin/rbv-run-one.sh" && pass "disk retryable exit" || fail "disk retryable" "missing"
+grep -q 'rc == 75\|RETRYABLE' "$ROOT/bin/rbv-worker.sh" && pass "worker skip tested retryable" || fail "worker retryable" "missing"
+_need="$(rbv_disk_need_for_sql 217000000)"
+[[ "$_need" == "1572864" ]] && pass "disk need floor 1.5G" || fail "disk need floor" "$_need"
+_need2="$(rbv_disk_need_for_sql 900000000)"
+# 900M*4/1024 = 3515625 > floor
+[[ "$_need2" == "3515625" ]] && pass "disk need 4x sql" || fail "disk need 4x" "$_need2"
 
 # run slim keeps report, drops extract
 _sl="$T/slimrun"; mkdir -p "$_sl/extract" "$_sl/project_extract"

@@ -44,6 +44,12 @@ fail_add() {
   rep "FAIL $1"
 }
 
+# Временный сбой (диск) — worker НЕ пишет в tested, можно повторить тот же key.
+mark_retryable() {
+  RBV_RETRYABLE=1
+  [[ -n "${RUN_DIR:-}" ]] && mkdir -p "$RUN_DIR" && : >"${RUN_DIR}/.retryable"
+}
+
 PG_CID=""
 COMPOSE_FILE=""
 NET_NAME=""
@@ -55,6 +61,7 @@ LAST_EVENT=0
 CURR_ARCH_EPOCH=0
 PREV_ARCH_EPOCH=0
 BASELINE_JSON="{}"
+RBV_RETRYABLE=0
 
 cleanup() {
   if [[ "$KEEP" != "true" ]]; then
@@ -157,6 +164,7 @@ else
     if grep -qiE 'No space left|ENOSPC|errno 28' "${RUN_DIR}/download.err" 2>/dev/null; then
       fail_add "download failed: диск заполнен (ENOSPC)"
       rbv_check_add download fail "ENOSPC — runs prune / docker prune"
+      mark_retryable
       rep "  ${_err}"
       rep "  → rw-backup-verify runs prune --keep 0"
       rep "  → docker system prune -af"
@@ -372,19 +380,17 @@ if [[ "$ok" == true ]]; then
   ready=false
   accept=false
 
-  # место под restore: ~4× размер .sql.gz, минимум 3GiB
+  # место под restore: ~4× .sql.gz, минимум 1.5 GiB (см. rbv_disk_need_for_sql)
   _sql_b=0
   [[ -n "${SQL:-}" && -f "${SQL:-}" ]] && _sql_b="$(stat -c%s "$SQL" 2>/dev/null || wc -c <"$SQL" | tr -d ' ')"
-  _need_kb=3145728
-  if [[ "$_sql_b" =~ ^[0-9]+$ ]] && (( _sql_b > 0 )); then
-    _need_kb=$(( _sql_b * 4 / 1024 ))
-    (( _need_kb < 3145728 )) && _need_kb=3145728
-  fi
+  _need_kb="$(rbv_disk_need_for_sql "${_sql_b:-0}")"
+  [[ "$_need_kb" =~ ^[0-9]+$ ]] || _need_kb="$(rbv_disk_floor_kb)"
   if ! rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR"; then
     _av="$(rbv_disk_avail_kb "$WD")"
     fail_add "мало места на диске (avail=${_av:-?}KiB need=${_need_kb}KiB)"
     rbv_check_add db_schema fail "ENOSPC: свободно ${_av:-?} KiB, нужно ≥${_need_kb}"
-    rep "FAIL disk: $(rbv_disk_report "$WD")"
+    mark_retryable
+    rep "FAIL disk: $(rbv_disk_report "$WD") — НЕ в tested (retryable)"
     rep "  → rw-backup-verify runs prune --keep 0 && docker system prune -af"
   fi
 
@@ -1094,4 +1100,11 @@ jq -n \
   '{storage:$sid,kind:$kind,instance:$inst,archive:$key,ok:$ok,db_tables:$tables,user_rows:$users,checks:$checks[0]}' \
   > "${RUN_DIR}/summary.json"
 
-[[ "$ok" == true ]]
+if [[ "$ok" == true ]]; then
+  exit 0
+fi
+# 75 = EX_TEMPFAIL: worker не помечает tested (можно повторить тот же архив)
+if [[ "${RBV_RETRYABLE:-0}" == "1" || -f "${RUN_DIR}/.retryable" ]]; then
+  exit 75
+fi
+exit 1
