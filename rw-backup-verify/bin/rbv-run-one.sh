@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 source "${SCRIPT_DIR}/../lib/common.sh"
 # shellcheck source=../lib/checks.sh
 source "${SCRIPT_DIR}/../lib/checks.sh"
+# shellcheck source=../lib/pg.sh
+source "${SCRIPT_DIR}/../lib/pg.sh"
 
 SID="${1:?storage}"
 KIND="${2:?kind}"
@@ -63,6 +65,8 @@ rep_file() {
   fi
   rep "----- end ${title} -----"
 }
+# шаги lib/pg.sh пишем и в report, и в stderr
+rbv_say() { rep "$*"; }
 ok=true
 fail_reasons=()
 
@@ -91,6 +95,11 @@ PREV_ARCH_EPOCH=0
 BASELINE_JSON="{}"
 RBV_RETRYABLE=0
 RBV_HB_PID=""
+RBV_DISK_NEED_KB=0
+
+# Реестр живого прогона: чужой reclaim/prune (ручной или из параллельного
+# tick'а) не должен снести нашу песочницу, compose-проект и runs/<id>.
+rbv_active_register "$RUN_DIR" "$PG_CID" "$COMPOSE_PROJECT"
 
 cleanup() {
   # heartbeat restore (иначе sleep-цикл живёт после EXIT)
@@ -105,11 +114,13 @@ cleanup() {
     fi
     [[ -n "${NET_NAME}" ]] && docker network rm "$NET_NAME" >/dev/null 2>&1 || true
     [[ -n "${PG_CID}" ]] && docker rm -f "$PG_CID" >/dev/null 2>&1 || true
-    # любые rbv_pg_* / probe после kill/OOM
+    # свои хвосты после kill/OOM; песочницы чужих живых прогонов не трогаем
     while IFS= read -r _old; do
       [[ -n "$_old" ]] || continue
+      rbv_is_protected "$_old" pg_cid && continue
       docker rm -f "$_old" >/dev/null 2>&1 || true
-    done < <(docker ps -aq --filter 'name=rbv_pg_' --filter 'name=rbv_probe_' 2>/dev/null || true)
+    done < <(docker ps -a --filter 'name=rbv_pg_' --filter 'name=rbv_probe_' \
+      --format '{{.Names}}' 2>/dev/null || true)
     # anonymous volumes от stack (redis/pgdata) — иначе копятся в /var/lib/docker/volumes
     docker volume prune -f >/dev/null 2>&1 || true
     # освободить диск для следующего job: dump/extract убрать, report/compose оставить
@@ -124,6 +135,7 @@ cleanup() {
     # page cache от dump/archive — иначе avail RAM падает между bot→panel
     rbv_mem_reclaim >/dev/null 2>&1 || true
   fi
+  rbv_active_unregister
 }
 trap cleanup EXIT
 
@@ -365,160 +377,11 @@ if [[ "$ok" == true ]]; then
 fi
 
 # --- DB restore + data checks -----------------------------------------------
-# Большие dump (200–500M gz) на узком хосте часто ловят OOM (rc=137) /
-# «server closed». Soft-retry в ту же полумёртвую БД бесполезен — только recreate.
-rbv_pg_alive() {
-  [[ -n "${PG_CID:-}" ]] || return 1
-  docker inspect -f '{{.State.Running}}' "$PG_CID" 2>/dev/null | grep -qx true
-}
-
-rbv_pg_diag() {
-  local tag="${1:-diag}"
-  rep "postgres[${tag}]: --- состояние ---"
-  if [[ -n "${PG_CID:-}" ]]; then
-    docker inspect -f 'status={{.State.Status}} running={{.State.Running}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}} error={{.State.Error}}' \
-      "$PG_CID" 2>/dev/null | while IFS= read -r _line; do rep "  ${_line}"; done || rep "  (inspect недоступен)"
-    if docker logs "$PG_CID" >/dev/null 2>&1; then
-      rep "  ----- docker logs (tail 25) -----"
-      docker logs --tail 25 "$PG_CID" 2>&1 | while IFS= read -r _line; do rep "  ${_line}"; done || true
-      rep "  ----- end logs -----"
-    fi
-  fi
-  # память/диск — частая причина 137 / «not ready»
-  if command -v free >/dev/null 2>&1; then
-    rep "  mem: $(free -m | awk '/Mem:/{printf "avail=%sMi total=%sMi", $7, $2}')"
-  fi
-  df -h /var/lib/docker 2>/dev/null | tail -n1 | while IFS= read -r _line; do rep "  disk docker: ${_line}"; done || true
-}
-
-rbv_pg_start() {
-  # $1 — причина (init|retry)
-  local why="${1:-init}"
-  local wait_s=120
-  local shm=256m
-  local mem_avail=0
-  if command -v free >/dev/null 2>&1; then
-    mem_avail="$(free -m | awk '/Mem:/{print $7}')"
-    [[ "$mem_avail" =~ ^[0-9]+$ ]] || mem_avail=0
-  fi
-  # на хостах ~4GiB shm=512m + initdb часто = мгновенный OOM
-  if (( mem_avail >= 6000 )); then
-    shm=512m
-  fi
-
-  # чужие rbv_pg_* после OOM/crash занимают RAM — снять до старта
-  docker rm -f "$PG_CID" >/dev/null 2>&1 || true
-  while IFS= read -r _old; do
-    [[ -n "$_old" && "$_old" != "$PG_CID" ]] || continue
-    docker rm -f "$_old" >/dev/null 2>&1 || true
-  done < <(docker ps -aq --filter "name=rbv_pg_" 2>/dev/null || true)
-  # page cache перед initdb/restore
-  rbv_mem_reclaim >/dev/null 2>&1 || true
-
-  rep "postgres: pull/start image=postgres:${PG_VER}-alpine name=${PG_CID} shm=${shm} mem_avail=${mem_avail}Mi (${why})"
-  if (( mem_avail > 0 && mem_avail < 1500 )); then
-    rep "WARN: мало RAM (${mem_avail}Mi) — restore крупных dump может получить SIGKILL(137); нужен swap ≥2G"
-  fi
-  set +e
-  # БЕЗ -v: PGDATA в слое контейнера. Low-mem настройки — хост verify часто 2–4 GiB.
-  docker run -d --name "$PG_CID" --shm-size="$shm" \
-    -e POSTGRES_HOST_AUTH_METHOD=trust \
-    "postgres:${PG_VER}-alpine" \
-    -c shared_buffers=64MB \
-    -c work_mem=2MB \
-    -c hash_mem_multiplier=1.0 \
-    -c maintenance_work_mem=32MB \
-    -c effective_cache_size=128MB \
-    -c max_parallel_workers=0 \
-    -c max_parallel_workers_per_gather=0 \
-    -c max_parallel_maintenance_workers=0 \
-    -c max_wal_size=256MB \
-    -c min_wal_size=32MB \
-    -c checkpoint_completion_target=0.9 \
-    -c wal_buffers=16MB \
-    -c jit=off \
-    >"${RUN_DIR}/pg.run.out" 2>"${RUN_DIR}/pg.run.err"
-  local run_rc=$?
-  set -e
-  if [[ $run_rc -ne 0 ]]; then
-    rep "postgres: docker run rc=${run_rc}"
-    rep_file "pg.run.err" "${RUN_DIR}/pg.run.err" 30
-    rbv_pg_diag "run-fail"
-    return 1
-  fi
-  # дать daemon зарегистрировать контейнер
-  sleep 1
-  if ! rbv_pg_alive; then
-    rep "postgres: контейнер сразу не Running"
-    rep_file "pg.run.err" "${RUN_DIR}/pg.run.err" 30
-    docker logs "$PG_CID" 2>&1 | tail -n 40 | while IFS= read -r _line; do rep "  log: ${_line}"; done || true
-    rbv_pg_diag "not-running"
-    return 1
-  fi
-
-  rep "postgres: жду pg_isready (до ${wait_s}с)…"
-  local i ready=false
-  for i in $(seq 1 "$wait_s"); do
-    if docker exec "$PG_CID" pg_isready -U postgres >/dev/null 2>&1; then
-      ready=true
-      rep "postgres: ready (${i}с)"
-      break
-    fi
-    if ! rbv_pg_alive; then
-      rep "postgres: контейнер умер на ожидании ready (${i}с)"
-      rbv_pg_diag "died-wait"
-      return 1
-    fi
-    if (( i % 15 == 0 )); then
-      rep "postgres: ещё не ready (${i}/${wait_s}с)…"
-    fi
-    sleep 1
-  done
-  if [[ "$ready" != true ]]; then
-    rbv_pg_diag "not-ready"
-    return 1
-  fi
-
-  rep "postgres: жду SELECT 1…"
-  local accept=false
-  for i in $(seq 1 60); do
-    if docker exec "$PG_CID" psql -U postgres -d postgres -Atc 'SELECT 1' >/dev/null 2>&1; then
-      accept=true
-      rep "postgres: accepts connections (${i}с)"
-      break
-    fi
-    if ! rbv_pg_alive; then
-      rep "postgres: контейнер умер на SELECT 1"
-      rbv_pg_diag "died-select"
-      return 1
-    fi
-    sleep 1
-  done
-  if [[ "$accept" != true ]]; then
-    rbv_pg_diag "no-select"
-    return 1
-  fi
-  return 0
-}
-
-# Restore .sql.gz внутрь контейнера (без pipe host→docker exec — он жрёт RAM).
-# $1 = path to .sql.gz on host. Пишет stderr в ${RUN_DIR}/psql.err.
-# stdout: ничего; rc = psql/docker.
-rbv_pg_restore_sql() {
-  local sql="$1"
-  local remote="/tmp/rbv_dump.sql.gz"
-  : >"${RUN_DIR}/psql.err"
-  [[ -n "${PG_CID:-}" && -f "$sql" ]] || return 1
-  docker cp "$sql" "${PG_CID}:${remote}" 2>>"${RUN_DIR}/psql.err" || return 1
-  # restore внутри контейнера: один gzip+psql, без буферов docker attach на хосте
-  docker exec "$PG_CID" sh -c \
-    "gzip -dc '${remote}' | psql -q -U postgres -d postgres -v ON_ERROR_STOP=0" \
-    >/dev/null 2>>"${RUN_DIR}/psql.err"
-  local rc=$?
-  docker exec "$PG_CID" rm -f "$remote" >/dev/null 2>&1 || true
-  return "$rc"
-}
-
+# Песочница PG и restore — в lib/pg.sh (rbv_pg_start / rbv_pg_restore).
+# Там же классификация сбоя (oom | external | psql_error | disk) и маркер
+# завершения psql: без него оборванный restore рапортовал rc=0 с половиной
+# таблиц, а дальше падал на «users table missing».
+# Тюнинг PG под RAM — rbv_pg_tunables (lib/pg.sh); типовой хост verify 2–4 GiB.
 DB_TABLES=0
 if [[ "$ok" == true ]]; then
   # PG_CID уже задан при старте скрипта (короткое имя)
@@ -530,6 +393,11 @@ if [[ "$ok" == true ]]; then
   [[ -n "${SQL:-}" && -f "${SQL:-}" ]] && _sql_b="$(stat -c%s "$SQL" 2>/dev/null || wc -c <"$SQL" | tr -d ' ')"
   _need_kb="$(rbv_disk_need_for_sql "${_sql_b:-0}")"
   [[ "$_need_kb" =~ ^[0-9]+$ ]] || _need_kb="$(rbv_disk_floor_kb)"
+  _est_kb="$(rbv_disk_estimate_for_sql "${_sql_b:-0}")"
+  _av_kb="$(rbv_disk_avail_kb "$WD")"
+  if [[ "$_av_kb" =~ ^[0-9]+$ && "$_est_kb" =~ ^[0-9]+$ ]] && (( _av_kb < _est_kb )); then
+    rep "WARN disk: свободно $(( _av_kb / 1024 ))MiB, restore этого дампа обычно требует ≈$(( _est_kb / 1024 ))MiB (SQL+индексы+WAL)"
+  fi
   if ! rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR"; then
     _av="$(rbv_disk_avail_kb "$WD")"
     fail_add "мало места на диске (avail=${_av:-?}KiB need=${_need_kb}KiB)"
@@ -552,72 +420,45 @@ if [[ "$ok" == true ]]; then
     # сбросить page cache перед тяжёлым restore (после extract архива)
     _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
     [[ -n "$_mr" ]] && rep "$_mr"
-    sql_sz="$(du -h "$SQL" 2>/dev/null | awk '{print $1}')"
-    rep "psql restore: $(basename "$SQL") (${sql_sz}) — docker cp + psql внутри контейнера"
-    (
-      t=0
-      while sleep 15; do
-        t=$((t + 15))
-        printf '%s\n' "psql restore: ещё работает… ${t}с" | tee -a "$REPORT" >&2
-      done
-    ) &
-    RBV_HB_PID=$!
-    _hb=$RBV_HB_PID
-    _psql_rc=1
-    _max_restore=3
-    for _attempt in $(seq 1 "$_max_restore"); do
-      if ! rbv_pg_alive; then
-        rep "psql restore: PG мёртв перед попыткой ${_attempt}/${_max_restore} — recreate"
-        if ! rbv_pg_start "retry-${_attempt}"; then
-          _psql_rc=137
-          break
-        fi
-      fi
-      : >"${RUN_DIR}/psql.err"
-      set +e
-      rbv_pg_restore_sql "$SQL"
-      _psql_rc=$?
-      set -e
-
-      _oom=false
-      docker inspect -f '{{.State.OOMKilled}}' "$PG_CID" 2>/dev/null | grep -qx true && _oom=true
-      if [[ $_psql_rc -eq 137 ]] || [[ "$_oom" == true ]] || ! rbv_pg_alive; then
-        rep "psql restore: OOM/SIGKILL/dead rc=${_psql_rc} oom=${_oom} (попытка ${_attempt}/${_max_restore})"
-        rbv_pg_diag "oom-${_attempt}"
-        if (( _attempt < _max_restore )); then
-          rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR" || true
-          rbv_mem_reclaim >/dev/null 2>&1 || true
-          rep "psql restore: recreate PG и повтор…"
-          rbv_pg_start "retry-${_attempt}" || true
-          continue
-        fi
-        break
-      fi
-      if grep -qiE 'starting up|connection.*failed|server closed|the database system is shutting down|No space left|ENOSPC' \
-           "${RUN_DIR}/psql.err" 2>/dev/null; then
-        rep "psql restore: соединение/диск (попытка ${_attempt}/${_max_restore}) — recreate"
-        rbv_pg_diag "conn-${_attempt}"
-        if (( _attempt < _max_restore )); then
-          rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR" || true
-          rbv_mem_reclaim >/dev/null 2>&1 || true
-          rbv_pg_start "retry-${_attempt}" || true
-          continue
-        fi
-        break
-      fi
-      break
-    done
-    kill "$_hb" 2>/dev/null || true
-    wait "$_hb" 2>/dev/null || true
-    RBV_HB_PID=""
-    rep "psql restore: rc=${_psql_rc}"
-    sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || true)"
-    sql_errs="$(echo "${sql_errs:-0}" | tr -d '[:space:]')"
-    [[ "$sql_errs" =~ ^[0-9]+$ ]] || sql_errs=0
-    if (( sql_errs > 0 )); then
-      rep "psql restore: ERROR-строк=${sql_errs} (см. ${RUN_DIR}/psql.err)"
-    fi
-
+    RBV_DISK_NEED_KB="$_need_kb"
+    _max_restore="${RBV_RESTORE_MAX_ATTEMPTS:-3}"
+    [[ "$_max_restore" =~ ^[1-9][0-9]*$ ]] || _max_restore=3
+    rbv_pg_restore "$SQL" "$_max_restore" || true
+    _psql_rc="${RBV_RESTORE_RC:-1}"
+    sql_errs="${RBV_RESTORE_ERRORS:-0}"
+    rep "psql restore: итог class=${RBV_RESTORE_CLASS} rc=${_psql_rc} попыток=${RBV_RESTORE_ATTEMPTS} ERROR=${sql_errs}"
+    case "${RBV_RESTORE_CLASS}" in
+      ok)
+        rbv_check_add db_restore ok "дамп применён полностью (ERROR=${sql_errs})"
+        ;;
+      external)
+        rbv_check_add db_restore fail "песочницу удалили снаружи (docker rm -f) — restore не завершён"
+        fail_add "restore прерван: песочницу удалили снаружи"
+        mark_retryable
+        rep "  → это НЕ нехватка RAM. Скорее всего параллельный прогон/уборка."
+        rep "  → journalctl -u rw-backup-verify.service --since '-15 min'"
+        ;;
+      oom)
+        rbv_check_add db_restore fail "OOMKilled — не хватило RAM"
+        fail_add "restore прерван: OOM"
+        mark_retryable
+        rep "  → добавьте swap ≥2G: fallocate -l 2G /swapfile && mkswap /swapfile && swapon /swapfile"
+        ;;
+      disk)
+        rbv_check_add db_restore fail "ENOSPC во время restore"
+        fail_add "restore прерван: нет места на диске"
+        mark_retryable
+        ;;
+      start_failed|dead)
+        rbv_check_add db_restore fail "песочница не поднялась / упала во время restore"
+        fail_add "restore прерван: postgres недоступен"
+        mark_retryable
+        ;;
+      *)
+        rbv_check_add db_restore fail "psql rc=${_psql_rc} (ERROR=${sql_errs})"
+        fail_add "psql restore rc=${_psql_rc}"
+        ;;
+    esac
     if rbv_pg_alive; then
       DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
       DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
@@ -628,26 +469,10 @@ if [[ "$ok" == true ]]; then
       rbv_pg_diag "post-restore-dead"
     fi
 
-    # много ERROR + пустая схема часто = ENOSPC/обрыв — один полный retry
-    if (( DB_TABLES < 1 )) && (( sql_errs > 20 || _psql_rc != 0 )) && rbv_ensure_disk_kb "$_need_kb" "$RUN_DIR"; then
-      rep "psql restore: schema пуста (errors=${sql_errs}) — полный retry на чистом PG"
-      if rbv_pg_start "schema-retry"; then
-        : >"${RUN_DIR}/psql.err"
-        set +e
-        rbv_pg_restore_sql "$SQL"
-        _psql_rc=$?
-        set -e
-        rep "psql restore retry: rc=${_psql_rc}"
-        sql_errs="$(grep -cE '^ERROR' "${RUN_DIR}/psql.err" 2>/dev/null || true)"
-        sql_errs="$(echo "${sql_errs:-0}" | tr -d '[:space:]')"
-        [[ "$sql_errs" =~ ^[0-9]+$ ]] || sql_errs=0
-        if rbv_pg_alive; then
-          DB_TABLES="$(rbv_select_app_db "${RBV_PG_DB_HINT}")"
-          DB_TABLES="$(echo "$DB_TABLES" | tr -d '[:space:]')"
-          [[ "$DB_TABLES" =~ ^[0-9]+$ ]] || DB_TABLES=0
-        fi
-        rep "psql restore retry: ERROR-строк=${sql_errs} tables=${DB_TABLES}"
-      fi
+    # Пустая схема после «успешного» restore = битый/пустой дамп, повтор не
+    # поможет. Обрыв/OOM/внешний kill уже отработаны ретраями в rbv_pg_restore.
+    if (( DB_TABLES < 1 )) && [[ "${RBV_RESTORE_CLASS}" == "ok" ]]; then
+      rep "psql restore: дамп применён без ошибок, но пользовательских таблиц нет — проверьте сам архив"
     fi
 
     rep "db_schema: db=${RBV_PG_DB:-postgres} user_tables=${DB_TABLES}"
@@ -659,19 +484,10 @@ if [[ "$ok" == true ]]; then
       else
         rbv_pg_diag "empty-schema-dead"
       fi
-      _extra=""
-      [[ ${_psql_rc:-1} -eq 137 ]] && _extra=" OOM/SIGKILL(rc=137)"
-      grep -qiE 'No space left|ENOSPC' "${RUN_DIR}/psql.err" 2>/dev/null && _extra="${_extra} ENOSPC"
+      _extra=" restore=${RBV_RESTORE_CLASS}"
       _av="$(rbv_disk_avail_kb "$WD")"
       fail_add "empty schema (dbs=${dbs} sql_errors=${sql_errs}${_extra})"
       rbv_check_add db_schema fail "user tables=0 (dbs=${dbs}, sql_errors=${sql_errs}${_extra}, disk=${_av:-?}KiB)"
-      if [[ ${_psql_rc:-1} -eq 137 ]] || echo "$_extra" | grep -q OOM; then
-        mark_retryable
-        rep "  → OOM: добавьте swap ≥2G на хосте verify (fallocate/swapon) и повторите run"
-      fi
-      if echo "$_extra" | grep -q ENOSPC; then
-        mark_retryable
-      fi
       if [[ -s "${RUN_DIR}/psql.err" ]]; then
         rep "----- psql.err (tail) -----"
         tail -n 15 "${RUN_DIR}/psql.err" | while IFS= read -r _line; do rep "  ${_line}"; done
@@ -684,7 +500,15 @@ if [[ "$ok" == true ]]; then
 
     # user_rows: не пусто + ≥ предыдущей проверки (один toggle)
     # bot → строго public.users; panel → эвристика.
-    if rbv_check_enabled "$KIND" user_rows; then
+    # На оборванном restore таблиц просто ещё нет — не выдаём это за потерю
+    # данных в бэкапе (именно так «users table missing» маскировал внешний kill).
+    if [[ "${RBV_RESTORE_CLASS}" != "ok" ]]; then
+      rep "data-проверки: пропуск — restore не завершён (${RBV_RESTORE_CLASS})"
+      rbv_check_enabled "$KIND" user_rows \
+        && rbv_check_add user_rows skip "restore не завершён (${RBV_RESTORE_CLASS})"
+      rbv_check_enabled "$KIND" event_freshness \
+        && rbv_check_add event_freshness skip "restore не завершён (${RBV_RESTORE_CLASS})"
+    elif rbv_check_enabled "$KIND" user_rows; then
       utbl="$(rbv_find_users_table "$KIND" || true)"
       if [[ -z "$utbl" ]]; then
         if [[ "$KIND" == "bot" ]]; then
@@ -721,7 +545,7 @@ if [[ "$ok" == true ]]; then
 
     # event freshness (relative to backup window + skew)
     # bot → даты из payment_webhook_events; panel → users/nodes.
-    if rbv_check_enabled "$KIND" event_freshness; then
+    if [[ "${RBV_RESTORE_CLASS}" == "ok" ]] && rbv_check_enabled "$KIND" event_freshness; then
       _ev_out="$(rbv_max_event_epoch "$KIND" | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       _ev_src=""
       LAST_EVENT=0
