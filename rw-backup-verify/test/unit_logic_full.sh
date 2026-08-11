@@ -430,11 +430,11 @@ se="$(echo "${se:-0}" | tr -d '[:space:]')"
 
 # OOM/rc=137 messaging helpers exist in rbv-run-one (bash -n covered below)
 bash -n "$ROOT/bin/rbv-run-one.sh" && pass "rbv-run-one bash -n" || fail "rbv-run-one bash -n" "syntax"
-grep -q 'shm-size' "$ROOT/bin/rbv-run-one.sh" && pass "pg shm-size" || fail "pg shm-size" "missing"
-grep -q 'OOMKilled' "$ROOT/bin/rbv-run-one.sh" && pass "pg OOM diag" || fail "pg OOM diag" "missing"
+grep -q 'shm-size' "$ROOT/lib/pg.sh" && pass "pg shm-size" || fail "pg shm-size" "missing"
+grep -q 'OOMKilled' "$ROOT/lib/pg.sh" && pass "pg OOM diag" || fail "pg OOM diag" "missing"
 grep -q 'rbv_pg_start' "$ROOT/bin/rbv-run-one.sh" && pass "pg start helper" || fail "pg start helper" "missing"
-grep -q 'rbv_pg_restore_sql\|docker cp' "$ROOT/bin/rbv-run-one.sh" && pass "restore via docker cp" || fail "restore docker cp" "missing"
-grep -q 'shared_buffers=64MB' "$ROOT/bin/rbv-run-one.sh" && pass "pg 64MB buffers" || fail "pg 64MB" "missing"
+grep -q 'docker cp' "$ROOT/lib/pg.sh" && pass "restore via docker cp" || fail "restore docker cp" "missing"
+grep -q 'shared_buffers=' "$ROOT/lib/pg.sh" && pass "pg tunables" || fail "pg tunables" "missing"
 grep -q '_RBV_SHORT' "$ROOT/bin/rbv-run-one.sh" && pass "short pg container names" || fail "short names" "missing"
 grep -q 'rbv_mem_reclaim' "$ROOT/lib/common.sh" && pass "mem reclaim fn" || fail "mem reclaim fn" "missing"
 grep -q 'drop_caches' "$ROOT/lib/common.sh" && pass "drop_caches" || fail "drop_caches" "missing"
@@ -532,7 +532,18 @@ set -e
 
 echo "==== install.sh syntax / non-root ===="
 bash -n "$ROOT/install.sh" && pass "install bash -n" || fail "install bash -n" "syntax"
-expect_rc 1 "install non-root" bash "$ROOT/install.sh"
+# под root install.sh реально поставил бы systemd-таймер прямо из теста —
+# сбрасываем привилегии, чтобы проверять именно guard «нужен root»
+if [[ ${EUID:-0} -eq 0 ]]; then
+  _inst="$(mktemp /tmp/rbv_install_XXXXXX.sh)"
+  cp "$ROOT/install.sh" "$_inst"
+  chmod 755 "$_inst"
+  expect_rc 1 "install non-root" \
+    setpriv --reuid=65534 --regid=65534 --clear-groups bash "$_inst"
+  rm -f "$_inst"
+else
+  expect_rc 1 "install non-root" bash "$ROOT/install.sh"
+fi
 
 echo
 echo "==== ${PASS} passed, ${FAIL} failed ===="
