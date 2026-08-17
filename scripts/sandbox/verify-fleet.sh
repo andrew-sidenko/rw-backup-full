@@ -422,10 +422,10 @@ queue_check() { # <server_id> <src> <backend_json> <category> <kind> <jobs_file>
 
   local keys
   keys="$(maws "$bj" s3 ls "s3://${bucket}/${prefix}/${category}/${src}/" --recursive 2>/dev/null \
-    | awk '{print $1" "$2" "$4}' | sort | tail -n "$HISTORY" | awk '{print $3}')"
+    | awk '{print $1" "$2" "$4}' | sort | tail -n "$HISTORY" | awk '{print $3}' || true)"
   if [[ -z "$keys" ]]; then
-    echo "FAIL [${src} × ${bname}] ${category}: архивов нет в этом хранилище" > "${RESULTS_DIR}/r$((job_id++))"
-    return
+    msg WARN "[${src} × ${bname}] ${category}: архивов нет в хранилище — пропускаем"
+    return 0
   fi
   local key
   while IFS= read -r key; do
